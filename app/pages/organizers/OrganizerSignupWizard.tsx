@@ -3,14 +3,11 @@ import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useFormik } from "formik";
 import * as Yup from "yup";
 import { useTranslation } from "react-i18next";
-import { Loader2, Mail, ArrowLeft, ArrowRight } from "lucide-react";
+import { Loader2, Mail, ArrowUpRight } from "lucide-react";
 import MetaHelmet from "@/components/MetaHelmet";
 import OtpInput from "@/components/OtpInput";
 import GeoCitySelector from "@/components/geo/GeoCitySelector";
-import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Progress } from "@/components/ui/progress";
 import {
   Select,
   SelectContent,
@@ -211,8 +208,10 @@ export default function OrganizerSignupWizard() {
     { value: "500+", label: t("organizerSignup.intake.size500Plus") },
   ];
 
+  const progressPct = stepProgress(step);
+
   return (
-    <div className="min-h-[calc(100vh-4.5rem)] bg-background flex flex-col">
+    <div className="pace-wizard-sheet pace-wizard-sheet--fluid w-full max-w-full min-w-0 overflow-x-clip">
       <MetaHelmet
         title={t("organizerSignup.metaTitle")}
         description={t("organizerSignup.metaDescription")}
@@ -220,202 +219,206 @@ export default function OrganizerSignupWizard() {
         noindex
       />
 
-      <div className="max-w-lg mx-auto w-full px-4 py-6 md:py-10 flex-1 flex flex-col">
-        {step !== "welcome" && (
-          <div className="mb-6 space-y-2" aria-live="polite">
-            <div className="flex items-center justify-between text-xs text-muted-foreground">
-              <span>
-                {t("organizerSignup.stepLabel", {
-                  current: stepNumber(step),
-                  total: STEP_ORDER.length - 1,
-                })}
-              </span>
-              <span>{stepTitle}</span>
-            </div>
-            <Progress value={stepProgress(step)} className="h-2" />
+      {step !== "welcome" ? (
+        <div aria-live="polite">
+          <div
+            className="pace-wizard-progress"
+            style={{ ["--wizard-progress" as string]: `${progressPct}%` }}
+          >
+            <span />
           </div>
-        )}
+          <p className="pace-wizard-step-label">
+            {t("organizerSignup.stepLabel", {
+              current: stepNumber(step),
+              total: STEP_ORDER.length - 1,
+            })}
+            <span> · {stepTitle}</span>
+          </p>
+        </div>
+      ) : null}
 
-        {step === "welcome" && (
-          <div className="flex-1 flex flex-col justify-center space-y-6 animate-slide-up">
-            <div className="space-y-3 text-center">
-              <h1 className="text-2xl md:text-3xl font-bold">{t("organizerSignup.welcome.title")}</h1>
-              <p className="text-muted-foreground">{t("organizerSignup.welcome.subtitle")}</p>
-            </div>
-            <Button
-              size="lg"
-              className="h-12 w-full text-base"
+      {step === "welcome" && (
+        <div className="pace-wizard-form">
+          <div className="pace-wizard-header">
+            <h1 className="pace-wizard-title">{t("organizerSignup.welcome.title")}</h1>
+            <p className="pace-wizard-hint">{t("organizerSignup.welcome.subtitle")}</p>
+          </div>
+          <div className="pace-wizard-actions">
+            <span />
+            <button
+              type="button"
+              className="pace-wizard-next"
               onClick={() => dispatch(setOrganizerSignupStep("owner"))}
             >
               {t("organizerSignup.welcome.cta")}
-            </Button>
-            <p className="text-center text-sm text-muted-foreground">
-              {t("organizerSignup.welcome.hasAccount")}{" "}
-              <Link to="/organizers/login" className="text-primary hover:underline">
-                {t("organizerSignup.start.signIn")}
-              </Link>
-            </p>
+              <ArrowUpRight className="h-3.5 w-3.5" aria-hidden />
+            </button>
           </div>
-        )}
+          <p className="pace-wizard-privacy">
+            {t("organizerSignup.welcome.hasAccount")}{" "}
+            <Link to="/organizers/login">{t("organizerSignup.start.signIn")}</Link>
+          </p>
+        </div>
+      )}
 
-        {step === "owner" && (
-          <form onSubmit={ownerForm.handleSubmit} className="space-y-5 animate-slide-up">
-            <div>
-              <h1 className="text-2xl font-bold mb-1">{stepTitle}</h1>
-              <p className="text-sm text-muted-foreground">{t("organizerSignup.owner.hint")}</p>
-            </div>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              <div className="space-y-1.5">
-                <Label htmlFor="owner-first">{t("organizerSignup.owner.firstName")}</Label>
+      {step === "owner" && (
+        <form onSubmit={ownerForm.handleSubmit} className="pace-wizard-form">
+          <div className="pace-wizard-header">
+            <h1 className="pace-wizard-title">{stepTitle}</h1>
+            <p className="pace-wizard-hint">{t("organizerSignup.owner.hint")}</p>
+          </div>
+          <div className="pace-wizard-fields">
+            <div className="pace-wizard-fields--2">
+              <div className="pace-form-field">
+                <label htmlFor="owner-first">{t("organizerSignup.owner.firstName")}</label>
                 <Input
                   id="owner-first"
-                  className="h-12"
                   autoComplete="given-name"
                   {...ownerForm.getFieldProps("ownerFirstName")}
                 />
-                {ownerForm.submitCount > 0 && ownerForm.errors.ownerFirstName && (
-                  <p className="text-xs text-destructive">{ownerForm.errors.ownerFirstName}</p>
-                )}
+                {ownerForm.submitCount > 0 && ownerForm.errors.ownerFirstName ? (
+                  <p className="pace-wizard-error">{ownerForm.errors.ownerFirstName}</p>
+                ) : null}
               </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="owner-last">{t("organizerSignup.owner.lastName")}</Label>
+              <div className="pace-form-field">
+                <label htmlFor="owner-last">{t("organizerSignup.owner.lastName")}</label>
                 <Input
                   id="owner-last"
-                  className="h-12"
                   autoComplete="family-name"
                   {...ownerForm.getFieldProps("ownerLastName")}
                 />
-                {ownerForm.submitCount > 0 && ownerForm.errors.ownerLastName && (
-                  <p className="text-xs text-destructive">{ownerForm.errors.ownerLastName}</p>
-                )}
+                {ownerForm.submitCount > 0 && ownerForm.errors.ownerLastName ? (
+                  <p className="pace-wizard-error">{ownerForm.errors.ownerLastName}</p>
+                ) : null}
               </div>
             </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="owner-email">{t("organizerSignup.owner.email")}</Label>
+            <div className="pace-form-field">
+              <label htmlFor="owner-email">{t("organizerSignup.owner.email")}</label>
               <div className="relative">
-                <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+                <Mail
+                  className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#758176]"
+                  aria-hidden
+                />
                 <Input
                   id="owner-email"
                   type="email"
-                  className="h-12 pl-10"
                   autoComplete="email"
                   {...ownerForm.getFieldProps("ownerEmail")}
                 />
               </div>
-              {ownerForm.submitCount > 0 && ownerForm.errors.ownerEmail && (
-                <p className="text-xs text-destructive">{ownerForm.errors.ownerEmail}</p>
-              )}
+              {ownerForm.submitCount > 0 && ownerForm.errors.ownerEmail ? (
+                <p className="pace-wizard-error">{ownerForm.errors.ownerEmail}</p>
+              ) : null}
             </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="owner-phone">{t("organizerSignup.owner.phoneOptional")}</Label>
+            <div className="pace-form-field">
+              <label htmlFor="owner-phone">{t("organizerSignup.owner.phoneOptional")}</label>
               <Input
                 id="owner-phone"
                 type="tel"
-                className="h-12"
                 autoComplete="tel"
                 placeholder="+52 …"
                 {...ownerForm.getFieldProps("ownerPhone")}
               />
             </div>
-            <WizardNav
-              onBack={() =>
-                skipWelcome
-                  ? navigate("/organizers/start")
-                  : dispatch(setOrganizerSignupStep("welcome"))
-              }
-              submitLabel={t("common.continue")}
-            />
-          </form>
-        )}
+          </div>
+          <WizardNav
+            onBack={() =>
+              skipWelcome
+                ? navigate("/organizers/start")
+                : dispatch(setOrganizerSignupStep("welcome"))
+            }
+            submitLabel={t("common.continue")}
+          />
+        </form>
+      )}
 
-        {step === "organization" && (
-          <form onSubmit={orgForm.handleSubmit} className="space-y-5 animate-slide-up">
-            <div>
-              <h1 className="text-2xl font-bold mb-1">{stepTitle}</h1>
-              <p className="text-sm text-muted-foreground">
-                {t("organizerSignup.organization.hint")}
-              </p>
+      {step === "organization" && (
+        <form onSubmit={orgForm.handleSubmit} className="pace-wizard-form">
+          <div className="pace-wizard-header">
+            <h1 className="pace-wizard-title">{stepTitle}</h1>
+            <p className="pace-wizard-hint">{t("organizerSignup.organization.hint")}</p>
+          </div>
+          <div className="pace-wizard-fields">
+            <div className="pace-form-field">
+              <label htmlFor="org-name">{t("organizerSignup.organization.name")}</label>
+              <Input id="org-name" {...orgForm.getFieldProps("name")} />
+              {orgForm.submitCount > 0 && orgForm.errors.name ? (
+                <p className="pace-wizard-error">{orgForm.errors.name}</p>
+              ) : null}
             </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="org-name">{t("organizerSignup.organization.name")}</Label>
-              <Input id="org-name" className="h-12" {...orgForm.getFieldProps("name")} />
-              {orgForm.submitCount > 0 && orgForm.errors.name && (
-                <p className="text-xs text-destructive">{orgForm.errors.name}</p>
-              )}
+            <div className="pace-form-field">
+              <GeoCitySelector
+                stateId={form.geoStateId}
+                cityId={form.geoCityId}
+                cityName={form.city}
+                onChange={(sel) => {
+                  dispatch(
+                    patchOrganizerSignupForm({
+                      geoStateId: sel.stateId,
+                      geoCityId: sel.geoCityId,
+                      city: sel.city,
+                      name: orgForm.values.name,
+                      email: orgForm.values.email,
+                      phone: orgForm.values.phone,
+                    }),
+                  );
+                  orgForm.setFieldValue("city", sel.city);
+                }}
+                staffRole="organizer"
+              />
+              {orgForm.submitCount > 0 && orgForm.errors.city ? (
+                <p className="pace-wizard-error">{orgForm.errors.city}</p>
+              ) : null}
             </div>
-            <GeoCitySelector
-              stateId={form.geoStateId}
-              cityId={form.geoCityId}
-              cityName={form.city}
-              onChange={(sel) => {
-                dispatch(
-                  patchOrganizerSignupForm({
-                    geoStateId: sel.stateId,
-                    geoCityId: sel.geoCityId,
-                    city: sel.city,
-                    // Keep Redux aligned with in-progress Formik fields so any
-                    // future reinitialize / back-nav never drops typed values.
-                    name: orgForm.values.name,
-                    email: orgForm.values.email,
-                    phone: orgForm.values.phone,
-                  }),
-                );
-                orgForm.setFieldValue("city", sel.city);
-              }}
-              staffRole="organizer"
-            />
-            {orgForm.submitCount > 0 && orgForm.errors.city && (
-              <p className="text-xs text-destructive">{orgForm.errors.city}</p>
-            )}
-            <div className="space-y-1.5">
-              <Label htmlFor="org-email">{t("organizerSignup.organization.emailOptional")}</Label>
+            <div className="pace-form-field">
+              <label htmlFor="org-email">{t("organizerSignup.organization.emailOptional")}</label>
               <Input
                 id="org-email"
                 type="email"
-                className="h-12"
                 placeholder={form.ownerEmail || t("organizerSignup.organization.emailPlaceholder")}
                 {...orgForm.getFieldProps("email")}
               />
             </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="org-phone">{t("organizerSignup.organization.phoneOptional")}</Label>
-              <Input id="org-phone" type="tel" className="h-12" {...orgForm.getFieldProps("phone")} />
+            <div className="pace-form-field">
+              <label htmlFor="org-phone">{t("organizerSignup.organization.phoneOptional")}</label>
+              <Input id="org-phone" type="tel" {...orgForm.getFieldProps("phone")} />
             </div>
-            <WizardNav
-              onBack={() => dispatch(setOrganizerSignupStep("owner"))}
-              submitLabel={t("common.continue")}
-            />
-          </form>
-        )}
+          </div>
+          <WizardNav
+            onBack={() => dispatch(setOrganizerSignupStep("owner"))}
+            submitLabel={t("common.continue")}
+          />
+        </form>
+      )}
 
-        {step === "intake" && (
-          <form onSubmit={intakeForm.handleSubmit} className="space-y-5 animate-slide-up">
-            <div>
-              <h1 className="text-2xl font-bold mb-1">{stepTitle}</h1>
-              <p className="text-sm text-muted-foreground">{t("organizerSignup.intake.hint")}</p>
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="intake-event-name">
+      {step === "intake" && (
+        <form onSubmit={intakeForm.handleSubmit} className="pace-wizard-form">
+          <div className="pace-wizard-header">
+            <h1 className="pace-wizard-title">{stepTitle}</h1>
+            <p className="pace-wizard-hint">{t("organizerSignup.intake.hint")}</p>
+          </div>
+          <div className="pace-wizard-fields">
+            <div className="pace-form-field">
+              <label htmlFor="intake-event-name">
                 {t("organizerSignup.intake.eventNameOptional")}
-              </Label>
+              </label>
               <Input
                 id="intake-event-name"
-                className="h-12"
                 placeholder={t("organizerSignup.intake.eventNamePlaceholder")}
                 maxLength={200}
                 {...intakeForm.getFieldProps("eventName")}
               />
               {intakeForm.submitCount > 0 && intakeForm.errors.eventName ? (
-                <p className="text-xs text-destructive">{intakeForm.errors.eventName}</p>
+                <p className="pace-wizard-error">{intakeForm.errors.eventName}</p>
               ) : null}
             </div>
-            <div className="space-y-1.5">
-              <Label>{t("organizerSignup.intake.sport")}</Label>
+            <div className="pace-form-field">
+              <label htmlFor="intake-sport">{t("organizerSignup.intake.sport")}</label>
               <Select
                 value={intakeForm.values.sportTypeId}
                 onValueChange={(v) => intakeForm.setFieldValue("sportTypeId", v)}
               >
-                <SelectTrigger className="h-12">
+                <SelectTrigger id="intake-sport">
                   <SelectValue placeholder={t("organizerSignup.intake.sportPlaceholder")} />
                 </SelectTrigger>
                 <SelectContent>
@@ -427,36 +430,37 @@ export default function OrganizerSignupWizard() {
                 </SelectContent>
               </Select>
             </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="rough-date">{t("organizerSignup.intake.dateOptional")}</Label>
-              <Input
-                id="rough-date"
-                type="month"
-                className="h-12"
-                {...intakeForm.getFieldProps("roughDate")}
-              />
+            <div className="pace-form-field">
+              <label htmlFor="rough-date">{t("organizerSignup.intake.dateOptional")}</label>
+              <Input id="rough-date" type="month" {...intakeForm.getFieldProps("roughDate")} />
             </div>
-            <div className="space-y-2">
-              <Label>{t("organizerSignup.intake.sizeOptional")}</Label>
-              <div className="flex flex-wrap gap-2">
+            <fieldset className="pace-event-type-fieldset">
+              <legend>{t("organizerSignup.intake.sizeOptional")}</legend>
+              <div className="pace-event-type-grid">
                 {sizeOptions.map((opt) => (
-                  <Button
+                  <label
                     key={opt.value}
-                    type="button"
-                    variant={intakeForm.values.expectedSize === opt.value ? "default" : "outline"}
-                    className="h-11"
-                    onClick={() => intakeForm.setFieldValue("expectedSize", opt.value)}
+                    className={`pace-event-type${
+                      intakeForm.values.expectedSize === opt.value ? " is-selected" : ""
+                    }`}
                   >
+                    <input
+                      type="radio"
+                      name="expectedSize"
+                      value={opt.value}
+                      checked={intakeForm.values.expectedSize === opt.value}
+                      onChange={() => intakeForm.setFieldValue("expectedSize", opt.value)}
+                    />
                     {opt.label}
-                  </Button>
+                  </label>
                 ))}
               </div>
-            </div>
-            {registerError && (
-              <p className="text-sm text-destructive" role="alert">
+            </fieldset>
+            {registerError ? (
+              <p className="pace-wizard-error" role="alert">
                 {registerError}
               </p>
-            )}
+            ) : null}
             <LegalConsentNotice
               variant="organizerRegister"
               showCheckbox
@@ -469,25 +473,28 @@ export default function OrganizerSignupWizard() {
                   : null
               }
             />
-            <WizardNav
-              onBack={() => dispatch(setOrganizerSignupStep("organization"))}
-              submitLabel={t("organizerSignup.intake.submit")}
-              loading={registering}
-            />
-          </form>
-        )}
+          </div>
+          <WizardNav
+            onBack={() => dispatch(setOrganizerSignupStep("organization"))}
+            submitLabel={t("organizerSignup.intake.submit")}
+            loading={registering}
+          />
+        </form>
+      )}
 
-        {step === "verify" && (
-          <form onSubmit={otpForm.handleSubmit} className="space-y-5 animate-slide-up">
-            <div>
-              <h1 className="text-2xl font-bold mb-1">{stepTitle}</h1>
-              <p className="text-sm text-muted-foreground">
-                {t("organizerSignup.verify.subtitle", {
-                  email: otpSentTo || form.ownerEmail,
-                })}
-              </p>
-            </div>
+      {step === "verify" && (
+        <form onSubmit={otpForm.handleSubmit} className="pace-wizard-form">
+          <div className="pace-wizard-header">
+            <h1 className="pace-wizard-title">{stepTitle}</h1>
+            <p className="pace-wizard-hint">
+              {t("organizerSignup.verify.subtitle", {
+                email: otpSentTo || form.ownerEmail,
+              })}
+            </p>
+          </div>
+          <div className="pace-wizard-fields">
             <OtpInput
+              variant="pace"
               value={otpForm.values.code}
               onChange={(code) => otpForm.setFieldValue("code", code)}
               onComplete={(code) => {
@@ -497,50 +504,53 @@ export default function OrganizerSignupWizard() {
                 });
               }}
             />
-            {otpForm.submitCount > 0 && otpForm.errors.code && (
-              <p className="text-xs text-destructive">{otpForm.errors.code}</p>
-            )}
-            {(otpError || registerError) && (
-              <p className="text-sm text-destructive" role="alert">
+            {otpForm.submitCount > 0 && otpForm.errors.code ? (
+              <p className="pace-wizard-error">{otpForm.errors.code}</p>
+            ) : null}
+            {otpError || registerError ? (
+              <p className="pace-wizard-error" role="alert">
                 {otpError || registerError}
               </p>
-            )}
-            <Button type="submit" size="lg" className="h-12 w-full" disabled={verifyingOtp}>
-              {verifyingOtp ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  {t("organizerSignup.verify.verifying")}
-                </>
-              ) : (
-                t("organizerSignup.verify.submit")
-              )}
-            </Button>
-            <Button
+            ) : null}
+          </div>
+          <div className="pace-wizard-actions">
+            <button
               type="button"
-              variant="ghost"
-              className="w-full"
+              className="pace-wizard-back"
               disabled={requestingOtp}
               onClick={() =>
                 void dispatch(
-                  requestStaffOtp({ email: (otpSentTo || form.ownerEmail).trim().toLowerCase() }),
+                  requestStaffOtp({
+                    email: (otpSentTo || form.ownerEmail).trim().toLowerCase(),
+                  }),
                 )
               }
             >
-              {requestingOtp ? t("organizerSignup.verify.resending") : t("organizerSignup.verify.resend")}
-            </Button>
-          </form>
-        )}
+              {requestingOtp
+                ? t("organizerSignup.verify.resending")
+                : t("organizerSignup.verify.resend")}
+            </button>
+            <button type="submit" className="pace-wizard-next" disabled={verifyingOtp}>
+              {verifyingOtp ? (
+                <>
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+                  {t("organizerSignup.verify.verifying")}
+                </>
+              ) : (
+                <>
+                  {t("organizerSignup.verify.submit")}
+                  <ArrowUpRight className="h-3.5 w-3.5" aria-hidden />
+                </>
+              )}
+            </button>
+          </div>
+        </form>
+      )}
 
-        <p className="text-center text-xs text-muted-foreground mt-8 pb-4">
-          {t("organizerSignup.helpPrompt")}{" "}
-          <a
-            href={`mailto:${t("organizerSignup.helpEmail")}`}
-            className="text-primary hover:underline"
-          >
-            {t("organizerSignup.helpEmail")}
-          </a>
-        </p>
-      </div>
+      <p className="pace-wizard-privacy">
+        {t("organizerSignup.helpPrompt")}{" "}
+        <a href={`mailto:${t("organizerSignup.helpEmail")}`}>{t("organizerSignup.helpEmail")}</a>
+      </p>
     </div>
   );
 }
@@ -556,24 +566,23 @@ function WizardNav({
 }) {
   const { t } = useTranslation();
   return (
-    <div className="flex flex-col sm:flex-row gap-3 pt-2">
-      <Button type="button" variant="outline" className="h-12 sm:flex-1" onClick={onBack}>
-        <ArrowLeft className="mr-2 h-4 w-4" />
+    <div className="pace-wizard-actions">
+      <button type="button" className="pace-wizard-back" onClick={onBack}>
         {t("organizerSignup.back")}
-      </Button>
-      <Button type="submit" className="h-12 sm:flex-[2]" disabled={loading}>
+      </button>
+      <button type="submit" className="pace-wizard-next" disabled={loading}>
         {loading ? (
           <>
-            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+            <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
             {t("common.loading")}
           </>
         ) : (
           <>
             {submitLabel}
-            <ArrowRight className="ml-2 h-4 w-4" />
+            <ArrowUpRight className="h-3.5 w-3.5" aria-hidden />
           </>
         )}
-      </Button>
+      </button>
     </div>
   );
 }

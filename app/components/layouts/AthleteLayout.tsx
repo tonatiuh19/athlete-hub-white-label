@@ -1,5 +1,6 @@
 import { Suspense, useEffect, useState } from "react";
 import {
+  Link,
   NavLink,
   Navigate,
   Outlet,
@@ -18,7 +19,6 @@ import {
   CreditCard,
 } from "lucide-react";
 import LanguageSwitcher from "@/components/LanguageSwitcher";
-import AtleitaWordmark from "@/components/brand/AtleitaWordmark";
 import EventRegistrationWizard from "@/components/events/registration/EventRegistrationWizard";
 import GroupRegistrationWizard from "@/components/events/registration/GroupRegistrationWizard";
 import { useAppDispatch, useAppSelector } from "@/store/hooks";
@@ -176,10 +176,10 @@ export default function AthleteLayout() {
           end={end}
           onClick={() => mobile && setMobileOpen(false)}
           className={({ isActive }) =>
-            `flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-medium transition-all ${
+            `flex items-center gap-3 px-4 py-3 rounded-[3px] text-sm font-medium transition-all ${
               isActive
-                ? "bg-cyan/15 text-primary border border-cyan/25"
-                : "text-muted-foreground hover:text-foreground hover:bg-card"
+                ? "bg-primary/10 text-primary border border-primary/20"
+                : "text-muted-foreground hover:text-foreground hover:bg-secondary"
             }`
           }
         >
@@ -191,24 +191,26 @@ export default function AthleteLayout() {
   );
 
   return (
-    <div className="min-h-screen bg-background flex overflow-x-clip w-full max-w-full">
-      <aside className="hidden lg:flex w-64 flex-col border-r border-border bg-card/30 backdrop-blur-sm fixed inset-y-0 left-0 z-30">
-        <div className="p-6 border-b border-border space-y-2">
-          <AtleitaWordmark href="/portal" className="h-10" />
+    <div className="pace-site min-h-screen flex overflow-x-clip w-full max-w-full">
+      <aside className="hidden lg:flex w-64 flex-col border-r border-[#e4e8e3] bg-[#fbfcf9] fixed inset-y-0 left-0 z-30">
+        <div className="p-5 border-b border-[#e4e8e3]">
+          <Link to="/portal" className="pace-wordmark text-[22px]" aria-label={t("landing.ariaHome")}>
+            atleita<span>.</span>
+          </Link>
         </div>
         <nav className="flex-1 p-4 space-y-1 overflow-y-auto">
           <NavItems />
         </nav>
-        <div className="p-4 border-t border-border">
+        <div className="p-4 border-t border-[#e4e8e3]">
           <div className="flex items-center gap-3 px-3 py-2 mb-2">
             {user?.avatarUrl ? (
               <img
                 src={user.avatarUrl}
                 alt=""
-                className="w-9 h-9 rounded-full object-cover border border-cyan/20"
+                className="w-9 h-9 rounded-[3px] object-cover border border-primary/20"
               />
             ) : (
-              <div className="w-9 h-9 rounded-full bg-gradient-to-br from-cyan/30 to-purple-accent/30 flex items-center justify-center text-sm font-bold">
+              <div className="w-9 h-9 rounded-[3px] bg-primary/10 border border-primary/20 flex items-center justify-center text-sm font-bold text-primary">
                 {user?.firstName?.[0] || "A"}
               </div>
             )}
@@ -225,7 +227,7 @@ export default function AthleteLayout() {
             type="button"
             onClick={() => void handleLogout()}
             disabled={loggingOut}
-            className="w-full flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors disabled:opacity-50"
+            className="w-full flex items-center gap-2 px-4 py-2.5 rounded-[3px] text-sm text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors disabled:opacity-50"
           >
             <LogOut className="w-4 h-4" /> {t("common.signOut")}
           </button>
@@ -233,10 +235,16 @@ export default function AthleteLayout() {
       </aside>
 
       <div className="flex-1 lg:ml-64 flex flex-col min-h-screen min-w-0 w-full max-w-full">
-        <header className="lg:hidden sticky top-0 z-40 bg-background/90 backdrop-blur-md border-b border-border px-4 h-14 flex items-center justify-between gap-2 min-w-0">
-          <AtleitaWordmark href="/portal" className="h-10" />
+        <header className="lg:hidden sticky top-0 z-40 bg-[#fbfcf9] border-b border-[#e4e8e3] px-4 h-14 flex items-center justify-between gap-2 min-w-0">
+          <Link to="/portal" className="pace-wordmark text-[22px]" aria-label={t("landing.ariaHome")}>
+            atleita<span>.</span>
+          </Link>
           <div className="flex items-center gap-2">
-            <LanguageSwitcher variant="compact" onLanguageChange={persistLanguage} />
+            <LanguageSwitcher
+              variant="ghost"
+              className="pace-header-lang"
+              onLanguageChange={persistLanguage}
+            />
             <button type="button" onClick={() => setMobileOpen(!mobileOpen)}>
               {mobileOpen ? (
                 <X className="w-6 h-6" />
@@ -248,14 +256,14 @@ export default function AthleteLayout() {
         </header>
 
         {mobileOpen && (
-          <div className="lg:hidden fixed top-14 inset-x-0 bottom-0 z-50 bg-background/95 backdrop-blur-md p-4 overflow-y-auto overscroll-contain">
+          <div className="lg:hidden fixed top-14 inset-x-0 bottom-0 z-50 bg-[#fbfcf9] p-4 overflow-y-auto overscroll-contain">
             <nav className="space-y-1">
               <NavItems mobile />
               <button
                 type="button"
                 onClick={() => void handleLogout()}
                 disabled={loggingOut}
-                className="w-full flex items-center gap-3 px-4 py-3 text-destructive disabled:opacity-50"
+                className="w-full flex items-center gap-3 px-4 py-3 rounded-[3px] text-destructive disabled:opacity-50"
               >
                 <LogOut className="w-5 h-5" /> {t("common.signOut")}
               </button>
@@ -265,7 +273,11 @@ export default function AthleteLayout() {
 
         <main className="flex-1 p-4 md:p-8 min-w-0 w-full max-w-full overflow-x-clip">
           <div className="hidden lg:flex justify-end gap-2 mb-4">
-            <LanguageSwitcher variant="ghost" onLanguageChange={persistLanguage} />
+            <LanguageSwitcher
+              variant="ghost"
+              className="pace-header-lang"
+              onLanguageChange={persistLanguage}
+            />
           </div>
           <Suspense fallback={<AthletePageFallback />}>
             <Outlet />

@@ -13,7 +13,7 @@ alwaysApply: true
 - **Fix root causes** — never patch around type errors or bugs
 - **No breaking changes** without calling them out
 - **API + swagger**: any `api/index.ts` route/behavior change → update `api/swagger.yaml`
-- **Design system**: relevant UI changes → update `DESIGN_SYSTEM.md`
+- **Design system**: relevant UI changes → update `DESIGN.md`; follow `.cursor/rules/design.mdc` (pace shape language platform-wide)
 - **i18n**: new user-visible strings → `app/i18n/locales/en.json` **and** `es.json`, use `t('key')` — never hardcode UI copy
 - **Tests + deploy**: see `testing.mdc`; production via `npm run deploy:prod`
 - **Review chat history** before changing code — do not reintroduce fixed issues

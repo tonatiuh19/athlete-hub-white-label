@@ -13,7 +13,7 @@ White-label sports event platform (passwordless). Architecture matches athlete-h
 - **Auth**: passwordless email OTP via Resend only (no Clerk in product)
 - **Payments v1**: Stripe + manual SPEI rails only; Mercado Pago removed from product surface (historical `payments.provider='mercadopago'` rows kept)
 - **Frontend folder**: `app/` (alias `@/*`), not `client/`
-- **Design**: Atleita evergreen + citron — see `DESIGN.md` and `app/global.css` (`.pace-site`)
+- **Design**: Atleita evergreen + citron, Archivo, **pace radii (3px CTAs / 2px inputs) platform-wide** including staff + portal — see `DESIGN.md`, `.cursor/rules/design.mdc`, and `app/global.css` (`.pace-site`)
 - **Mobile first (NO EXCEPTIONS)**: every UI change must work at **320–390px**; **no page-level horizontal scroll** — vertical scroll only. See `.cursor/rules/mobile.mdc`
 - **Deploy**: `npm run deploy:prod` only
 - **Tests**: ship regression tests with behavior changes; see `.cursor/rules/testing.mdc`

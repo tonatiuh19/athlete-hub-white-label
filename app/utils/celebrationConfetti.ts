@@ -1,6 +1,13 @@
 import confetti from "canvas-confetti";
+import { ATLEITA_COLORS } from "@/constants/atleitaBrand";
 
-const BRAND_COLORS = ["#00E5FF", "#34D399", "#3B82F6", "#FFFFFF", "#818CF8"];
+const BRAND_COLORS = [
+  ATLEITA_COLORS.green,
+  ATLEITA_COLORS.citron,
+  ATLEITA_COLORS.ink,
+  ATLEITA_COLORS.white,
+  ATLEITA_COLORS.greenLight,
+];
 
 function fire(options: confetti.Options) {
   void confetti({

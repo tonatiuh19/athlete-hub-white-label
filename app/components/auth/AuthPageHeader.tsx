@@ -1,21 +1,19 @@
 import { Link } from "react-router-dom";
-import { ArrowLeft } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import AtleitaWordmark from "@/components/brand/AtleitaWordmark";
+import LanguageSwitcher from "@/components/LanguageSwitcher";
 
-/** Sticky header on athlete/staff login form column */
+/** Pace compact header on athlete/staff login form column */
 export default function AuthPageHeader() {
   const { t } = useTranslation();
 
   return (
-    <header className="sticky top-0 z-20 bg-background/80 backdrop-blur-md border-b border-border/60 shrink-0">
-      <div className="px-4 sm:px-6 h-14 flex items-center justify-between gap-3 min-w-0">
-        <AtleitaWordmark className="min-w-0" />
-        <Link
-          to="/"
-          className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-primary shrink-0 transition-colors"
-        >
-          <ArrowLeft className="w-3.5 h-3.5" />
+    <header className="pace-header pace-header--compact sticky top-0 z-20 w-full max-w-full min-w-0 overflow-x-clip shrink-0">
+      <Link className="pace-wordmark" to="/" aria-label={t("landing.ariaHome")}>
+        atleita<span>.</span>
+      </Link>
+      <div className="pace-header-actions">
+        <LanguageSwitcher variant="ghost" className="pace-header-lang" />
+        <Link className="pace-header-enter" to="/">
           {t("common.back")}
         </Link>
       </div>

@@ -115,20 +115,15 @@ export default function OrganizerStart() {
           </p>
 
           <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-8">
-            <Button asChild size="lg" className="h-12 px-8 text-base w-full sm:w-auto shadow-sm">
-              <Link to={SIGNUP_WIZARD_URL}>
+            <Link to={SIGNUP_WIZARD_URL} className="pace-organizer-cta w-full sm:w-auto">
+              <span className="inline-flex items-center gap-1.5">
                 {t("organizerSignup.start.cta")}
-                <ArrowRight className="ml-2 h-4 w-4" />
-              </Link>
-            </Button>
-            <Button
-              asChild
-              variant="outline"
-              size="lg"
-              className="h-12 px-8 w-full sm:w-auto"
-            >
-              <Link to="/staff/login">{t("organizerSignup.start.signIn")}</Link>
-            </Button>
+                <ArrowRight className="h-4 w-4" aria-hidden />
+              </span>
+            </Link>
+            <Link to="/staff/login" className="pace-header-enter w-full sm:w-auto justify-center">
+              {t("organizerSignup.start.signIn")}
+            </Link>
           </div>
 
           <p className="text-sm text-muted-foreground mt-5 flex items-center justify-center gap-2">

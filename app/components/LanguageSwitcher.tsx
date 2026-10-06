@@ -27,10 +27,10 @@ export default function LanguageSwitcher({
 
   const base =
     variant === "compact"
-      ? "px-2.5 py-1.5 text-xs rounded-lg"
+      ? "px-2.5 py-1.5 text-xs rounded-[3px]"
       : variant === "ghost"
-        ? "px-3 py-2 text-xs rounded-xl"
-        : "px-3 py-2 text-sm rounded-xl";
+        ? "px-3 py-2 text-xs rounded-[3px]"
+        : "px-3 py-2 text-sm rounded-[3px]";
 
   return (
     <button

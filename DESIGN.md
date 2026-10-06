@@ -13,7 +13,7 @@
 - Audience: Race and endurance-event organizers
 - Visual world: Race-day operations — capable, outdoorsy, confident, premium
 - Palette: Evergreen with citron accents over cool white neutrals
-- Type: Archivo sans; oversized, tightly tracked display headlines
+- Type: **Archivo** sans platform-wide (including marketing home); oversized, tightly tracked display headlines
 - Composition: Organizer-first hero, capabilities, storefront preview, pricing, setup CTA
 - Shape language: Crisp components, restrained radii, evergreen borders, citron accents
 - Anti-references: Attendee ticket marketplaces, purple gradients, glassmorphism, decorative status badges, admin-dashboard chrome in marketing, **dark-mode product shells**, Triboo athlete-marketplace chrome (floating mobile tab bar, communities, public/staff blog, XP/achievements, theme toggle)
@@ -21,7 +21,11 @@
 
 ## Tokens
 
-See `app/global.css` (`.pace-site` / `:root`) and `tailwind.config.ts`. Prefer `atleita-*` / semantic tokens (`primary`, `accent`, `background`).
+See `app/global.css` (`:root`) and `tailwind.config.ts`. Prefer `atleita-*` / semantic tokens (`primary`, `accent`, `background`).
+
+- **`:root`** = brand source of truth for the whole SPA (public, athlete, staff).
+- **Shape language is platform-wide**: **3px** CTAs/cards/nav, **2px** inputs — Tailwind `rounded-*` and shadcn `Button`/`Input`/`Select` follow pace (not soft SaaS).
+- **`.pace-site`** wraps marketing **and** staff/athlete shells for Archivo + cool-white ground. Dense editors still use `.staff-panel` spacing, not a second palette.
 
 ## Guardrails
 
@@ -29,3 +33,7 @@ See `app/global.css` (`.pace-site` / `:root`) and `tailwind.config.ts`. Prefer `
 - Marketing heroes use light surfaces with evergreen/citron atmosphere — not full-bleed black panels.
 - Emails may use an ink/citron branded shell; the SPA remains light-only.
 - **No emoji glyphs in product UI** — use Lucide (`lucide-react`) or existing React icon components for arrows, checks, medals, flags, and CTAs. Do not put ↗ ↓ ↑ ← → ✓ ★ 🏅 🏁 (or similar) in JSX text or i18n copy.
+
+## Agent enforcement
+
+Cursor agents must follow `.cursor/rules/design.mdc` (always applied) on every UI change — home, public, organizer, staff, and athlete portal share one pace pattern. Do not invent a softer dashboard look for consoles.

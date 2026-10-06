@@ -251,7 +251,7 @@ export default function AthleteLogin() {
   const busyIdentify = checkingEmail || requestingOtp;
 
   return (
-    <div className="h-[100dvh] overflow-hidden flex w-full max-w-full min-w-0 bg-background">
+    <div className="pace-site h-[100dvh] overflow-hidden flex w-full max-w-full min-w-0">
       <ClerkLoadedGate>
         <AthleteLoginClerkResume postLoginPath={postLoginPath} />
       </ClerkLoadedGate>
@@ -261,14 +261,14 @@ export default function AthleteLogin() {
         path="/login"
       />
 
-      <div className="flex-1 lg:max-w-[480px] flex flex-col overflow-y-auto border-r border-border/40">
+      <div className="flex-1 lg:max-w-[480px] flex flex-col overflow-y-auto border-r border-[#e4e8e3]">
         <AuthPageHeader />
 
         <div className="flex-1 flex flex-col justify-center px-6 sm:px-10 py-6">
           <div className="w-full max-w-[340px] mx-auto animate-slide-up">
-            <div className="flex flex-col items-center text-center mb-8">
-              <h1 className="text-2xl font-bold leading-tight mb-2">{heading}</h1>
-              <p className="text-sm text-muted-foreground leading-relaxed">{subtitle}</p>
+            <div className="pace-wizard-header mb-8 text-center">
+              <h1 className="pace-wizard-title">{heading}</h1>
+              <p className="pace-wizard-hint">{subtitle}</p>
             </div>
 
             {step === "identify" && (
@@ -284,7 +284,7 @@ export default function AthleteLogin() {
                         id="athlete-email"
                         type="email"
                         {...identifyForm.getFieldProps("email")}
-                        className="w-full h-12 pl-10 pr-4 rounded-xl border border-input bg-card/80 focus:border-cyan focus:ring-2 focus:ring-cyan/20 outline-none transition-all text-sm"
+                        className="w-full h-12 pl-10 pr-4 border border-[#ccd8ca] bg-white focus:border-[#496d4f] outline outline-2 outline-offset-1 outline-transparent focus-visible:outline-[rgb(142_170_69_/_28%)] transition-all text-[13px] rounded-[2px]"
                         placeholder={t("auth.athlete.emailPlaceholder")}
                         autoComplete="email"
                         autoFocus
@@ -298,7 +298,7 @@ export default function AthleteLogin() {
                   <button
                     type="submit"
                     disabled={busyIdentify}
-                    className="w-full h-12 btn-primary rounded-xl flex items-center justify-center gap-2 text-sm font-semibold disabled:opacity-60"
+                    className="pace-wizard-next w-full disabled:opacity-60"
                   >
                     {busyIdentify ? (
                       <>
@@ -327,10 +327,11 @@ export default function AthleteLogin() {
 
             {step === "code" && (
               <form onSubmit={codeForm.handleSubmit} className="space-y-4">
-                <div className="rounded-xl border border-border/60 bg-card/40 px-3 py-2 text-xs text-muted-foreground truncate">
+                <div className="rounded-[2px] border border-[#ccd8ca] bg-white px-3 py-2 text-xs text-muted-foreground truncate">
                   {otpSentTo || email}
                 </div>
                 <OtpInput
+                  variant="pace"
                   value={codeForm.values.code}
                   onChange={(code) => codeForm.setFieldValue("code", code)}
                   onComplete={(code) => {
@@ -347,7 +348,7 @@ export default function AthleteLogin() {
                 <button
                   type="submit"
                   disabled={verifyingOtp}
-                  className="w-full h-12 btn-primary rounded-xl flex items-center justify-center gap-2 text-sm font-semibold disabled:opacity-60"
+                  className="pace-wizard-next w-full disabled:opacity-60"
                 >
                   {verifyingOtp ? (
                     <>
@@ -385,7 +386,7 @@ export default function AthleteLogin() {
 
             {step === "register" && (
               <form onSubmit={registerForm.handleSubmit} className="space-y-4">
-                <div className="rounded-xl border border-border/60 bg-card/40 px-3 py-2 text-xs text-muted-foreground truncate">
+                <div className="rounded-[2px] border border-[#ccd8ca] bg-white px-3 py-2 text-xs text-muted-foreground truncate">
                   {email}
                 </div>
                 <div className="space-y-1.5">
@@ -398,7 +399,7 @@ export default function AthleteLogin() {
                       id="athlete-first-name"
                       type="text"
                       {...registerForm.getFieldProps("firstName")}
-                      className="w-full h-12 pl-10 pr-4 rounded-xl border border-input bg-card/80 focus:border-cyan focus:ring-2 focus:ring-cyan/20 outline-none transition-all text-sm"
+                      className="w-full h-12 pl-10 pr-4 border border-[#ccd8ca] bg-white focus:border-[#496d4f] outline outline-2 outline-offset-1 outline-transparent focus-visible:outline-[rgb(142_170_69_/_28%)] transition-all text-[13px] rounded-[2px]"
                       autoComplete="given-name"
                       autoFocus
                     />
@@ -417,7 +418,7 @@ export default function AthleteLogin() {
                       id="athlete-last-name"
                       type="text"
                       {...registerForm.getFieldProps("lastName")}
-                      className="w-full h-12 pl-10 pr-4 rounded-xl border border-input bg-card/80 focus:border-cyan focus:ring-2 focus:ring-cyan/20 outline-none transition-all text-sm"
+                      className="w-full h-12 pl-10 pr-4 border border-[#ccd8ca] bg-white focus:border-[#496d4f] outline outline-2 outline-offset-1 outline-transparent focus-visible:outline-[rgb(142_170_69_/_28%)] transition-all text-[13px] rounded-[2px]"
                       autoComplete="family-name"
                     />
                   </div>
@@ -458,7 +459,7 @@ export default function AthleteLogin() {
                 <button
                   type="submit"
                   disabled={registering}
-                  className="w-full h-12 btn-primary rounded-xl flex items-center justify-center gap-2 text-sm font-semibold disabled:opacity-60"
+                  className="pace-wizard-next w-full disabled:opacity-60"
                 >
                   {registering ? (
                     <>
@@ -482,7 +483,7 @@ export default function AthleteLogin() {
 
             {step === "socialLogin" && (
               <div className="space-y-5">
-                <div className="rounded-xl border border-border/60 bg-card/40 px-3 py-2 text-xs text-muted-foreground truncate">
+                <div className="rounded-[2px] border border-[#ccd8ca] bg-white px-3 py-2 text-xs text-muted-foreground truncate">
                   {email}
                 </div>
                 <LegalConsentNotice variant="athleteRegister" />

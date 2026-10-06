@@ -9,8 +9,8 @@ When a turn **implements, fixes, refactors, or changes API/DB/UI behavior**, do 
 
 ## Required checklist
 
-1. **Gaps** — API → Redux → UI wires, i18n (EN+ES), swagger, DESIGN_SYSTEM, migrations + `schema.sql`, env/docs, **mobile fit (no page horizontal scroll)**
-2. **Issues** — null/auth/role edges (admin vs organizer), timezone/date, race conditions, 401 session cascade, security, **viewport overflow**
+1. **Gaps** — API → Redux → UI wires, i18n (EN+ES), swagger, `DESIGN.md` / pace chrome, migrations + `schema.sql`, env/docs, **mobile fit (no page horizontal scroll)**
+2. **Issues** — null/auth/role edges (admin vs organizer), timezone/date, race conditions, 401 session cascade, security, **viewport overflow**, **style drift** (soft SaaS radii / Triboo colors / Inter / missing `.pace-site` on public/staff/portal)
 3. **Breaking changes** — confirm none, or call out with migration path
 4. **Tests** — run related unit + API integration suites; add regression tests for bugs found
 5. **Missed** — chat history; do not reintroduce fixed issues

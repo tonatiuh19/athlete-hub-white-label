@@ -79,9 +79,9 @@ export default function StaffDashboard() {
       <PortalErrorAlert error={dashboardError || eventsError || analyticsError} onRetry={reload} />
 
       {showSiteSetup ? (
-        <div className="rounded-2xl border border-primary/30 bg-primary/5 p-5 sm:p-6 flex flex-col sm:flex-row sm:items-center gap-4 justify-between">
+        <div className="rounded-[3px] border border-primary/30 bg-primary/5 p-5 sm:p-6 flex flex-col sm:flex-row sm:items-center gap-4 justify-between">
           <div className="flex gap-3 min-w-0">
-            <div className="w-10 h-10 rounded-xl bg-secondary flex items-center justify-center shrink-0">
+            <div className="w-10 h-10 rounded-[3px] bg-secondary flex items-center justify-center shrink-0">
               <Palette className="w-5 h-5 text-primary" />
             </div>
             <div className="min-w-0">
@@ -93,10 +93,7 @@ export default function StaffDashboard() {
               </p>
             </div>
           </div>
-          <Link
-            to="/staff/site"
-            className="h-11 px-4 inline-flex items-center justify-center rounded-xl btn-primary text-sm font-semibold shrink-0"
-          >
+          <Link to="/staff/site" className="pace-header-cta shrink-0">
             {t("staffPortal.siteSetupBanner.cta")}
           </Link>
         </div>

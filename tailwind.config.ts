@@ -75,9 +75,16 @@ export default {
         success: "#22c55e",
       },
       borderRadius: {
-        lg: "var(--radius)",
-        md: "calc(var(--radius) - 2px)",
-        sm: "calc(var(--radius) - 4px)",
+        /** Pace crisp radii — overrides default Tailwind soft SaaS corners */
+        none: "0",
+        sm: "2px",
+        DEFAULT: "3px",
+        md: "3px",
+        lg: "3px",
+        xl: "3px",
+        "2xl": "4px",
+        "3xl": "6px",
+        full: "9999px",
       },
       keyframes: {
         "accordion-down": {

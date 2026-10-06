@@ -9,14 +9,16 @@ alwaysApply: false
 ## Paths
 - `@/*` → `app/`, `@shared/*` → `shared/` — prefer aliases over deep relatives
 
-## Styling
+## Styling (see also `design.mdc` — always applied)
 - Tailwind 3 + tokens from `app/global.css` / `tailwind.config.ts`
-- **Never** arbitrary colors (`text-emerald-500`, `bg-amber-400`, etc.)
-- Use semantic tokens: `primary`, `accent`, `destructive`, `muted`, `secondary`, `foreground`, `background`, `border`, `card`, `input`, `ring`
-- Exception: dark staff sidebar `bg-[#0b0f1a]` is intentional
-- Prefer `app/components/ui/` (Radix + Tailwind); Lucide icons first, `react-icons` if needed
+- **Visual contract**: `DESIGN.md` — evergreen + citron, Archivo, **pace radii (3px / 2px) platform-wide**
+- **Never** arbitrary colors (`text-emerald-500`, `bg-amber-400`, etc.) except intentional brand hex already in pace CSS
+- Use semantic tokens: `primary`, `accent`, `destructive`, `muted`, `secondary`, `foreground`, `background`, `border`, `card`, `input`, `ring`, `atleita-*`
+- Prefer `app/components/ui/` (Radix + Tailwind) — defaults are already pace-shaped; do not override back to soft SaaS
+- Reuse `.pace-*` classes for marketing/onboarding/auth; staff/portal shells use `.pace-site`
+- Lucide icons first; **no emoji glyphs** in product UI or i18n
 - **Mobile first** — see `mobile.mdc`; page shells must use `w-full max-w-full min-w-0 overflow-x-clip`; **no page-level horizontal scroll**
-- Smooth transitions; keep UX clean and engaging
+- Smooth, restrained motion; keep UX clean — no glassmorphism / multi-layer glow
 
 ## i18n
 - Locale files: `app/i18n/locales/en.json` and `es.json`
@@ -24,6 +26,7 @@ alwaysApply: false
 
 ## Forms
 - Formik + Yup; reusable schemas; submit via Redux thunks
+- Public/onboarding forms: prefer `pace-form-field` / `pace-wizard-*` when in a pace shell
 
 ## Logging
 - UI: `app/utils/logger.ts` only (not raw `console.*`)

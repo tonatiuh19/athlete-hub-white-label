@@ -19,7 +19,6 @@ import AuthBrandPanel from "@/components/AuthBrandPanel";
 import AuthPageHeader from "@/components/auth/AuthPageHeader";
 import AuthFormError from "@/components/auth/AuthFormError";
 import { STAFF_LOGIN_VIDEO_URL } from "@/constants/atleitaBrand";
-import LanguageSwitcher from "@/components/LanguageSwitcher";
 import { useAppDispatch, useAppSelector } from "@/store/hooks";
 import { requestRoleOtp, verifyRoleOtp } from "@/store/slices/staffAuthSlice";
 import { getStaffToken } from "@/lib/api";
@@ -135,7 +134,7 @@ export default function RoleOtpLogin({ role }: RoleOtpLoginProps) {
   const email = otpSentTo || emailForm.values.email;
 
   return (
-    <div className="h-[100dvh] overflow-hidden flex w-full max-w-full min-w-0 bg-background">
+    <div className="pace-site h-[100dvh] overflow-hidden flex w-full max-w-full min-w-0">
       <MetaHelmet
         title={t(`${i18nKey}.metaTitle`)}
         description={t(`${i18nKey}.metaDescription`)}
@@ -143,20 +142,17 @@ export default function RoleOtpLogin({ role }: RoleOtpLoginProps) {
         noindex
       />
 
-      <div className="flex-1 lg:max-w-[480px] flex flex-col overflow-y-auto border-r border-border/40">
+      <div className="flex-1 lg:max-w-[480px] flex flex-col overflow-y-auto border-r border-[#e4e8e3]">
         <AuthPageHeader />
 
         <div className="flex-1 flex flex-col justify-center px-6 sm:px-10 py-6">
           <div className="w-full max-w-[340px] mx-auto animate-slide-up">
-            <div className="flex flex-col items-center text-center mb-8">
-              <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-primary mb-3">
-                atleita<span className="text-foreground">.</span>
-              </p>
-              <h1 className="text-2xl font-bold mb-2 leading-tight">
+            <div className="pace-wizard-header mb-8 text-center">
+              <h1 className="pace-wizard-title">
                 {step === "email" ? (
                   <>
                     {t(`${i18nKey}.title`)}{" "}
-                    <span className="text-primary">
+                    <span className="text-[var(--pace-citron)]">
                       {t(`${i18nKey}.titleHighlight`)}
                     </span>
                   </>
@@ -164,7 +160,7 @@ export default function RoleOtpLogin({ role }: RoleOtpLoginProps) {
                   t(`${i18nKey}.titleCode`)
                 )}
               </h1>
-              <p className="text-sm text-muted-foreground leading-relaxed">
+              <p className="pace-wizard-hint">
                 {step === "email"
                   ? t(`${i18nKey}.subtitle`)
                   : t(`${i18nKey}.subtitleCode`, { email })}
@@ -172,30 +168,22 @@ export default function RoleOtpLogin({ role }: RoleOtpLoginProps) {
             </div>
 
             {step === "email" ? (
-              <form onSubmit={emailForm.handleSubmit} className="space-y-4">
-                <div className="space-y-1.5">
-                  <label
-                    htmlFor={`${role}-email`}
-                    className="block text-sm font-medium text-foreground/90"
-                  >
-                    {t(`${i18nKey}.emailLabel`)}
-                  </label>
+              <form onSubmit={emailForm.handleSubmit} className="pace-wizard-fields">
+                <div className="pace-form-field">
+                  <label htmlFor={`${role}-email`}>{t(`${i18nKey}.emailLabel`)}</label>
                   <div className="relative">
-                    <Mail className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground pointer-events-none" />
+                    <Mail className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#758176]" />
                     <input
                       id={`${role}-email`}
                       type="email"
                       {...emailForm.getFieldProps("email")}
-                      className="w-full h-12 pl-10 pr-4 rounded-xl border border-input bg-card/80 focus:border-primary focus:ring-2 focus:ring-primary/20 outline-none transition-all text-sm"
                       placeholder={t(`${i18nKey}.emailPlaceholder`)}
                       autoComplete="email"
                       autoFocus
                     />
                   </div>
                   {emailForm.submitCount > 0 && emailForm.errors.email ? (
-                    <p className="text-xs text-destructive">
-                      {emailForm.errors.email}
-                    </p>
+                    <p className="pace-wizard-error">{emailForm.errors.email}</p>
                   ) : null}
                 </div>
 
@@ -204,7 +192,7 @@ export default function RoleOtpLogin({ role }: RoleOtpLoginProps) {
                 <button
                   type="submit"
                   disabled={requestingOtp}
-                  className="w-full h-12 btn-primary rounded-xl flex items-center justify-center gap-2 text-sm font-semibold disabled:opacity-60"
+                  className="pace-wizard-next w-full disabled:opacity-60"
                 >
                   {requestingOtp ? (
                     <>
@@ -229,8 +217,9 @@ export default function RoleOtpLogin({ role }: RoleOtpLoginProps) {
                 ) : null}
               </form>
             ) : (
-              <form onSubmit={codeForm.handleSubmit} className="space-y-5">
+              <form onSubmit={codeForm.handleSubmit} className="pace-wizard-fields">
                 <OtpInput
+                  variant="pace"
                   value={codeForm.values.code}
                   onChange={(v) => codeForm.setFieldValue("code", v)}
                   onComplete={(code) => {
@@ -245,15 +234,13 @@ export default function RoleOtpLogin({ role }: RoleOtpLoginProps) {
                   }
                 />
                 {codeForm.submitCount > 0 && codeForm.errors.code ? (
-                  <p className="text-xs text-destructive text-center">
-                    {codeForm.errors.code}
-                  </p>
+                  <p className="pace-wizard-error text-center">{codeForm.errors.code}</p>
                 ) : null}
                 <AuthFormError error={error} />
                 <button
                   type="submit"
                   disabled={verifyingOtp}
-                  className="w-full h-12 btn-primary rounded-xl flex items-center justify-center gap-2 text-sm font-semibold"
+                  className="pace-wizard-next w-full disabled:opacity-60"
                 >
                   {verifyingOtp ? (
                     <>
@@ -270,7 +257,7 @@ export default function RoleOtpLogin({ role }: RoleOtpLoginProps) {
                     setStep("email");
                     codeForm.resetForm();
                   }}
-                  className="w-full text-sm text-muted-foreground hover:text-primary py-1 inline-flex items-center justify-center gap-1 min-w-0"
+                  className="pace-wizard-back w-full inline-flex items-center justify-center gap-1 min-w-0"
                 >
                   <ArrowLeft className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
                   <span className="truncate">{email}</span>
@@ -281,20 +268,17 @@ export default function RoleOtpLogin({ role }: RoleOtpLoginProps) {
         </div>
 
         <div className="px-6 pb-6 shrink-0">
-          <div className="flex justify-center gap-4 text-xs text-muted-foreground mb-3">
+          <div className="flex justify-center gap-4 text-xs text-[#758176] mb-3">
             <span className="flex items-center gap-1">
-              <CheckCircle className="w-3.5 h-3.5 text-primary" />
+              <CheckCircle className="w-3.5 h-3.5 text-[var(--pace-green)]" />
               {t(`${i18nKey}.trustSecure`)}
             </span>
             <span className="flex items-center gap-1">
-              <CheckCircle className="w-3.5 h-3.5 text-primary" />
+              <CheckCircle className="w-3.5 h-3.5 text-[var(--pace-green)]" />
               {t(`${i18nKey}.trustInternal`)}
             </span>
           </div>
-          <div className="flex items-center justify-center mb-3">
-            <LanguageSwitcher variant="ghost" />
-          </div>
-          <p className="text-center text-[11px] text-muted-foreground/50">
+          <p className="pace-wizard-privacy text-center">
             {t("common.copyright", { year: new Date().getFullYear() })}
           </p>
         </div>

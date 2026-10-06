@@ -7,6 +7,8 @@ interface OtpInputProps {
   onComplete?: (code: string) => void;
   autoFocus?: boolean;
   hasError?: boolean;
+  /** Crisp pace marketing cells (2px radius, no scale). */
+  variant?: "default" | "pace";
 }
 
 export default function OtpInput({
@@ -15,6 +17,7 @@ export default function OtpInput({
   onComplete,
   autoFocus = false,
   hasError = false,
+  variant = "default",
 }: OtpInputProps) {
   const refs = useRef<(HTMLInputElement | null)[]>([]);
   const lastCompletedRef = useRef<string>("");
@@ -91,17 +94,25 @@ export default function OtpInput({
           onChange={(e) => handleChange(e, i)}
           onKeyDown={(e) => handleKeyDown(e, i)}
           onPaste={handlePaste}
-          className={[
-            "flex-1 min-w-0 max-w-[52px] h-12 sm:h-14 rounded-xl border text-center text-lg sm:text-xl font-bold font-mono",
-            "bg-background transition-all duration-150 outline-none",
-            "focus:scale-105 focus:shadow-md",
-            digit
-              ? "border-primary/60 bg-primary/5 text-foreground shadow-sm shadow-primary/10"
-              : "border-input text-foreground/40",
-            hasError
-              ? "border-destructive/60 bg-destructive/5"
-              : "hover:border-primary/40 focus:border-primary focus:ring-2 focus:ring-primary/20",
-          ].join(" ")}
+          className={
+            variant === "pace"
+              ? [
+                  "pace-otp-cell",
+                  digit ? "text-foreground" : "text-foreground/40",
+                  hasError ? "border-destructive/60 bg-destructive/5" : "",
+                ].join(" ")
+              : [
+                  "flex-1 min-w-0 max-w-[52px] h-12 sm:h-14 rounded-xl border text-center text-lg sm:text-xl font-bold font-mono",
+                  "bg-background transition-all duration-150 outline-none",
+                  "focus:scale-105 focus:shadow-md",
+                  digit
+                    ? "border-primary/60 bg-primary/5 text-foreground shadow-sm shadow-primary/10"
+                    : "border-input text-foreground/40",
+                  hasError
+                    ? "border-destructive/60 bg-destructive/5"
+                    : "hover:border-primary/40 focus:border-primary focus:ring-2 focus:ring-primary/20",
+                ].join(" ")
+          }
         />
       ))}
     </div>

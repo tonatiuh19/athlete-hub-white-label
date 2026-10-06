@@ -24,7 +24,7 @@ export default function AtleitaWordmark({
         className,
       )}
     >
-      atleita<span className="text-primary">.</span>
+      atleita<span className="text-atleita-citron">.</span>
     </Link>
   );
 }

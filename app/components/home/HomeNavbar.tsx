@@ -35,9 +35,9 @@ export default function HomeNavbar() {
   const isLoggedIn = Boolean(token && user);
 
   const authButtonClass = cn(
-    "text-xs sm:text-sm font-semibold rounded-xl transition-all duration-300 whitespace-nowrap",
+    "text-xs sm:text-sm font-semibold rounded-[3px] transition-all duration-300 whitespace-nowrap",
     onLightSurface
-      ? "btn-primary px-3 py-2 sm:px-5 sm:py-2.5"
+      ? "pace-header-cta px-3 py-2 sm:px-5 sm:py-2.5"
       : "px-3 py-2 sm:px-5 sm:py-2.5 text-primary border border-primary/40 bg-white/[0.06] backdrop-blur-md hover:bg-primary/15 hover:border-primary/70",
   );
 

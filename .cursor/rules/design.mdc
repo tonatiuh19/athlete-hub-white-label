@@ -1,0 +1,34 @@
+---
+description: Atleita visual system — pace shape language platform-wide (home, public, staff, portal)
+alwaysApply: true
+---
+
+# Atleita design (NO EXCEPTIONS)
+
+Canonical contract: `DESIGN.md`. Tokens: `app/global.css` (`:root`) + `tailwind.config.ts`.
+
+## Platform-wide (marketing + staff + athlete)
+
+1. **Light only** — no theme toggle, no product dark mode, no OS-driven `.dark` UI.
+2. **Palette** — evergreen `#214B3A`, citron `#D7ED70`, ink `#18231F` via semantic tokens (`primary`, `accent`, `background`, `atleita-*`). Never Triboo orange/cyan/purple marketplace chrome.
+3. **Type** — **Archivo** only (body + `.pace-site`). Never Inter / system stacks for product UI.
+4. **Shape language** — crisp pace radii platform-wide:
+   - CTAs / cards / nav chips: **3px** (`rounded-[3px]` / Tailwind `rounded-md|lg|xl` → 3px)
+   - Inputs / selects / textareas: **2px**
+   - Do **not** reintroduce soft SaaS corners (`rounded-2xl` / `rounded-xl` as visual intent, glassmorphism, multi-layer shadows)
+5. **Shells** — wrap public, organizer, auth, **staff**, and **athlete portal** in `.pace-site` (or inherit from layout). Dense editors may use `.staff-panel` for spacing density, **not** a second palette.
+6. **Chrome** — prefer `pace-header` / `pace-wordmark` / `pace-header-cta` / `pace-header-enter` / `pace-header-lang` / `pace-wizard-*` / `pace-form-field` when building marketing or onboarding; staff CTAs should match the same 3px evergreen language (`pace-header-cta` or shadcn `Button` with pace defaults).
+7. **Icons** — Lucide only in product UI; no emoji glyphs in JSX or i18n.
+
+## Anti-patterns (reject in review)
+
+- Soft SaaS: large radii, purple gradients, glass blur headers, orange nav borders
+- Dual systems: home looks pace, staff/portal looks generic shadcn
+- Hardcoded Triboo colors (`#ff5a1f`, hue `17`, cyan/purple accents)
+- New UI without checking `DESIGN.md` + existing `.pace-*` classes in `app/global.css`
+
+## When changing UI
+
+- Keep `--radius` at pace values; do not bump Tailwind `borderRadius` back to soft defaults
+- Update `DESIGN.md` if the visual contract changes
+- Ship regression coverage in `tests/unit/atleitaBrandTokens.spec.ts` for token/shell regressions

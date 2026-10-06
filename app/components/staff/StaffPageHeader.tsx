@@ -73,7 +73,11 @@ export default function StaffPageHeader({
   const utilities =
     showUtilities && portal ? (
       <div className="hidden lg:flex items-center gap-1.5 shrink-0">
-        <LanguageSwitcher variant="ghost" onLanguageChange={portal.persistLanguage} />
+        <LanguageSwitcher
+          variant="ghost"
+          className="pace-header-lang"
+          onLanguageChange={portal.persistLanguage}
+        />
       </div>
     ) : null;
 

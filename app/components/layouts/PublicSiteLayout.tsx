@@ -6,10 +6,7 @@ import { shouldHidePublicSiteNavbar } from "@/utils/mobileTabBar";
 import { cn } from "@/lib/utils";
 
 function isOrganizerOnboardingPath(pathname: string): boolean {
-  return (
-    pathname.startsWith("/organizers/") ||
-    pathname === "/organizers"
-  );
+  return pathname.startsWith("/organizers/") || pathname === "/organizers";
 }
 
 export default function PublicSiteLayout() {
@@ -18,15 +15,15 @@ export default function PublicSiteLayout() {
   const organizerFlow = isOrganizerOnboardingPath(pathname);
   const hideSiteNavbar = shouldHidePublicSiteNavbar(pathname);
 
-  // Atleita marketing home owns its own chrome (pace-site).
+  // Atleita marketing home owns its own pace-site chrome.
   if (isHome) {
     return <Outlet />;
   }
 
-  // Organizer signup/start: Atleita-only chrome (no athlete-marketplace nav).
+  // Organizer signup/start: same pace shell as home.
   if (organizerFlow) {
     return (
-      <div className="flex flex-col bg-background overflow-x-clip w-full max-w-full min-h-screen min-w-0">
+      <div className="pace-site atleita-organizer-page flex flex-col overflow-x-clip w-full max-w-full min-h-screen min-w-0">
         <AtleitaOrganizerHeader />
         <main className="flex-1 w-full min-w-0 overflow-x-clip">
           <Outlet />
@@ -36,7 +33,7 @@ export default function PublicSiteLayout() {
   }
 
   return (
-    <div className="flex flex-col bg-page-gradient overflow-x-clip w-full max-w-full min-h-screen min-w-0">
+    <div className="pace-site flex flex-col overflow-x-clip w-full max-w-full min-h-screen min-w-0">
       {hideSiteNavbar ? null : <HomeNavbar />}
       <main
         className={cn(
