@@ -1,0 +1,22 @@
+---
+description: API serverless rules — api/index.ts + server/ bundle for Vercel
+globs: api/**/*,server/**/*
+alwaysApply: false
+---
+
+# API (Vercel Serverless)
+
+- HTTP routes and orchestration live in `api/index.ts`; heavy logic may live in `server/*.ts` and `shared/*.ts` (bundled via `vercel.json` `includeFiles`)
+- **Forbidden**: runtime `import` from sibling `api/*.ts` except `./testHooks` — breaks or bloats the function bundle
+- Run `npm run check:api-inline` before deploy; fix violations before merging
+- Update `api/swagger.yaml` when endpoints change
+- Dev: single port **8080** (Vite + API)
+- Only add endpoints when needed (secrets, DB, server-only logic)
+- Keep types consistent across `app/`, `api/index.ts`, `shared/api.ts`
+- Return `{ error: string }` with correct status; friendly messages, not raw DB driver text
+- **Staff routes**: `requireAdmin` vs `requireOrganizer` — never assume one JWT works for both
+
+## Tests
+- API integration: `api/**/*.integration.test.ts` (supertest + `createServer()`)
+- Pure helpers: `api/**/*.test.ts` or `tests/unit/`
+- Export test hooks via `api/testHooks.ts`; use `setTestPool()` for mock DB suites

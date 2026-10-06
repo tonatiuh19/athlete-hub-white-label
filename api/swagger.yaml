@@ -1,0 +1,5541 @@
+openapi: 3.0.3
+info:
+  title: Athlete Hub API
+  description: |
+    REST API for the Athlete Hub sports events platform.
+
+    ## Authentication
+    - **Protected routes** require `Authorization: Bearer <session_token>`
+    - **Public routes** require no authentication
+
+    ## Base URL
+    All endpoints are prefixed with `/api`.
+  version: "1.0.0"
+  contact:
+    name: Athlete Hub Dev
+
+servers:
+  - url: /api
+    description: Same-origin (development & production)
+
+tags:
+  - name: Health
+    description: System health checks
+  - name: Auth
+    description: Passwordless OTP authentication (athlete, organizer, admin)
+  - name: Marketplace
+    description: Public event discovery
+  - name: Athlete
+    description: Athlete portal
+  - name: Organizer
+    description: Organizer portal
+  - name: Admin
+    description: Platform admin
+  - name: Simulation
+    description: Organizer simulation events (Stripe test kit, gated magic links)
+  - name: Webhooks
+    description: External service webhooks (Stripe)
+
+paths:
+  /sim/{token}:
+    get:
+      tags: [Simulation]
+      summary: Load a gated simulation event for test checkout
+      parameters:
+        - in: path
+          name: token
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Simulation event payload (categories, fields, test cards)
+        "404":
+          description: Not found
+  /sim/{token}/stripe-config:
+    get:
+      tags: [Simulation]
+      summary: Stripe test publishable key for simulation Elements
+      parameters:
+        - in: path
+          name: token
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Test mode publishable key
+        "503":
+          description: Stripe test kit not configured
+  /cron/cleanup-simulations:
+    post:
+      tags: [Simulation]
+      summary: Wipe expired simulation generated data (keep event shell)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Cleanup result
+        "401":
+          description: Unauthorized
+  /cron/cleanup-mp-pending:
+    post:
+      tags: [Payments]
+      summary: >
+        Historical TTL cleanup for unpaid Mercado Pago pending/processing payment rows
+        (legacy MP checkout). No new MP payments are created in v1.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Cleanup result
+        "401":
+          description: Unauthorized
+  /organizer/simulations:
+    get:
+      tags: [Simulation, Organizer]
+      summary: List organizer simulations (owner only)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Simulations + quota
+    post:
+      tags: [Simulation, Organizer]
+      summary: Create or clone a simulation event (owner only)
+      security:
+        - bearerAuth: []
+      responses:
+        "201":
+          description: Created
+        "400":
+          description: Quota or validation error
+  /admin/simulations:
+    get:
+      tags: [Simulation, Admin]
+      summary: List all simulation events
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Simulations
+  /health:
+    get:
+      tags: [Health]
+      summary: Health check
+      responses:
+        "200":
+          description: Service is healthy
+        "503":
+          description: Database disconnected
+
+  /ping:
+    get:
+      tags: [Health]
+      summary: Ping
+      responses:
+        "200":
+          description: Pong
+
+  /auth/athlete/check-email:
+    post:
+      tags: [Auth]
+      summary: Check if an athlete account exists for an email
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email:
+                  type: string
+      responses:
+        "200":
+          description: Whether the email is registered
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  exists:
+                    type: boolean
+                  hasPassword:
+                    type: boolean
+                  hasSocialLogin:
+                    type: boolean
+
+  /auth/athlete/request-otp:
+    post:
+      tags: [Auth]
+      summary: Send passwordless login OTP to an existing athlete email
+      description: >
+        Accepts optional `locale` (`es`|`en`) and/or `Accept-Language`.
+        Errors return localized `error` plus stable `code` (see LocalizedError).
+        Existing accounts prefer DB `preferred_language` over body locale for OTP email language.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email:
+                  type: string
+                locale:
+                  $ref: '#/components/schemas/AppLocale'
+      responses:
+        "200":
+          description: Code sent
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/LocalizedSuccess'
+                  - type: object
+                    properties:
+                      ok:
+                        type: boolean
+                      email:
+                        type: string
+        "404":
+          description: No account for email
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LocalizedError'
+        "409":
+          description: Social-only account — use Clerk OAuth
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LocalizedError'
+        "429":
+          description: Rate limited
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LocalizedError'
+
+  /auth/athlete/verify-otp:
+    post:
+      tags: [Auth]
+      summary: Verify athlete email OTP and issue session
+      description: >
+        Optional `locale`. Errors use LocalizedError (`error` + `code`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, code]
+              properties:
+                email:
+                  type: string
+                code:
+                  type: string
+                locale:
+                  $ref: '#/components/schemas/AppLocale'
+      responses:
+        "200":
+          description: Session token returned
+        "401":
+          description: Invalid or expired code
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LocalizedError'
+
+  /auth/athlete/register:
+    post:
+      tags: [Auth]
+      summary: Register athlete (passwordless OTP by default; password optional for legacy)
+      description: >
+        Omitting `password` creates the athlete and emails a one-time code
+        (`requiresOtp: true`). Providing a password issues a session immediately (legacy).
+        Optional `locale` sets `preferred_language` for new accounts and localizes validation
+        errors (`names_required`, `date_of_birth_required`, `invalid_gender`, `password_policy`, etc.).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, firstName, lastName, dateOfBirth]
+              properties:
+                email:
+                  type: string
+                firstName:
+                  type: string
+                lastName:
+                  type: string
+                password:
+                  type: string
+                  description: Optional — omit for passwordless OTP signup
+                dateOfBirth:
+                  type: string
+                  format: date
+                  description: YYYY-MM-DD — used for category eligibility
+                gender:
+                  type: string
+                  enum: [male, female, other, prefer_not_to_say]
+                locale:
+                  $ref: '#/components/schemas/AppLocale'
+                theme:
+                  $ref: '#/components/schemas/AppTheme'
+      responses:
+        "200":
+          description: Session token, or requiresOtp payload for passwordless signup
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  requiresOtp:
+                    type: boolean
+                  email:
+                    type: string
+                  message:
+                    type: string
+                    description: Localized success text when requiresOtp
+                  code:
+                    type: string
+                    example: verification_code_sent
+        "400":
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LocalizedError'
+        "409":
+          description: Account exists / social-only
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LocalizedError'
+
+  /auth/athlete/login:
+    post:
+      tags: [Auth]
+      summary: Athlete email/password login (legacy)
+      description: >
+        Prefer `request-otp` / `verify-otp`. If `password_hash` is null, responds with
+        `otp_required` and emails a login OTP (social-only → `social_account_exists`).
+        Optional `locale`. Errors return LocalizedError.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:
+                  type: string
+                password:
+                  type: string
+                locale:
+                  $ref: '#/components/schemas/AppLocale'
+      responses:
+        "200":
+          description: Session token returned
+        "403":
+          description: Passwordless account — OTP emailed (`otp_required`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LocalizedError'
+        "409":
+          description: Social-only account — use Clerk OAuth
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LocalizedError'
+
+  /auth/athlete/forgot-password:
+    post:
+      tags: [Auth]
+      summary: Request athlete password reset or login OTP
+      description: >
+        Password accounts receive a reset code. Passwordless accounts receive a login OTP
+        (same as request-otp). Social-only accounts get a generic ok with no email.
+        Optional `locale`. Success message is localized (`forgot_password_instructions_sent`).
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                email:
+                  type: string
+                locale:
+                  $ref: '#/components/schemas/AppLocale'
+      responses:
+        "200":
+          description: Always returns ok (no email enumeration)
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/LocalizedSuccess'
+                  - type: object
+                    properties:
+                      ok:
+                        type: boolean
+
+  /auth/athlete/reset-password:
+    post:
+      tags: [Auth]
+      summary: Reset athlete password with email and 6-digit code from email
+      description: >
+        Optional `locale`. Validation errors use LocalizedError codes such as
+        `reset_code_required`, `password_policy`, `invalid_or_expired_reset_code`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, code, password]
+              properties:
+                email:
+                  type: string
+                code:
+                  type: string
+                  pattern: "^\\d{6}$"
+                password:
+                  type: string
+                locale:
+                  $ref: '#/components/schemas/AppLocale'
+      responses:
+        "200":
+          description: Password updated; may return session token
+        "400":
+          description: Validation or invalid reset code
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LocalizedError'
+
+  /auth/organizer/request-otp:
+    post:
+      tags: [Auth]
+      summary: Request organizer OTP
+      responses:
+        "200":
+          description: OTP sent
+
+  /auth/organizer/verify-otp:
+    post:
+      tags: [Auth]
+      summary: Verify organizer OTP
+      responses:
+        "200":
+          description: Session token returned
+
+  /auth/admin/request-otp:
+    post:
+      tags: [Auth]
+      summary: Request admin OTP
+      responses:
+        "200":
+          description: OTP sent
+
+  /auth/admin/verify-otp:
+    post:
+      tags: [Auth]
+      summary: Verify admin OTP
+      responses:
+        "200":
+          description: Session token returned
+
+  /auth/admin/me:
+    get:
+      tags: [Auth]
+      summary: Current admin profile
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Admin profile
+    patch:
+      tags: [Auth]
+      summary: Update current admin profile
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                first_name:
+                  type: string
+                last_name:
+                  type: string
+                phone:
+                  type: string
+                  nullable: true
+                preferred_language:
+                  type: string
+                  enum: [es, en]
+                preferred_theme:
+                  type: string
+                  enum: [light, dark, system]
+      responses:
+        "200":
+          description: Updated admin profile
+
+  /auth/admin/avatar:
+    post:
+      tags: [Auth]
+      summary: Upload admin profile photo
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Photo uploaded
+    delete:
+      tags: [Auth]
+      summary: Remove admin profile photo
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Photo removed
+
+  /auth/organizer/me:
+    get:
+      tags: [Auth]
+      summary: Current organizer member profile
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Organizer member profile
+    patch:
+      tags: [Auth]
+      summary: Update current organizer member profile
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                first_name:
+                  type: string
+                last_name:
+                  type: string
+                phone:
+                  type: string
+                  nullable: true
+                preferred_language:
+                  type: string
+                  enum: [es, en]
+      responses:
+        "200":
+          description: Updated organizer member profile
+
+  /auth/organizer/avatar:
+    post:
+      tags: [Auth]
+      summary: Upload organizer member profile photo
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Photo uploaded
+    delete:
+      tags: [Auth]
+      summary: Remove organizer member profile photo
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Photo removed
+
+  /auth/clerk/athlete:
+    post:
+      tags: [Auth]
+      summary: Exchange Clerk session for athlete JWT
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sessionToken]
+              properties:
+                sessionToken:
+                  type: string
+      responses:
+        "200":
+          description: Athlete session token
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Revoke current session
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Logged out
+
+  /sport-types:
+    get:
+      tags: [Marketplace]
+      summary: List active sport types
+      responses:
+        "200":
+          description: Sport types list
+
+  /public/home:
+    get:
+      tags: [Marketplace]
+      summary: Public home page data (live stats, all published events, leaderboards)
+      responses:
+        "200":
+          description: Platform stats, published events, top athletes and teams
+
+  /public/site-profile:
+    get:
+      tags: [Marketplace]
+      summary: Public site profile (legal entity and contact page config)
+      responses:
+        "200":
+          description: Merged site public profile with empty fields omitted in UI
+
+  /sites/by-subdomain/{subdomain}:
+    get:
+      tags: [OrganizerSites]
+      summary: Public published organizer microsite by vanity subdomain
+      description: >
+        Returns theme, sections, legal docs, and upcoming published public events.
+        Draft / pending_approval events are never included.
+      parameters:
+        - name: subdomain
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Site payload including events[]
+        "404":
+          description: Site not found or not published
+
+  /organizer/site:
+    get:
+      tags: [OrganizerSites]
+      summary: Load organizer microsite for the site editor
+      description: >
+        Authenticated organizer site chrome plus upcoming events including draft
+        and pending_approval (editor layout preview only). Publish site does not
+        publish events. Legal documents (terms/privacy/refund) are edited via
+        PATCH with legal[] — required (ES, non-empty HTML) before event
+        submit/approve.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Site payload including events[] and legal[]
+        "401":
+          description: Unauthorized
+    patch:
+      tags: [OrganizerSites]
+      summary: Save organizer microsite draft or publish the site
+      description: >
+        Updates theme/sections/legal and optional site status (draft|published|suspended).
+        Does not change event statuses — events require their own publish/approval flow
+        and organizer ES legal docs (terms, privacy, refund) must be non-empty HTML.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                subdomain:
+                  type: string
+                status:
+                  type: string
+                  enum: [draft, published, suspended]
+                localeDefault:
+                  type: string
+                  enum: [es, en]
+                theme:
+                  type: object
+                sections:
+                  type: array
+                  items:
+                    type: object
+                legal:
+                  type: array
+                  items:
+                    type: object
+      responses:
+        "200":
+          description: Updated site payload including events[]
+        "400":
+          description: Invalid subdomain or payload
+        "409":
+          description: Subdomain taken
+
+
+
+  /public/organizers/register:
+    post:
+      tags: [Staff]
+      summary: Self-service organizer registration (public)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - owner_first_name
+                - owner_last_name
+                - owner_email
+                - name
+                - city
+              properties:
+                owner_first_name:
+                  type: string
+                owner_last_name:
+                  type: string
+                owner_email:
+                  type: string
+                  format: email
+                owner_phone:
+                  type: string
+                name:
+                  type: string
+                email:
+                  type: string
+                  format: email
+                phone:
+                  type: string
+                city:
+                  type: string
+                country:
+                  type: string
+                  default: MX
+                locale:
+                  type: string
+                  description: >
+                    UI locale from the signup form (es|en). Drives welcome-email
+                    language and owner preferred_language. Falls back to
+                    Accept-Language when omitted.
+                intake:
+                  type: object
+                  properties:
+                    event_name:
+                      type: string
+                      nullable: true
+                      maxLength: 200
+                    sport_type_id:
+                      type: integer
+                      nullable: true
+                    rough_date:
+                      type: string
+                      format: date
+                      nullable: true
+                    expected_size:
+                      type: string
+                      enum: ["<100", "100-500", "500+"]
+                      nullable: true
+      responses:
+        "201":
+          description: Organizer created; verify email with staff OTP next
+        "400":
+          description: Validation error
+        "409":
+          description: Email already registered
+        "429":
+          description: Rate limited
+
+
+
+  /events:
+    get:
+      tags: [Marketplace]
+      summary: List published public events with search, filters, and pagination
+      parameters:
+        - name: q
+          in: query
+          description: >
+            Search query (min 2 chars). Uses the same fuzzy, accent-insensitive
+            matching as GET /search/suggest across title, sport, city, organizer,
+            and keywords. Default sort date_asc ranks by relevance when q is set.
+          schema:
+            type: string
+        - name: sport
+          in: query
+          schema:
+            type: string
+        - name: city
+          in: query
+          schema:
+            type: string
+        - name: geoCityId
+          in: query
+          schema:
+            type: integer
+          description: Canonical geo_cities id for exact city+state filtering. Unknown ids return an empty result set.
+        - name: featured
+          in: query
+          schema:
+            type: boolean
+        - name: dateFrom
+          in: query
+          schema:
+            type: string
+            format: date
+          description: Inclusive start of date range (compared by calendar day)
+        - name: dateTo
+          in: query
+          schema:
+            type: string
+            format: date
+          description: Inclusive end of date range (compared by calendar day). Inverted ranges are normalized automatically.
+        - name: minPrice
+          in: query
+          schema:
+            type: number
+        - name: maxPrice
+          in: query
+          schema:
+            type: number
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum: [date_asc, date_desc, price_asc, price_desc, popular]
+        - name: limit
+          in: query
+          schema:
+            type: integer
+        - name: offset
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Events list with total count, includes location_lat and location_lng
+
+  /geo/states:
+    get:
+      tags: [Geo]
+      summary: List states/provinces for a country
+      parameters:
+        - name: country
+          in: query
+          schema:
+            type: string
+            default: MX
+      responses:
+        "200":
+          description: States list
+
+  /geo/cities:
+    get:
+      tags: [Geo]
+      summary: List cities from the geo catalog
+      parameters:
+        - name: country
+          in: query
+          schema:
+            type: string
+            default: MX
+        - name: state_id
+          in: query
+          schema:
+            type: integer
+        - name: q
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Cities list with state metadata
+
+  /geo/resolve-place:
+    get:
+      tags: [Geo]
+      summary: Resolve coordinates for an event place pin
+      description: >
+        Uses event lat/lng when provided, otherwise geo_cities catalog coords,
+        otherwise Nominatim geocoding (Mexico-biased).
+      parameters:
+        - name: country
+          in: query
+          schema:
+            type: string
+            default: MX
+        - name: city
+          in: query
+          schema:
+            type: string
+        - name: state
+          in: query
+          schema:
+            type: string
+        - name: name
+          in: query
+          schema:
+            type: string
+        - name: lat
+          in: query
+          schema:
+            type: number
+        - name: lng
+          in: query
+          schema:
+            type: number
+      responses:
+        "200":
+          description: Resolved place or null
+
+  /events/filters/cities:
+    get:
+      tags: [Marketplace]
+      summary: List cities with published event counts (geo catalog backed)
+      responses:
+        "200":
+          description: Array of geo cities with id, city, state, lat, lng, and event_count
+
+  /events/subdomain-available:
+    get:
+      tags: [Marketplace]
+      summary: Check whether an event vanity subdomain is available
+      parameters:
+        - name: subdomain
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 3
+            maxLength: 63
+      responses:
+        "200":
+          description: Availability result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EventSubdomainAvailableResponse"
+
+  /events/subdomain/{subdomain}:
+    get:
+      tags: [Marketplace]
+      summary: Resolve vanity host to canonical /events/{slug} path
+      description: >
+        Returns published/completed non-simulation events with visibility
+        public or unlisted. Reserved-but-unpublished vanity hosts return 404
+        with code `not_live`; unknown hosts return code `not_found`.
+      parameters:
+        - name: subdomain
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Published event mapping
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EventSubdomainResolveResponse"
+        "404":
+          description: Not found or not live yet
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum: [not_found, not_live]
+                  status:
+                    type: string
+                  visibility:
+                    type: string
+
+  /search/suggest:
+    get:
+      tags: [Marketplace]
+      summary: Unified autocomplete for events, cities, and sports
+      description: |
+        City suggestions include published event locations and matches from the
+        INEGI municipio catalog (geo_cities), with geoCityId when available.
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 2
+      responses:
+        "200":
+          description: Grouped search suggestions
+
+  /events/{slug}:
+    get:
+      tags: [Marketplace]
+      summary: Get event detail with categories, registration fields, course, and media
+      description: |
+        Optional Bearer athlete token. When authenticated, includes `myRegistration`
+        if the athlete has a pending or confirmed registration for this event.
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Event detail (may include myRegistration for signed-in athletes)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  feePresentation:
+                    $ref: "#/components/schemas/FeePresentation"
+                  payments_available:
+                    type: boolean
+                    description: False when published paid categories exist but organizer Connect payout is not ready
+                  has_paid_categories:
+                    type: boolean
+                  categories:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/EventCategoryPricing"
+        "404":
+          description: Event not found
+
+  /athlete/me:
+    get:
+      tags: [Athlete]
+      summary: Get current athlete profile
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Athlete profile
+    patch:
+      tags: [Athlete]
+      summary: Update athlete profile (name, contact, sport details)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [first_name, last_name]
+              properties:
+                first_name:
+                  type: string
+                last_name:
+                  type: string
+                phone:
+                  type: string
+                  nullable: true
+                date_of_birth:
+                  type: string
+                  format: date
+                  nullable: true
+                gender:
+                  type: string
+                  enum: [male, female, other, prefer_not_to_say]
+                  nullable: true
+                shirt_size:
+                  type: string
+                  enum: [XS, S, M, L, XL, XXL]
+                  nullable: true
+                country:
+                  type: string
+                city:
+                  type: string
+                  nullable: true
+                emergency_contact_name:
+                  type: string
+                  nullable: true
+                emergency_contact_phone:
+                  type: string
+                  nullable: true
+      responses:
+        "200":
+          description: Profile updated
+        "400":
+          description: Validation error
+        "409":
+          description: Phone already in use
+
+  /athlete/preferences:
+    patch:
+      tags: [Athlete]
+      summary: Update athlete preferences (language)
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                preferred_language:
+                  type: string
+                  enum: [es, en]
+      responses:
+        "200":
+          description: Preferences updated
+
+  /athlete/registrations:
+    get:
+      tags: [Athlete]
+      summary: List athlete registrations
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Registrations list (includes order_id / managed / claim-pending flags)
+
+  /athlete/order-wallets:
+    get:
+      tags: [Athlete]
+      summary: Pass wallet for group purchases (managed minors + unclaimed guests)
+      description: >
+        Returns QR passes the signed-in purchaser should hold at the gate —
+        managed participants (no claim) and adult guests with pending claim tokens.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Wallet list ordered by most recent group order
+
+  /athlete/registrations/claim-guest:
+    post:
+      tags: [Athlete]
+      summary: Claim a guest registration into the signed-in athlete account
+      description: |
+        Links a guest registration (purchased by someone else) to the authenticated athlete
+        when the claim token email matches the athlete login email.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [claimToken]
+              properties:
+                claimToken:
+                  type: string
+                  format: uuid
+      responses:
+        "200":
+          description: Registration claimed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  registration:
+                    type: object
+                    properties:
+                      public_uuid:
+                        type: string
+                      registration_number:
+                        type: string
+                      event_slug:
+                        type: string
+                      event_title:
+                        type: string
+                      category_name:
+                        type: string
+        "403":
+          description: Claim email does not match signed-in athlete
+        "404":
+          description: Invalid or expired claim token
+        "409":
+          description: Athlete already registered for this event
+
+  /athlete/waitlist:
+    get:
+      tags: [Athlete]
+      summary: List athlete waitlist entries
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Active waitlist entries with event and category info
+
+  /athlete/results:
+    get:
+      tags: [Athlete]
+      summary: List published race results for the athlete
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Published results with ranks and finish times
+
+  /athlete/avatar:
+    post:
+      tags: [Athlete]
+      summary: Upload profile photo (optimized data URL)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [image]
+              properties:
+                image:
+                  type: string
+                  description: data:image/jpeg;base64,... (max 180KB decoded)
+      responses:
+        "200":
+          description: Avatar updated
+        "400":
+          description: Invalid image
+    delete:
+      tags: [Athlete]
+      summary: Remove custom profile photo
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Avatar removed
+
+  /athlete/payment-methods:
+    get:
+      tags: [Athlete]
+      summary: List saved Stripe payment methods for the athlete
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Saved cards and default payment method id
+
+  /athlete/payment-methods/setup-intent:
+    post:
+      tags: [Athlete]
+      summary: Create Stripe SetupIntent to add a new card
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: SetupIntent client secret
+
+  /athlete/payment-methods/complete-setup:
+    post:
+      tags: [Athlete]
+      summary: Finalize card setup and optionally set default
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [setupIntentId]
+              properties:
+                setupIntentId:
+                  type: string
+                setAsDefault:
+                  type: boolean
+      responses:
+        "200":
+          description: Updated payment methods list
+
+  /athlete/payment-methods/default:
+    patch:
+      tags: [Athlete]
+      summary: Set default payment method
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [paymentMethodId]
+              properties:
+                paymentMethodId:
+                  type: string
+      responses:
+        "200":
+          description: Updated payment methods list
+
+  /athlete/payment-methods/{paymentMethodId}:
+    delete:
+      tags: [Athlete]
+      summary: Remove a saved payment method
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: paymentMethodId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Updated payment methods list
+
+
+
+
+
+
+
+  /athlete/registrations/{publicUuid}/waivers/resign:
+    post:
+      tags: [Athlete]
+      summary: Re-sign outdated event waivers for a confirmed registration
+      description: >
+        Validates and stores waiver signatures, regenerates stamped acceptance PDFs,
+        and emails the athlete the updated certificates when stamp succeeds.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: publicUuid
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [waiverSignatures]
+              properties:
+                waiverSignatures:
+                  type: array
+                  items:
+                    type: object
+                    required: [waiverId, signature]
+                    properties:
+                      waiverId:
+                        type: integer
+                      signature:
+                        type: string
+                        description: ACCEPTED checkbox token or typed name (≥3 chars)
+                      waiverVersion:
+                        type: integer
+      responses:
+        "200":
+          description: Waivers re-signed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  acceptancePdfsAttached:
+                    type: integer
+                    description: Count of stamped PDFs emailed (0 if stamp failed)
+        "400":
+          description: Invalid signatures or registration not eligible
+        "404":
+          description: Registration not found
+
+  /athlete/registrations/{publicUuid}/transfer:
+    post:
+      tags: [Athlete]
+      summary: Transfer registration to another athlete by email
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: publicUuid
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [recipientEmail]
+              properties:
+                recipientEmail:
+                  type: string
+                  format: email
+      responses:
+        "200":
+          description: Transfer completed
+        "400":
+          description: Transfers not allowed or invalid state
+        "403":
+          description: Not the registration owner
+        "404":
+          description: Registration or recipient not found
+        "409":
+          description: Recipient already registered
+
+  /events/{slug}/register/checkout:
+    post:
+      tags: [Marketplace]
+      summary: Create pending registration and Stripe PaymentIntent
+      description: |
+        Creates a Stripe checkout (payment record only). Registration is created
+        when payment succeeds via /register/confirm or payment_intent.succeeded webhook.
+
+        **Single ticket:** send `categoryId` (required) plus optional fields.
+
+        **Group / family order:** send `lineItems` (1..max_per_order participants) instead of
+        `categoryId`. Each line item includes participant type (self, account, guest), category,
+        waivers, and extras. One discount code applies to the whole order.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [idempotencyKey]
+              properties:
+                categoryId:
+                  type: integer
+                  description: Required for single-ticket checkout (omit when using lineItems)
+                lineItems:
+                  type: array
+                  description: Group checkout participants (omit categoryId when present)
+                  minItems: 1
+                  items:
+                    type: object
+                    required: [lineId, participantType, categoryId]
+                    properties:
+                      lineId:
+                        type: string
+                        format: uuid
+                      participantType:
+                        type: string
+                        enum: [self, account, guest]
+                      accountEmail:
+                        type: string
+                        format: email
+                      guest:
+                        type: object
+                        properties:
+                          firstName:
+                            type: string
+                          lastName:
+                            type: string
+                          email:
+                            type: string
+                            format: email
+                          dateOfBirth:
+                            type: string
+                            format: date
+                          gender:
+                            type: string
+                      guardianRelationship:
+                        type: string
+                      categoryId:
+                        type: integer
+                      fieldValues:
+                        type: object
+                        additionalProperties: true
+                      waiverSignatures:
+                        type: array
+                        items:
+                          type: object
+                      selectedExtras:
+                        type: array
+                        items:
+                          type: object
+                      extraFieldAnswers:
+                        type: array
+                        items:
+                          type: object
+                fieldValues:
+                  type: object
+                  additionalProperties: true
+                idempotencyKey:
+                  type: string
+                waiverId:
+                  type: integer
+                  description: Required when event requires_waiver is true
+                waiverSignature:
+                  type: string
+                  description: Typed signature when waiver is required
+                discountCode:
+                  type: string
+                  description: Optional discount code to apply at checkout
+                selectedExtras:
+                  type: array
+                  description: Optional add-on lines (extraId + quantity)
+                  items:
+                    type: object
+                    required: [extraId, quantity]
+                    properties:
+                      extraId:
+                        type: integer
+                      quantity:
+                        type: integer
+                        minimum: 1
+                        maximum: 99
+                extraFieldAnswers:
+                  type: array
+                  description: Per-add-on answers for custom athlete questions
+                  items:
+                    $ref: "#/components/schemas/ExtraFieldAnswersInput"
+      responses:
+        "200":
+          description: Checkout session with client secret
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegistrationCheckoutResponse"
+        "401":
+          description: Unauthorized
+        "409":
+          description: Already registered, sold out, or waitlist available (code waitlist_available)
+
+  /events/{slug}/register/checkout/msi-plan:
+    post:
+      tags: [Marketplace]
+      summary: Apply or clear Mexico MSI plan before Stripe confirm
+      description: |
+        Updates the pending PaymentIntent amount, application_fee_amount (Y2 uplift),
+        and card installments plan. Only when the event has MSI enabled, checkout is
+        Stripe, and the one-shot athlete total is at least $1,000 MXN. Group checkout
+        is not supported yet. Pass planMonths null to return to contado (base fee).
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [paymentPublicUuid]
+              properties:
+                paymentPublicUuid:
+                  type: string
+                planMonths:
+                  type: integer
+                  nullable: true
+                  enum: [3, 6, 9]
+                  description: null clears MSI (pay in full)
+      responses:
+        "200":
+          description: Updated checkout session
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegistrationCheckoutResponse"
+        "400":
+          description: MSI unavailable or invalid plan
+        "401":
+          description: Unauthorized
+        "404":
+          description: Payment not found
+        "409":
+          description: Payment no longer editable
+
+  /events/{slug}/discount/validate:
+    post:
+      tags: [Marketplace]
+      summary: Validate discount code and preview pricing
+      description: Public endpoint; athlete auth optional.
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code, categoryId]
+              properties:
+                code:
+                  type: string
+                categoryId:
+                  type: integer
+      responses:
+        "200":
+          description: Discount preview with adjusted price breakdown
+        "400":
+          description: Invalid or inapplicable discount code
+
+  /events/{slug}/waitlist:
+    post:
+      tags: [Marketplace]
+      summary: Join category waitlist when sold out
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [categoryId]
+              properties:
+                categoryId:
+                  type: integer
+      responses:
+        "201":
+          description: Waitlist entry created
+        "400":
+          description: Category not sold out or waitlist disabled
+        "409":
+          description: Already on waitlist or registered
+
+  /events/{slug}/register/confirm:
+    post:
+      tags: [Marketplace]
+      summary: Confirm payment and activate registration
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [paymentPublicUuid]
+              properties:
+                paymentPublicUuid:
+                  type: string
+                paymentIntentId:
+                  type: string
+                paymentMethodId:
+                  type: string
+                  description: Pay with a saved card (server-side confirm)
+      responses:
+        "200":
+          description: Registration confirmed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  confirmationEmail:
+                    type: string
+                    description: Athlete login email — confirmation is sent here only
+                  registration:
+                    type: object
+        "402":
+          description: Payment failed or requires additional authentication (3DS)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  error:
+                    type: string
+                  requiresAction:
+                    type: boolean
+                  clientSecret:
+                    type: string
+
+  /athlete/pending-checkout:
+    get:
+      tags: [Athlete]
+      summary: List incomplete registration checkouts for the signed-in athlete
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventSlug
+          in: query
+          required: false
+          schema:
+            type: string
+          description: When set, returns at most one pending checkout for that event
+      responses:
+        "200":
+          description: Pending checkout payments without a linked registration
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pending:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        public_uuid:
+                          type: string
+                        amount_cents:
+                          type: integer
+                        currency:
+                          type: string
+                        status:
+                          type: string
+                        event_title:
+                          type: string
+                        event_slug:
+                          type: string
+                        category_name:
+                          type: string
+                          nullable: true
+                        category_id:
+                          type: integer
+                          nullable: true
+
+  /config/payments:
+    get:
+      tags: [Marketplace]
+      summary: Stripe publishable key and currency
+      responses:
+        "200":
+          description: Payment configuration
+
+  /config/app-version:
+    get:
+      tags: [Health]
+      summary: Deployed application version (footer display)
+      responses:
+        "200":
+          description: Current app version
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version:
+                    type: string
+                    nullable: true
+
+  /organizer/events:
+    get:
+      tags: [Organizer]
+      summary: Paginated list of organizer events (respects member event access)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [draft, pending_approval, published, cancelled, completed]
+        - name: simulation
+          in: query
+          description: Filter by simulation flag (`1` simulations only, `0` live only, omit for both)
+          schema:
+            type: string
+            enum: ["0", "1", "all"]
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: sortBy
+          in: query
+          schema:
+            type: string
+        - name: sortDir
+          in: query
+          schema:
+            type: string
+            enum: [ASC, DESC]
+      responses:
+        "200":
+          description: Paginated events list
+    post:
+      tags: [Organizer]
+      summary: Create a new event draft
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/StaffEventUpsertRequest"
+                - type: object
+                  required: [title, subdomain, sport_type_id, start_date]
+      responses:
+        "201":
+          description: Event created
+        "400":
+          description: Validation error (e.g. subdomain required / already taken)
+
+  /organizer/events/{eventId}:
+    get:
+      tags: [Organizer]
+      summary: Event detail with categories
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Event detail (includes bib_mode)
+    patch:
+      tags: [Organizer]
+      summary: Update organizer event
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StaffEventUpsertRequest"
+      responses:
+        "200":
+          description: Updated event
+        "400":
+          description: Validation error (includes subdomain_immutable when subdomain changes)
+    delete:
+      tags: [Organizer]
+      summary: Soft-delete event (cancels open registrations; prefer deactivate-listing)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Soft-deleted; returns cancelledRegistrations count
+        "403":
+          description: Only owner/organizer
+
+  /organizer/events/{eventId}/deactivate-listing:
+    post:
+      tags: [Organizer]
+      summary: Hide event from marketplace (visibility=unlisted)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Event detail with unlisted visibility
+
+  /organizer/events/{eventId}/publish:
+    post:
+      tags: [Organizer]
+      summary: Submit event for admin approval (requires active categories)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Event moved to pending_approval status
+
+  /organizer/events/{eventId}/categories:
+    post:
+      tags: [Organizer]
+      summary: Add registration category
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "201":
+          description: Category added
+
+  /organizer/events/{eventId}/categories/{categoryId}:
+    patch:
+      tags: [Organizer]
+      summary: Update category pricing and capacity
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: categoryId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Categories updated
+    delete:
+      tags: [Organizer]
+      summary: Remove or deactivate category
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: categoryId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Categories updated
+
+  /organizer/events/{eventId}/registration-fields:
+    get:
+      tags: [Organizer]
+      summary: List custom registration fields
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Registration fields
+    put:
+      tags: [Organizer]
+      summary: Replace custom registration fields
+      description: >
+        Each field may use scope_type all_categories (default) or selected_categories
+        with category_ids. Selected scope requires at least one valid event category id.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Fields updated
+
+  /organizer/events/{eventId}/folio-segments:
+    get:
+      tags: [Organizer]
+      summary: List custom folio segment rules
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Folio segment rules for the event
+    put:
+      tags: [Organizer]
+      summary: Replace custom folio segment rules
+      description: >
+        Rules are evaluated top to bottom by sort_order. Each rule may filter by
+        category scope and coupon scope, define a pattern (tokens + literals),
+        choose counter scope (segment, event, or category), and optionally set an
+        inclusive end_number to reserve a folio block (e.g. 1–100). Active blocks
+        with overlapping start/end ranges are rejected. When a block is full,
+        new registrations for that rule fail. Unmatched registrations keep the
+        legacy REG-{eventId}-{sequence} format.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Folio rules updated
+        "400":
+          description: Validation error
+        "409":
+          description: Cannot remove a segment that already issued folios
+
+  /organizer/events/{eventId}/extras:
+    post:
+      tags: [Organizer]
+      summary: Create event add-on (extra)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StaffEventExtraInput"
+      responses:
+        "201":
+          description: Add-on created; returns full extras list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  extras:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/StaffEventExtra"
+        "400":
+          description: Validation error (scope, sales window, fields)
+        "409":
+          description: Payout setup required for paid add-ons
+
+  /organizer/events/{eventId}/extras/{extraId}:
+    patch:
+      tags: [Organizer]
+      summary: Update event add-on
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: extraId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StaffEventExtraPatch"
+      responses:
+        "200":
+          description: Updated extras list
+        "409":
+          description: Field definitions locked after first sale
+    delete:
+      tags: [Organizer]
+      summary: Remove or deactivate add-on
+      description: >
+        Hard-deletes when sold_count is 0. Soft-deletes (is_active=0) when the add-on
+        has purchases, preserving registration history. Idempotent when already removed.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: extraId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Updated extras list
+
+  /organizer/events/{eventId}/waivers:
+    get:
+      tags: [Organizer]
+      summary: List event waivers (HTML/PDF, audience adult|minor|all, optional category_ids)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Waivers list (includes audience, category_ids, pdf_url, content_type)
+    put:
+      tags: [Organizer]
+      summary: Sync event waivers (version bump on edit; audience + category targeting)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                waivers:
+                  type: array
+                  items:
+                    type: object
+                    required: [title]
+                    properties:
+                      id: { type: integer }
+                      title: { type: string }
+                      content_html: { type: string }
+                      pdf_url: { type: string, nullable: true }
+                      content_type: { type: string, enum: [html, pdf, both] }
+                      audience: { type: string, enum: [all, adult, minor] }
+                      category_ids:
+                        type: array
+                        items: { type: integer }
+                        nullable: true
+                      sort_order: { type: integer }
+      responses:
+        "200":
+          description: Waiver saved
+
+  /organizer/events/{eventId}/schedule-waves:
+    get:
+      tags: [Organizer]
+      summary: List schedule waves
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Waves list
+    put:
+      tags: [Organizer]
+      summary: Replace schedule waves
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Waves saved
+
+  /organizer/events/{eventId}/course:
+    get:
+      tags: [Organizer]
+      summary: Get event course map
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Course data
+    put:
+      tags: [Organizer]
+      summary: Upsert event course map
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Course saved
+
+  /organizer/events/fetch-image:
+    post:
+      tags: [Organizer]
+      summary: Fetch CDN image bytes for staff re-crop (CORS bypass)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url:
+                  type: string
+                  format: uri
+      responses:
+        "200":
+          description: Base64-encoded image
+        "400":
+          description: Invalid or disallowed URL
+
+  /organizer/events/{eventId}/discount-codes:
+    get:
+      tags: [Organizer]
+      summary: List discount codes
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Discount codes list
+    post:
+      tags: [Organizer]
+      summary: Create discount code
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "201":
+          description: Discount code created
+
+  /organizer/events/{eventId}/discount-codes/{codeId}:
+    patch:
+      tags: [Organizer]
+      summary: Update discount code
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: codeId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Discount code updated
+    delete:
+      tags: [Organizer]
+      summary: Delete discount code
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: codeId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Discount code deleted
+
+  /organizer/events/{eventId}/waitlist:
+    get:
+      tags: [Organizer]
+      summary: List waitlist entries for an event
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Waitlist entries with athlete info
+
+  /organizer/events/{eventId}/waitlist/offer:
+    post:
+      tags: [Organizer]
+      summary: Offer a waitlist spot and queue notification
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [waitlistEntryId]
+              properties:
+                waitlistEntryId:
+                  type: integer
+                offerExpiresHours:
+                  type: integer
+                  default: 24
+      responses:
+        "200":
+          description: Offer sent
+        "409":
+          description: Entry not in waiting status
+
+  /organizer/events/{eventId}/waitlist/revoke:
+    post:
+      tags: [Organizer]
+      summary: Revoke or remove a waitlist entry
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [waitlistEntryId]
+              properties:
+                waitlistEntryId:
+                  type: integer
+      responses:
+        "200":
+          description: Updated waitlist entries
+        "404":
+          description: Entry not found or already resolved
+
+  /organizer/events/{eventId}/media:
+    get:
+      tags: [Organizer]
+      summary: List event media assets
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Media assets list
+    put:
+      tags: [Organizer]
+      summary: Replace event media assets
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [media]
+              properties:
+                media:
+                  type: array
+                  items:
+                    type: object
+                    required: [url, asset_type]
+                    properties:
+                      asset_type:
+                        type: string
+                        enum: [hero, banner, logo, gallery, document, route_map, other]
+                      url:
+                        type: string
+                      alt_text:
+                        type: string
+                      sort_order:
+                        type: integer
+                      is_primary:
+                        type: boolean
+      responses:
+        "200":
+          description: Media saved
+
+  /organizer/events/{eventId}/results:
+    get:
+      tags: [Organizer]
+      summary: List event results
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Results list
+    post:
+      tags: [Organizer]
+      summary: Import or upsert results
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Results upserted
+
+  /organizer/events/{eventId}/results/publish:
+    post:
+      tags: [Organizer]
+      summary: Publish results to athletes
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Results published
+
+  /organizer/events/{eventId}/results/{resultId}/splits:
+    get:
+      tags: [Organizer]
+      summary: List timing splits for a result
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: resultId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Result splits
+    put:
+      tags: [Organizer]
+      summary: Replace timing splits for a result
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: resultId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [splits]
+              properties:
+                splits:
+                  type: array
+                  items:
+                    type: object
+                    required: [split_name, elapsed_ms]
+                    properties:
+                      split_name:
+                        type: string
+                      split_order:
+                        type: integer
+                      distance_km:
+                        type: number
+                      elapsed_ms:
+                        type: integer
+                      pace_per_km_ms:
+                        type: integer
+      responses:
+        "200":
+          description: Splits saved
+
+  /organizer/events/{eventId}/messages/bulk:
+    post:
+      tags: [Organizer]
+      summary: "[Deprecated] Queue bulk email"
+      deprecated: true
+      description: Returns 410. Use `/organizer/events/{eventId}/broadcasts` (Resend Broadcast) instead.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subject, body]
+              properties:
+                subject:
+                  type: string
+                body:
+                  type: string
+      responses:
+        "410":
+          description: Deprecated — use event broadcasts
+
+  /organizer/events/{eventId}/broadcasts:
+    get:
+      tags: [Organizer]
+      summary: List event email broadcasts
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Broadcast history
+    post:
+      tags: [Organizer]
+      summary: Create and send (or schedule) a Resend broadcast to confirmed registrants
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subject, contentHtml]
+              properties:
+                subject:
+                  type: string
+                contentHtml:
+                  type: string
+                preheader:
+                  type: string
+                title:
+                  type: string
+                templateKey:
+                  type: string
+                sendMode:
+                  type: string
+                  enum: [now, scheduled]
+                scheduledAt:
+                  type: string
+                  format: date-time
+      responses:
+        "201":
+          description: Broadcast created
+        "404":
+          description: Event not found
+
+  /organizer/events/{eventId}/broadcasts/audience:
+    get:
+      tags: [Organizer]
+      summary: Confirmed registrant audience count for broadcasts
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Audience summary
+
+  /organizer/events/{eventId}/broadcasts/templates:
+    get:
+      tags: [Organizer]
+      summary: Localized broadcast templates for the event
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Template list
+
+  /organizer/events/{eventId}/broadcasts/preview:
+    post:
+      tags: [Organizer]
+      summary: Render Atleita-branded broadcast HTML preview
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subject, contentHtml]
+              properties:
+                subject:
+                  type: string
+                contentHtml:
+                  type: string
+                preheader:
+                  type: string
+                title:
+                  type: string
+      responses:
+        "200":
+          description: HTML preview
+
+  /admin/events/{eventId}/broadcasts:
+    get:
+      tags: [Admin]
+      summary: List event email broadcasts (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Broadcast history
+    post:
+      tags: [Admin]
+      summary: Send broadcast to any event's confirmed registrants
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subject, contentHtml]
+              properties:
+                subject:
+                  type: string
+                contentHtml:
+                  type: string
+                sendMode:
+                  type: string
+                  enum: [now, scheduled]
+                scheduledAt:
+                  type: string
+                  format: date-time
+      responses:
+        "201":
+          description: Broadcast created
+
+  /organizer/registrations/lookup:
+    get:
+      tags: [Organizer]
+      summary: Cross-event lookup by folio or QR token (read-only)
+      description: For mutations use `/organizer/events/{eventId}/registrations/*` hub routes.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Registration found (includes purchased_extras when add-ons were bought)
+        "404":
+          description: Not found
+
+  /organizer/events/{eventId}/registrations:
+    post:
+      tags: [Organizer]
+      summary: Create manual registration or manual sale (seller/operations/finance)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [event_category_id]
+              properties:
+                athlete_id:
+                  type: integer
+                athlete_email:
+                  type: string
+                  format: email
+                event_category_id:
+                  type: integer
+                comp:
+                  type: boolean
+                  description: Complimentary registration (mock provider)
+                manual_sale:
+                  type: boolean
+                  description: >
+                    Paid in-person cash sale at category price with provider manual,
+                    zero platform commission, and metadata_json.tender=cash.
+                    Requires events.manual_sales_enabled=1; otherwise 400 manual_sales_disabled.
+                waiver_waived:
+                  type: boolean
+                bib_number:
+                  type: string
+                create_guest:
+                  type: boolean
+                  description: Create athlete profile when email has no account
+                guest_first_name:
+                  type: string
+                guest_last_name:
+                  type: string
+                guest_date_of_birth:
+                  type: string
+                  format: date
+                managed_by_purchaser:
+                  type: boolean
+                  description: Skip claim email (auto for under-18); requires purchaser_email
+                purchaser_email:
+                  type: string
+                  format: email
+                purchaser_athlete_id:
+                  type: integer
+      responses:
+        "201":
+          description: Registration created
+        "400":
+          description: >
+            Validation error (e.g. manual_sale combined with comp, purchaser_required,
+            or manual_sales_disabled when the event flag is off)
+        "403":
+          description: Insufficient permissions (manual sale vs registration ops vs event editors)
+        "409":
+          description: Duplicate registration or sold out
+
+  /organizer/events/{eventId}/registrations/lookup:
+    get:
+      tags: [Organizer]
+      summary: Lookup registration within an event
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Registration found
+
+  /organizer/events/{eventId}/registrations/{registrationId}/check-in:
+    post:
+      tags: [Organizer]
+      summary: Check in a confirmed registration
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: registrationId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Checked in
+
+  /organizer/events/{eventId}/registrations/{registrationId}/bib:
+    patch:
+      tags: [Organizer]
+      summary: Assign bib number
+      description: Requires registration ops role (owner, organizer, operations, timing).
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: registrationId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Bib assigned
+
+  /organizer/events/{eventId}/registrations/{registrationId}/cancel:
+    patch:
+      tags: [Organizer]
+      summary: Cancel registration (no automatic refund)
+      description: Requires registration ops role (owner, organizer, operations, timing).
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: registrationId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Registration cancelled
+
+  /organizer/events/{eventId}/registrations/bulk-bib:
+    post:
+      tags: [Organizer]
+      summary: Bulk assign bib numbers for an event
+      description: Requires registration ops role (owner, organizer, operations, timing).
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Bulk import result
+
+  /organizer/events/{eventId}/registrations/export-catalog:
+    get:
+      tags: [Organizer]
+      summary: Available columns for dynamic registration export
+      description: >
+        Returns core columns plus this event's custom registration fields and extras
+        (qty, totals, and extra field answers), with presets (essentials, race_day, logistics, full).
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Export column catalog
+
+  /organizer/events/{eventId}/registrations/export:
+    post:
+      tags: [Organizer]
+      summary: Export registrations as CSV (or JSON)
+      description: >
+        Server-side export for the full filtered event set (not just the UI page).
+        Body: columns (required column ids from export-catalog), optional statuses, optional q search, format csv|json.
+        CSV includes a UTF-8 BOM for Excel.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [columns]
+              properties:
+                columns:
+                  type: array
+                  items:
+                    type: string
+                statuses:
+                  type: array
+                  items:
+                    type: string
+                q:
+                  type: string
+                format:
+                  type: string
+                  enum: [csv, json]
+      responses:
+        "200":
+          description: CSV download or JSON grid
+        "400":
+          description: Invalid columns / too many rows
+
+  /organizer/onboarding-intake:
+    get:
+      tags: [Organizer]
+      summary: Signup intake prefs for prefill (event name, sport, rough date)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Intake JSON or null
+        "403":
+          description: Not an organizer
+
+  /organizer/members:
+    get:
+      tags: [Organizer]
+      summary: List organizer team members (includes event_access_scope + assigned_event_ids)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Team members
+    post:
+      tags: [Organizer]
+      summary: Invite team member (owner only); sellers default to selected-events scope
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, first_name, last_name, role]
+              properties:
+                email: { type: string }
+                first_name: { type: string }
+                last_name: { type: string }
+                role: { type: string }
+                phone: { type: string }
+                event_access_scope:
+                  type: string
+                  enum: [organization, events]
+                event_ids:
+                  type: array
+                  items: { type: integer }
+                  description: Required when event_access_scope is events (default for sellers)
+      responses:
+        "201":
+          description: Member invited
+        "400":
+          description: Missing event_ids for events scope
+
+  /organizer/members/{memberId}:
+    patch:
+      tags: [Organizer]
+      summary: Update member status, role, or event access (owner only)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: memberId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status: { type: string }
+                role: { type: string }
+                event_access_scope:
+                  type: string
+                  enum: [organization, events]
+                event_ids:
+                  type: array
+                  items: { type: integer }
+      responses:
+        "200":
+          description: Member updated
+
+  /organizer/analytics:
+    get:
+      tags: [Organizer]
+      summary: Organizer analytics with 30-day time series
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Stats and chart data
+
+  /organizer/registrations:
+    get:
+      tags: [Organizer]
+      summary: List registrations for organizer events
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: query
+          schema:
+            type: integer
+        - name: q
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Registration rows with athlete info
+
+  /organizer/preferences:
+    patch:
+      tags: [Organizer]
+      summary: Update organizer member preferences (language)
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                preferred_language:
+                  type: string
+                  enum: [es, en]
+      responses:
+        "200":
+          description: Preferences updated
+
+  /organizer/events/{eventId}/sponsors:
+    get:
+      tags: [Organizer]
+      summary: List sponsors configured for an organizer event
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Event sponsors list
+        "404":
+          description: Event not found
+    put:
+      tags: [Organizer]
+      summary: Replace all sponsors for an event (used during event setup)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sponsors]
+              properties:
+                sponsors:
+                  type: array
+                  items:
+                    type: object
+                    required: [name]
+                    properties:
+                      name:
+                        type: string
+                      logo_url:
+                        type: string
+                      website_url:
+                        type: string
+                      tier:
+                        type: string
+                        enum: [title, gold, silver, bronze, partner]
+                      sort_order:
+                        type: integer
+      responses:
+        "200":
+          description: Updated sponsors list
+        "404":
+          description: Event not found
+
+
+
+
+  /admin/dashboard:
+    get:
+      tags: [Admin]
+      summary: Platform dashboard stats
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Dashboard stats
+
+  /admin/site-profile:
+    get:
+      tags: [Admin]
+      summary: Get platform site public profile (legal entity + contact)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Site public profile
+    patch:
+      tags: [Admin]
+      summary: Update platform site public profile
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: SitePublicProfile payload (legalEntity + contact)
+      responses:
+        "200":
+          description: Updated profile
+        "400":
+          description: Invalid payload
+
+  /admin/email-settings:
+    get:
+      tags: [Admin]
+      summary: Get platform email integration settings (Resend topic for organizer broadcasts)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Email settings
+    patch:
+      tags: [Admin]
+      summary: Update platform email integration settings
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [resendEventUpdatesTopic]
+              properties:
+                resendEventUpdatesTopic:
+                  type: object
+                  properties:
+                    topicId:
+                      type: string
+                      nullable: true
+      responses:
+        "200":
+          description: Updated email settings
+        "400":
+          description: Invalid payload
+
+  /admin/registrations/{registrationId}/resend-confirmation:
+    post:
+      tags: [Admin]
+      summary: Resend registration confirmation email (folio + event details)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: registrationId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Email sent
+        "502":
+          description: Send failed
+
+  /admin/athletes:
+    get:
+      tags: [Admin]
+      summary: Search athletes on the platform
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Athlete directory rows
+
+  /admin/events:
+    get:
+      tags: [Admin]
+      summary: Paginated list of all events with organizer info
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [draft, pending_approval, published, cancelled, completed]
+        - name: organizerId
+          in: query
+          schema:
+            type: integer
+        - name: simulation
+          in: query
+          description: Filter by simulation flag (`1` simulations only, `0` live only, omit for both)
+          schema:
+            type: string
+            enum: ["0", "1", "all"]
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: sortBy
+          in: query
+          schema:
+            type: string
+            enum: [start_date, title, status, registration_count, organizer_name, created_at, id, location_city]
+        - name: sortDir
+          in: query
+          schema:
+            type: string
+            enum: [ASC, DESC]
+      responses:
+        "200":
+          description: Paginated events list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items:
+                      type: object
+                  pagination:
+                    type: object
+                    properties:
+                      page:
+                        type: integer
+                      limit:
+                        type: integer
+                      total:
+                        type: integer
+                      totalPages:
+                        type: integer
+        "400":
+          description: Invalid organizerId
+    post:
+      tags: [Admin]
+      summary: Create event for an organizer
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [organizer_id, title, subdomain, sport_type_id, start_date]
+              properties:
+                organizer_id:
+                  type: integer
+                title:
+                  type: string
+                subdomain:
+                  type: string
+                  description: >
+                    Required. Globally unique vanity host label for
+                    `{subdomain}.atleita.com`. Immutable after create.
+                  minLength: 3
+                  maxLength: 63
+                sport_type_id:
+                  type: integer
+                start_date:
+                  type: string
+                  format: date-time
+                slug:
+                  type: string
+                short_description:
+                  type: string
+                description:
+                  type: string
+                visibility:
+                  type: string
+                  enum: [public, private, unlisted]
+                featured:
+                  type: boolean
+                end_date:
+                  type: string
+                  format: date-time
+                registration_opens_at:
+                  type: string
+                  format: date-time
+                registration_closes_at:
+                  type: string
+                  format: date-time
+                location_name:
+                  type: string
+                location_city:
+                  type: string
+                hero_image_url:
+                  type: string
+                max_registrations:
+                  type: integer
+                max_registrations_per_order:
+                  type: integer
+                bib_mode:
+                  $ref: "#/components/schemas/EventBibMode"
+      responses:
+        "201":
+          description: Event created as draft
+        "400":
+          description: Validation error (e.g. subdomain already taken)
+
+  /admin/analytics:
+    get:
+      tags: [Admin]
+      summary: Extended platform analytics
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Stats, 30-day metrics, top events
+
+        "200":
+          description: Registration rows with athlete info and checked_in_at
+
+  /admin/athletes/{athleteId}:
+    get:
+      tags: [Admin]
+      summary: Athlete detail with recent registrations
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: athleteId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Athlete detail
+    patch:
+      tags: [Admin]
+      summary: Suspend or reactivate athlete
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: athleteId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status:
+                  type: string
+                  enum: [active, suspended]
+      responses:
+        "200":
+          description: Athlete updated
+
+  /admin/events/{eventId}:
+    get:
+      tags: [Admin]
+      summary: Event detail with categories
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Event detail
+    patch:
+      tags: [Admin]
+      summary: Update any event
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Updated event
+    delete:
+      tags: [Admin]
+      summary: Soft-delete any event (cancels open registrations)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Soft-deleted
+
+  /admin/events/{eventId}/deactivate-listing:
+    post:
+      tags: [Admin]
+      summary: Hide event from marketplace (visibility=unlisted)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Event unlisted
+
+  /admin/events/{eventId}/summary:
+    get:
+      tags: [Admin]
+      summary: Event command center stats (registrations, revenue, categories)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Live event summary
+
+  /admin/events/{eventId}/registrations:
+    get:
+      tags: [Admin]
+      summary: List registrations for an event
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: q
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Registration list
+
+  /admin/events/{eventId}/check-in/window:
+    get:
+      tags: [Admin]
+      summary: Check-in window status for an event (event timezone)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Window open/closed with local and UTC bounds
+
+  /admin/events/{eventId}/registrations/lookup:
+    get:
+      tags: [Admin]
+      summary: Lookup registration by QR, folio, or bib within an event
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Registration found
+
+  /admin/events/{eventId}/registrations/{registrationId}/check-in:
+    post:
+      tags: [Admin]
+      summary: Check in a registration
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: registrationId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Checked in
+
+  /admin/events/{eventId}/registrations/{registrationId}/bib:
+    patch:
+      tags: [Admin]
+      summary: Assign bib number
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: registrationId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Bib assigned
+
+  /admin/events/{eventId}/registrations/{registrationId}/cancel:
+    patch:
+      tags: [Admin]
+      summary: Cancel registration
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: registrationId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Registration cancelled
+
+  /admin/events/{eventId}/registrations/bulk-bib:
+    post:
+      tags: [Admin]
+      summary: Bulk assign bib numbers for an event
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Bulk import result
+
+  /admin/events/{eventId}/registrations/export-catalog:
+    get:
+      tags: [Admin]
+      summary: Available columns for dynamic registration export
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Export column catalog
+
+  /admin/events/{eventId}/registrations/export:
+    post:
+      tags: [Admin]
+      summary: Export registrations as CSV (or JSON)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [columns]
+              properties:
+                columns:
+                  type: array
+                  items:
+                    type: string
+                statuses:
+                  type: array
+                  items:
+                    type: string
+                q:
+                  type: string
+                format:
+                  type: string
+                  enum: [csv, json]
+      responses:
+        "200":
+          description: CSV download or JSON grid
+
+  /admin/events/{eventId}/publish:
+    post:
+      tags: [Admin]
+      summary: Approve and publish event (only from pending_approval)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Event published
+        "400":
+          description: Event is not pending approval
+
+  /admin/events/{eventId}/schedule-waves:
+    get:
+      tags: [Admin]
+      summary: List schedule waves
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Waves list
+    put:
+      tags: [Admin]
+      summary: Replace schedule waves
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Waves saved
+        "404":
+          description: Event not found
+
+  /admin/events/fetch-image:
+    post:
+      tags: [Admin]
+      summary: Fetch CDN image bytes for staff re-crop (CORS bypass)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url:
+                  type: string
+                  format: uri
+      responses:
+        "200":
+          description: Base64-encoded image
+        "400":
+          description: Invalid or disallowed URL
+
+  /admin/events/{eventId}/reject:
+    post:
+      tags: [Admin]
+      summary: Reject organizer submission and return event to draft
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  maxLength: 500
+      responses:
+        "200":
+          description: Event returned to draft
+
+  /admin/analytics/timeseries:
+    get:
+      tags: [Admin]
+      summary: 30-day registrations and revenue time series
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Chart data
+
+  /admin/preferences:
+    patch:
+      tags: [Admin]
+      summary: Update admin preferences (language)
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                preferred_language:
+                  type: string
+                  enum: [es, en]
+      responses:
+        "200":
+          description: Preferences updated
+
+  /webhooks/stripe:
+    post:
+      tags: [Webhooks]
+      summary: Stripe webhook handler (Connect + payments)
+      description: |
+        Verifies Stripe signature, deduplicates by `stripe_event_id`, and handles
+        `payment_intent.succeeded` and `account.updated`. Other event types are marked ignored.
+      parameters:
+        - name: stripe-signature
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Webhook received (or duplicate safely skipped)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  received:
+                    type: boolean
+                  duplicate:
+                    type: boolean
+                  ignored:
+                    type: boolean
+        "400":
+          description: Invalid signature
+        "503":
+          description: Webhook not configured
+
+  /organizer/payouts/status:
+    get:
+      tags: [Organizer]
+      summary: Organizer Connect payout status and checklists
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Atleita + Stripe checklist and payoutReady flag
+        "403":
+          description: Insufficient permissions
+
+  /organizer/payouts/profile:
+    patch:
+      tags: [Organizer]
+      summary: Update Atleita payout profile (legal name, RFC, billing email)
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                legal_name:
+                  type: string
+                billing_email:
+                  type: string
+                rfc:
+                  type: string
+                tax_regime:
+                  type: string
+                fee_presentation:
+                  type: string
+                  enum: [pass_through, absorb_all]
+      responses:
+        "200":
+          description: Updated payout status payload
+        "400":
+          description: Invalid profile fields
+
+  /organizer/payouts/accept-terms:
+    post:
+      tags: [Organizer]
+      summary: Accept payout terms and fee acknowledgment (owner/finance)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Updated payout status payload
+        "403":
+          description: Insufficient permissions
+
+  /organizer/payouts/onboard:
+    post:
+      tags: [Organizer]
+      summary: Start Stripe Connect recipient onboarding (AccountSession + Account Link fallback)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Status payload with optional clientSecret (embedded) and/or url (hosted Account Link)
+        "503":
+          description: Stripe unavailable or Connect not enabled on platform account (code connect_not_enabled)
+
+  /organizer/payouts/account-session:
+    post:
+      tags: [Organizer]
+      summary: Create Stripe AccountSession for Connect embedded components
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: "{ clientSecret, publishableKey, url?, stripeAccountId, connectDashboard?, embeddedPreferred? }"
+        "400":
+          description: Atleita profile incomplete (code platform_profile_incomplete)
+        "502":
+          description: AccountSession failed (code account_session_failed)
+        "503":
+          description: Stripe unavailable or Connect not enabled
+
+  /organizer/payouts/login:
+    post:
+      tags: [Organizer]
+      summary: Open Express Dashboard login link (legacy Express accounts only)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: "{ url }"
+        "400":
+          description: No account linked, or white-label dashboard=none (code dashboard_internal)
+        "503":
+          description: Stripe unavailable
+
+  /organizer/payouts/sync:
+    post:
+      tags: [Organizer]
+      summary: Sync Connect account status from Stripe
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Refreshed payout status payload
+
+  /organizer/payouts/rail:
+    post:
+      tags: [Organizer]
+      summary: Set preferred payout rail (stripe or manual)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [payout_rail]
+              properties:
+                payout_rail:
+                  type: string
+                  enum: [stripe, manual]
+      responses:
+        "200":
+          description: Updated payout status payload
+
+  /organizer/payouts/accounts:
+    get:
+      tags: [Organizer]
+      summary: List organizer Cuenta de Pago accounts (CLABE last4 only)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: "{ accounts: OrganizerPayoutAccountPublic[] }"
+    post:
+      tags: [Organizer]
+      summary: Create draft payout account (CLABE encrypted server-side)
+      security:
+        - bearerAuth: []
+      responses:
+        "201":
+          description: Created account (+ refreshed status fields)
+        "409":
+          description: Verified default already exists
+
+  /organizer/payouts/accounts/{id}:
+    patch:
+      tags: [Organizer]
+      summary: Update draft or rejected payout account
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: Updated account
+        "409":
+          description: Locked / not editable
+
+  /organizer/payouts/accounts/{id}/submit:
+    post:
+      tags: [Organizer]
+      summary: Submit payout account for admin verification (locks fields)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: Submitted account
+
+  /organizer/payouts/accounts/{id}/default:
+    post:
+      tags: [Organizer]
+      summary: Set a verified account as default
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: Updated account
+
+  /admin/organizers/{organizerId}/payout-accounts:
+    get:
+      tags: [Admin]
+      summary: List organizer Cuenta de Pago accounts
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: organizerId
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: Accounts list (CLABE last4 only)
+
+  /admin/organizers/{organizerId}/payout-accounts/{id}/verify:
+    post:
+      tags: [Admin]
+      summary: Verify submitted Cuenta de Pago (sets default)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: organizerId
+          required: true
+          schema: { type: integer }
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: Verified account (+ updated payout status when available)
+
+  /admin/organizers/{organizerId}/payout-accounts/{id}/reject:
+    post:
+      tags: [Admin]
+      summary: Reject submitted Cuenta de Pago
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: organizerId
+          required: true
+          schema: { type: integer }
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string }
+                rejection_reason: { type: string }
+      responses:
+        "200":
+          description: Rejected account
+
+  /admin/organizers/{organizerId}/payout-accounts/{id}/reveal-clabe:
+    post:
+      tags: [Admin]
+      summary: Reveal full CLABE for SPEI (admin-only, audited)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: organizerId
+          required: true
+          schema: { type: integer }
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: Full CLABE + account public fields
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [clabe, account]
+                properties:
+                  clabe: { type: string }
+                  account: { type: object }
+        "400":
+          description: Account not submitted/verified
+        "404":
+          description: Account not found
+
+  /admin/organizers/{organizerId}/payout-accounts/{id}/unverify:
+    post:
+      tags: [Admin]
+      summary: Revoke verified Cuenta de Pago (unlocks for organizer edit)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: organizerId
+          required: true
+          schema: { type: integer }
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string }
+                rejection_reason: { type: string }
+      responses:
+        "200":
+          description: Account set to rejected / unlocked
+        "400":
+          description: Account not verified
+
+  /admin/spei-settlements:
+    get:
+      tags: [Admin]
+      summary: List SPEI settlement queue (platform-mode Stripe charges)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: status
+          schema:
+            type: string
+            enum: [pending, sent, cancelled, all]
+            default: pending
+      responses:
+        "200":
+          description: Settlements with pending/sent totals
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SpeiSettlementListResponse"
+
+  /admin/spei-settlements/{id}/mark-sent:
+    post:
+      tags: [Admin]
+      summary: Mark a pending SPEI settlement as sent (ops confirmed bank transfer)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                notes: { type: string, maxLength: 500 }
+      responses:
+        "200":
+          description: Settlement marked sent
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [settlement]
+                properties:
+                  settlement:
+                    $ref: "#/components/schemas/SpeiSettlementRow"
+        "400":
+          description: Not pending, or CLABE reveal not possible
+        "404":
+          description: Settlement not found
+
+  /organizer/spei-settlements:
+    get:
+      tags: [Organizer]
+      summary: List own SPEI settlements (pending/sent totals; CLABE last4 only)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: status
+          schema:
+            type: string
+            enum: [pending, sent, cancelled, all]
+            default: pending
+      responses:
+        "200":
+          description: Organizer settlements
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SpeiSettlementListResponse"
+        "403":
+          description: Insufficient permissions
+
+  /organizer/payouts/mp/oauth/start:
+    get:
+      tags: [Organizer]
+      deprecated: true
+      summary: Removed — Mercado Pago OAuth start (returns 410)
+      security:
+        - bearerAuth: []
+      responses:
+        "410":
+          description: Mercado Pago removed (mp_removed)
+
+  /organizer/payouts/mp/oauth/callback:
+    get:
+      tags: [Organizer]
+      deprecated: true
+      summary: Removed — Mercado Pago OAuth callback (redirects to Pagos setup)
+      responses:
+        "302":
+          description: Redirect to /staff/payments?tab=setup
+
+  /webhooks/mercadopago:
+    post:
+      tags: [Webhooks]
+      summary: >
+        Historical Mercado Pago IPN / webhooks for legacy payments.provider=mercadopago
+        rows only (no new MP checkout in v1)
+      responses:
+        "200":
+          description: Accepted
+
+  /events/{slug}/register/mp/pay:
+    post:
+      tags: [Registration]
+      deprecated: true
+      summary: Removed — Mercado Pago card token pay (returns 410)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "410":
+          description: Mercado Pago removed (mp_removed)
+
+  /organizer/payments:
+    get:
+      tags: [Organizer]
+      summary: List organizer payments (finance/owner see all; sellers see own manual sales)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, processing, succeeded, failed, refunded, partially_refunded]
+        - name: provider
+          in: query
+          schema:
+            type: string
+            enum: [stripe, mock, manual]
+        - name: eventId
+          in: query
+          schema:
+            type: integer
+        - name: recordedByMemberId
+          in: query
+          description: Filter by seller who recorded a manual sale (owner/finance only). Prefer sellerFilter.
+          schema:
+            type: integer
+        - name: sellerFilter
+          in: query
+          description: "all (default), online (checkout without seller), or organizer member id"
+          schema:
+            type: string
+        - name: page
+          in: query
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          schema:
+            type: integer
+        - name: sortBy
+          in: query
+          schema:
+            type: string
+        - name: sortDir
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+      responses:
+        "200":
+          description: Paginated payments list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  payments:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: integer
+                        provider:
+                          type: string
+                          enum: [stripe, mock, manual]
+                        recorded_by_member_id:
+                          type: integer
+                          nullable: true
+                        seller_first_name:
+                          type: string
+                          nullable: true
+                        seller_last_name:
+                          type: string
+                          nullable: true
+                        seller_email:
+                          type: string
+                          nullable: true
+                        service_fee_cents:
+                          type: integer
+                  pagination:
+                    type: object
+        "403":
+          description: Insufficient permissions
+
+  /organizer/payments/seller-summary:
+    get:
+      tags: [Organizer]
+      summary: Manual sales totals grouped by seller (owner/organizer/finance)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Seller sales summary
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  manual_sale_count:
+                    type: integer
+                  manual_sale_total_cents:
+                    type: integer
+                  sellers:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        member_id:
+                          type: integer
+                        first_name:
+                          type: string
+                        last_name:
+                          type: string
+                        email:
+                          type: string
+                        sale_count:
+                          type: integer
+                        total_cents:
+                          type: integer
+        "403":
+          description: Insufficient permissions
+
+  /organizer/payments/{paymentId}/refund:
+    post:
+      tags: [Organizer]
+      summary: Refund a succeeded payment (owner, organizer, or finance roles)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: paymentId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  maxLength: 500
+      responses:
+        "200":
+          description: Refund processed
+        "400":
+          description: Refund failed
+        "403":
+          description: Insufficient permissions or payment not owned by organizer
+        "404":
+          description: Payment not found
+
+  /admin/organizers/{organizerId}/connect:
+    get:
+      tags: [Admin]
+      summary: Admin view of organizer Connect status
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: organizerId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Payout status payload
+        "404":
+          description: Organizer not found
+
+  /admin/organizers/{organizerId}/connect/onboard:
+    post:
+      tags: [Admin]
+      summary: Admin-assisted Stripe Connect onboarding link
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: organizerId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Onboarding URL and status payload
+
+  /admin/organizers/{organizerId}/connect/sync:
+    post:
+      tags: [Admin]
+      summary: Sync organizer Connect account from Stripe (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: organizerId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Refreshed status payload
+
+  /admin/organizers/{organizerId}/connect/link-account:
+    post:
+      tags: [Admin]
+      summary: Link existing Stripe Connect account to organizer
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: organizerId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [stripe_account_id]
+              properties:
+                stripe_account_id:
+                  type: string
+                  example: acct_1234567890
+      responses:
+        "200":
+          description: Linked account status payload
+        "409":
+          description: Account already linked to another organizer
+
+  /admin/organizers/{organizerId}/connect/disable:
+    post:
+      tags: [Admin]
+      summary: Disable organizer payouts (admin override)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: organizerId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Updated status payload
+
+  /admin/organizers/{organizerId}/connect/enable:
+    post:
+      tags: [Admin]
+      summary: Re-enable organizer payouts and sync from Stripe
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: organizerId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Updated status payload
+
+  /events/{slug}/sponsors/track:
+    post:
+      tags: [Marketplace]
+      summary: Track sponsor impression or click on public event page
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sponsorId, type]
+              properties:
+                sponsorId:
+                  type: integer
+                type:
+                  type: string
+                  enum: [impression, click]
+      responses:
+        "200":
+          description: Event recorded
+
+  /athlete/results/{resultId}/visualization:
+    get:
+      tags: [Athlete]
+      summary: Course pace segments and route for a finished result
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: resultId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Result visualization with splits, course, and pace segments
+
+  /admin/organizers:
+    get:
+      tags: [Admin]
+      summary: Search or list organizers (paginated when page query is set)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+        - name: page
+          in: query
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          schema:
+            type: integer
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, active, suspended, inactive]
+        - name: sortBy
+          in: query
+          schema:
+            type: string
+        - name: sortDir
+          in: query
+          schema:
+            type: string
+            enum: [ASC, DESC]
+      responses:
+        "200":
+          description: Organizer list (paginated or picker mode)
+    post:
+      tags: [Admin]
+      summary: Create organizer organization with owner
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, email, owner_email, owner_first_name, owner_last_name]
+              properties:
+                name:
+                  type: string
+                email:
+                  type: string
+                slug:
+                  type: string
+                city:
+                  type: string
+                country:
+                  type: string
+                phone:
+                  type: string
+                owner_email:
+                  type: string
+                owner_first_name:
+                  type: string
+                owner_last_name:
+                  type: string
+      responses:
+        "201":
+          description: Organizer created
+
+  /admin/organizers/{organizerId}:
+    get:
+      tags: [Admin]
+      summary: Organizer detail with team members
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: organizerId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Organizer detail
+    patch:
+      tags: [Admin]
+      summary: Update organizer organization
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: organizerId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                fee_presentation:
+                  $ref: "#/components/schemas/FeePresentation"
+                service_fee_percent:
+                  type: number
+      responses:
+        "200":
+          description: Updated organizer
+
+  /admin/organizers/{organizerId}/members:
+    post:
+      tags: [Admin]
+      summary: Invite member to organizer organization
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: organizerId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "201":
+          description: Member invited
+
+  /admin/organizers/{organizerId}/members/{memberId}:
+    patch:
+      tags: [Admin]
+      summary: Update organizer member status
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: organizerId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: memberId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Updated members list
+
+
+
+
+  /admin/admins:
+    get:
+      tags: [Admin]
+      summary: List platform administrators
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+        - name: page
+          in: query
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Paginated admin list
+    post:
+      tags: [Admin]
+      summary: Invite platform admin (admin role; super_admin required to create super_admin)
+      security:
+        - bearerAuth: []
+      responses:
+        "201":
+          description: Admin created
+
+  /admin/admins/{adminId}:
+    patch:
+      tags: [Admin]
+      summary: Update platform admin status or role (role changes require super_admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: adminId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Updated admin
+
+  /admin/events/{eventId}/sponsor-analytics:
+    get:
+      tags: [Admin]
+      summary: Sponsor impression and click analytics for an event
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Sponsor analytics summary
+
+  /admin/events/{eventId}/sponsors:
+    get:
+      tags: [Admin]
+      summary: List sponsors for any event (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Sponsors list
+    put:
+      tags: [Admin]
+      summary: Replace sponsors for any event (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Updated sponsors
+
+  /admin/events/{eventId}/media:
+    get:
+      tags: [Admin]
+      summary: List media assets for an event (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Media assets
+    put:
+      tags: [Admin]
+      summary: Replace media assets for an event (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Updated media
+
+  /admin/events/{eventId}/waitlist:
+    get:
+      tags: [Admin]
+      summary: Waitlist queue for an event (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Waitlist entries
+
+  /admin/events/{eventId}/waitlist/offer:
+    post:
+      tags: [Admin]
+      summary: Offer a waitlist spot (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Offer sent
+
+  /admin/events/{eventId}/waitlist/revoke:
+    post:
+      tags: [Admin]
+      summary: Revoke or remove a waitlist entry (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [waitlistEntryId]
+              properties:
+                waitlistEntryId:
+                  type: integer
+      responses:
+        "200":
+          description: Updated waitlist entries
+        "404":
+          description: Entry not found or already resolved
+
+  /admin/events/{eventId}/categories:
+    post:
+      tags: [Admin]
+      summary: Add registration category (admin, any event)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "201":
+          description: Category added
+
+  /admin/events/{eventId}/categories/{categoryId}:
+    patch:
+      tags: [Admin]
+      summary: Update category (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: categoryId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Categories updated
+    delete:
+      tags: [Admin]
+      summary: Remove or deactivate category (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: categoryId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Categories updated
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    AppLocale:
+      type: string
+      enum: [es, en]
+      description: >
+        App UI locale. When omitted, API uses Accept-Language then defaults to `es`.
+        For existing accounts, DB `preferred_language` wins for OTP/email language.
+    AppTheme:
+      type: string
+      enum: [light, dark, system]
+      description: >
+        UI color theme. New athlete accounts may send `theme` on register/Clerk to seed
+        `preferred_theme` from guest `localStorage` (`atleita-theme`). Auth session payloads
+        always include normalized `preferredTheme`.
+    LocalizedError:
+      type: object
+      required: [error, code]
+      description: >
+        User-facing API error. `error` is localized; `code` is stable for clients
+        (map via i18n). Auth and many athlete/registration/payment errors use this shape.
+      properties:
+        error:
+          type: string
+          description: Localized human-readable message
+        code:
+          type: string
+          description: >
+            Stable machine code (e.g. account_not_found, event_not_found,
+            waiver_required, names_required, password_policy, rate_limited).
+          example: account_not_found
+        retryAfterSec:
+          type: integer
+          description: Present for rate_limited responses
+    LocalizedSuccess:
+      type: object
+      required: [message, code]
+      description: Localized success acknowledgment (e.g. OTP / forgot-password)
+      properties:
+        message:
+          type: string
+        code:
+          type: string
+          enum: [verification_code_sent, forgot_password_instructions_sent]
+    EventBibMode:
+      type: string
+      enum: [folio, separate]
+      description: >
+        folio = registration folio is also the race bib (dorsal); separate = folio and bib independent.
+        New events default to folio; existing events migrate to separate.
+    EventSubdomainAvailableResponse:
+      type: object
+      properties:
+        available:
+          type: boolean
+        subdomain:
+          type: string
+        error:
+          type: string
+          description: Format or taken error code when available=false
+    EventSubdomainResolveResponse:
+      type: object
+      properties:
+        subdomain:
+          type: string
+        slug:
+          type: string
+        title:
+          type: string
+        canonical_path:
+          type: string
+          example: /events/mi-carrera
+    StaffEventUpsertRequest:
+      type: object
+      description: >
+        On create, title / subdomain / sport_type_id / start_date are required
+        (enforced by API). On PATCH, subdomain is immutable — a different value
+        returns 400 with code subdomain_immutable.
+      properties:
+        title:
+          type: string
+        sport_type_id:
+          type: integer
+        start_date:
+          type: string
+          format: date-time
+        end_date:
+          type: string
+          format: date-time
+        slug:
+          type: string
+        subdomain:
+          type: string
+          description: >
+            Required on create. Globally unique vanity host label for
+            `{subdomain}.atleita.com`. Immutable after create.
+          minLength: 3
+          maxLength: 63
+        short_description:
+          type: string
+        description:
+          type: string
+        visibility:
+          type: string
+          enum: [public, private, unlisted]
+        featured:
+          type: boolean
+        registration_opens_at:
+          type: string
+          format: date-time
+        registration_closes_at:
+          type: string
+          format: date-time
+        location_name:
+          type: string
+        location_city:
+          type: string
+        location_state:
+          type: string
+        max_registrations:
+          type: integer
+        max_registrations_per_order:
+          type: integer
+        bib_mode:
+          $ref: "#/components/schemas/EventBibMode"
+        auto_deactivate_after_event:
+          type: boolean
+          description: When true (default), unlist from marketplace after the event day ends
+        fee_presentation:
+          $ref: "#/components/schemas/FeePresentation"
+        msi_enabled:
+          type: boolean
+          description: Offer Stripe MSI (3/6/9) on checkout when payouts are ready
+        manual_sales_enabled:
+          type: boolean
+          description: >
+            When true, staff may record cash manual sales (provider=manual) for this event.
+            Default false.
+    FeePresentation:
+      type: string
+      enum: [pass_through, absorb_all]
+    RegistrationPurchasedExtra:
+      type: object
+      description: Add-on line purchased with a registration (snapshot at checkout time)
+      properties:
+        event_extra_id:
+          type: integer
+        name:
+          type: string
+        quantity:
+          type: integer
+        unit_price_cents:
+          type: integer
+        total_cents:
+          type: integer
+        field_answers:
+          type: array
+          items:
+            $ref: "#/components/schemas/RegistrationPurchasedExtraFieldAnswer"
+    RegistrationPurchasedExtraFieldAnswer:
+      type: object
+      properties:
+        field_key:
+          type: string
+        label:
+          type: string
+        value_text:
+          type: string
+          nullable: true
+        value_json:
+          type: object
+          nullable: true
+        field_kind:
+          type: string
+          enum: [standard, mx_shipping_block]
+        field_type:
+          type: string
+    EventExtraField:
+      type: object
+      properties:
+        id:
+          type: integer
+        field_key:
+          type: string
+        label:
+          type: string
+        field_type:
+          type: string
+          enum: [text, textarea, select, checkbox, number, date]
+        field_kind:
+          type: string
+          enum: [standard, mx_shipping_block]
+        options_json:
+          type: array
+          items:
+            type: string
+          nullable: true
+        is_required:
+          type: boolean
+        sort_order:
+          type: integer
+    EventExtra:
+      type: object
+      properties:
+        id:
+          type: integer
+        public_uuid:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+          nullable: true
+        price_cents:
+          type: integer
+        currency:
+          type: string
+        image_url:
+          type: string
+          nullable: true
+        extra_type:
+          type: string
+        max_per_athlete:
+          type: integer
+        capacity:
+          type: integer
+          nullable: true
+        sold_count:
+          type: integer
+        sort_order:
+          type: integer
+        scope_type:
+          type: string
+          enum: [all_categories, selected_categories]
+        sales_opens_at:
+          type: string
+          format: date-time
+          nullable: true
+        sales_closes_at:
+          type: string
+          format: date-time
+          nullable: true
+        category_ids:
+          type: array
+          items:
+            type: integer
+        fields:
+          type: array
+          items:
+            $ref: "#/components/schemas/EventExtraField"
+        sales_status:
+          type: string
+          enum: [open, scheduled, ended]
+    StaffEventExtra:
+      allOf:
+        - $ref: "#/components/schemas/EventExtra"
+        - type: object
+          properties:
+            fields_locked:
+              type: boolean
+    StaffEventExtraInput:
+      type: object
+      required: [name, price_cents]
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        price_cents:
+          type: integer
+        is_free:
+          type: boolean
+        currency:
+          type: string
+        image_url:
+          type: string
+        extra_type:
+          type: string
+        max_per_athlete:
+          type: integer
+        capacity:
+          type: integer
+          nullable: true
+        sort_order:
+          type: integer
+        scope_type:
+          type: string
+          enum: [all_categories, selected_categories]
+        category_ids:
+          type: array
+          items:
+            type: integer
+        sales_opens_at:
+          type: string
+          format: date-time
+          nullable: true
+        sales_closes_at:
+          type: string
+          format: date-time
+          nullable: true
+        fields:
+          type: array
+          items:
+            $ref: "#/components/schemas/EventExtraField"
+    StaffEventExtraPatch:
+      allOf:
+        - $ref: "#/components/schemas/StaffEventExtraInput"
+    ExtraFieldAnswersInput:
+      type: object
+      required: [extraId, values]
+      properties:
+        extraId:
+          type: integer
+        values:
+          type: object
+          additionalProperties: true
+    RegistrationCheckoutResponse:
+      type: object
+      properties:
+        paymentPublicUuid:
+          type: string
+        clientSecret:
+          type: string
+          nullable: true
+        amountCents:
+          type: integer
+        registrationAmountCents:
+          type: integer
+        serviceFeeCents:
+          type: integer
+        currency:
+          type: string
+        categoryName:
+          type: string
+        eventTitle:
+          type: string
+        feePresentation:
+          $ref: "#/components/schemas/FeePresentation"
+        listPriceCents:
+          type: integer
+        displayIvaCents:
+          type: integer
+        organizerFiscalNetCents:
+          type: integer
+        discountCode:
+          type: string
+        discountAmountCents:
+          type: integer
+        extrasSubtotalCents:
+          type: integer
+        extras:
+          type: array
+          items:
+            type: object
+            properties:
+              extraId:
+                type: integer
+              name:
+                type: string
+              quantity:
+                type: integer
+              unitPriceCents:
+                type: integer
+              totalCents:
+                type: integer
+        msiAvailable:
+          type: boolean
+          description: Stripe MSI available (event enabled, Stripe rail, athlete total ≥ $1,000 MXN)
+        msiAllowedPlans:
+          type: array
+          items:
+            type: integer
+            enum: [3, 6, 9]
+        msiPlanMonths:
+          type: integer
+          nullable: true
+          enum: [3, 6, 9]
+          description: Selected MSI plan; null means pay in full (contado)
+    EventCategoryPricing:
+      type: object
+      properties:
+        price_cents:
+          type: integer
+        total_cents:
+          type: integer
+          description: Athlete-facing checkout total for this category
+        display_iva_cents:
+          type: integer
+        organizer_fiscal_net_cents:
+          type: integer
+    MarketplaceEventCard:
+      type: object
+      properties:
+        from_price_cents:
+          type: integer
+          description: Minimum athlete-facing category total (includes pass-through fees)
+    SpeiSettlementRow:
+      type: object
+      required:
+        - id
+        - payment_id
+        - organizer_id
+        - amount_cents
+        - currency
+        - status
+        - created_at
+        - updated_at
+      properties:
+        id: { type: integer }
+        payment_id: { type: integer }
+        organizer_id: { type: integer }
+        organizer_name: { type: string }
+        event_id: { type: integer, nullable: true }
+        event_title: { type: string, nullable: true }
+        amount_cents: { type: integer }
+        currency: { type: string }
+        status:
+          type: string
+          enum: [pending, sent, cancelled]
+        payout_account_id: { type: integer, nullable: true }
+        clabe_last4:
+          type: string
+          nullable: true
+          description: Last 4 of CLABE only — never full CLABE
+        bank_name: { type: string, nullable: true }
+        marked_sent_at: { type: string, nullable: true }
+        notes: { type: string, nullable: true }
+        created_at: { type: string }
+        updated_at: { type: string }
+    SpeiSettlementListResponse:
+      type: object
+      required: [settlements, pending_total_cents, sent_total_cents]
+      properties:
+        settlements:
+          type: array
+          items:
+            $ref: "#/components/schemas/SpeiSettlementRow"
+        pending_total_cents: { type: integer }
+        sent_total_cents: { type: integer }

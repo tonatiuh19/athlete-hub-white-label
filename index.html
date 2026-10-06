@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="es-MX" class="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>Atleita — La plataforma detrás de tu evento</title>
+    <meta
+      name="description"
+      content="Inscripciones, pagos y micrositios de marca para organizadores de eventos deportivos."
+    />
+    <meta name="theme-color" content="#F7F9F6" />
+    <meta name="color-scheme" content="light" />
+    <script>
+      try {
+        // Atleita is light-only — never apply .dark from OS or stored prefs.
+        document.documentElement.classList.remove("dark");
+        document.documentElement.classList.add("light");
+        document.documentElement.style.colorScheme = "light";
+      } catch (e) {}
+    </script>
+    <meta name="robots" content="index, follow" />
+    <meta property="og:site_name" content="Atleita" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Atleita — La plataforma detrás de tu evento" />
+    <meta
+      property="og:description"
+      content="Inscripciones, pagos y micrositios de marca para organizadores de eventos deportivos."
+    />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="Atleita — inscripciones y operación de eventos deportivos" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Atleita — La plataforma detrás de tu evento" />
+    <meta
+      name="twitter:description"
+      content="Inscripciones, pagos y micrositios de marca para organizadores de eventos deportivos."
+    />
+    <meta name="twitter:image:alt" content="Atleita — inscripciones y operación de eventos deportivos" />
+  </head>
+
+  <body>
+    <div id="root"></div>
+
+    <script type="module" src="/app/App.tsx"></script>
+  </body>
+</html>

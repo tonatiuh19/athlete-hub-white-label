@@ -1,0 +1,48 @@
+---
+description: Mobile-first UI — no page horizontal scroll; validate every layout at phone widths
+alwaysApply: true
+---
+
+# Mobile responsiveness (NO EXCEPTIONS)
+
+Most athletes and staff use phones. **Every** UI change (public events, athlete portal, staff console, event console) must work on phones first.
+
+## Hard rules
+
+1. **No page-level horizontal scroll** — `body` / `#root` must never scroll sideways. Vertical scroll only.
+2. **Wide content stays contained** — tables, DataGrids, chip rows, and toolbars scroll **inside** `max-w-full overflow-x-auto` (or `.table-scroll`); never widen the page.
+3. **Fit the viewport** — layouts must work at **320–390px** without clipped controls, overlapping text, or broken CTAs.
+4. **Stack before row** — filters, form rows, and action bars default to `flex-col`; switch to row at `md:`/`lg:` when 3+ controls (not cramped `sm:` rows).
+5. **Long strings wrap** — emails, subdomains, URLs: `min-w-0`, `break-words` / `truncate`. Flex children that grow need `min-w-0`.
+6. **Fixed widths are rare** — prefer `max-w-*`, `min()`, `w-full`. OTP inputs, QR codes, and hero media must scale below ~375px.
+7. **Touch targets** — interactive controls ≥ ~40px hit area where practical (`h-10`/`h-11` buttons, adequate padding).
+8. **Staff event console** — sidebars collapse on mobile; primary nav must not trap content off-screen.
+
+## Patterns (Atleita)
+
+```tsx
+// ✅ Page shell (matches PageContent / staff pages)
+className="mx-auto w-full min-w-0 overflow-x-clip"
+
+// ✅ Full-height auth / wizard on mobile
+className="h-[100dvh] overflow-hidden flex w-full max-w-full min-w-0"
+
+// ✅ Table / DataGrid
+<div className="table-scroll">…</div>
+
+// ✅ Toolbar with many filters
+className="flex flex-col gap-3 md:flex-row md:flex-wrap"
+
+// ❌ Fixed grids that overflow 320px
+className="grid grid-cols-4" // without responsive cols
+```
+
+## Checklist before finishing a UI turn
+
+- [ ] Checked at ~375px **and** ~320px (mental model or browser)
+- [ ] No new fixed `min-w-[Npx]` without mobile fallback
+- [ ] No body / `#root` horizontal overflow (marketing + portals + staff)
+- [ ] Staff/admin tables inside `min-w-0 overflow-hidden` + `.table-scroll`
+- [ ] Event public pages + registration wizard usable on small screens
+- [ ] Landing / microsite (`.pace-site`) header CTAs do not force sideways scroll
+- [ ] New strings use `t('key')` in **both** `es.json` and `en.json`

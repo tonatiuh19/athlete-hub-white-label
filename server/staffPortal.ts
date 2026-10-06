@@ -1,0 +1,8566 @@
+import {
+  normalizeEventSubdomain,
+  validateEventSubdomainFormat,
+} from "../shared/eventSubdomain.js";
+import { normalizeLocale as normalizeAppLocale } from "../shared/i18n.js";
+import type {
+  Express,
+  NextFunction,
+  RequestHandler,
+  Request,
+  Response,
+} from "express";
+import crypto from "crypto";
+import type { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
+import {
+  CATEGORY_SOLD_COUNT_UNALIASED_SQL,
+  DISCOUNT_USED_COUNT_SQL,
+  EVENT_REGISTRATION_COUNT_SQL,
+  WAVE_REGISTERED_COUNT_SQL,
+} from "./registrationCounts.js";
+import {
+  buildStaffEventsPagination,
+  listStaffEvents,
+  parseStaffEventsListQuery,
+} from "./staffEventsList.js";
+import { handleEventAssetUpload } from "./eventAssetUpload.js";
+import { handleStaffImageProxy } from "./staffImageProxy.js";
+import { normalizeCdnUploadUrl } from "./cdnUpload.js";
+import {
+  getOrganizerSiteLegalStatus,
+  validateOrganizerSiteLegalReady,
+} from "./organizerSites.js";
+import {
+  deactivateEventFromListing,
+  softDeleteStaffEvent,
+} from "./eventLifecycle.js";
+import {
+  normalizeEventBibMode,
+  resolveRegistrationBibNumber,
+} from "./bibMode.js";
+import {
+  fetchEventWaiversForStaff,
+  getRegistrationWaiverStatus,
+  enrichRegistrationRowsWithWaiverOutdated,
+  markRegistrationWaiverWaivedByStaff,
+  syncEventWaivers,
+  validateEventPublishWaivers,
+} from "./eventWaivers.js";
+import {
+  eventEndWallTime,
+  parseIncomingEventDateTime,
+} from "../shared/checkInWindow.js";
+import { isMinorOnReferenceDate } from "../shared/groupCheckout.js";
+import { normalizeApiDateOnly } from "../shared/api.js";
+import { validateCoursePayload } from "../shared/courseValidation.js";
+import { normalizeEventCourse } from "../shared/courseNormalize.js";
+import {
+  assertCheckInWindowForEvent,
+  checkInWindowResponsePayload,
+  evaluateEventCheckInWindow,
+  loadEventCheckInContext,
+} from "./eventCheckIn.js";
+import {
+  buildRegistrationExport,
+  buildRegistrationExportCatalog,
+} from "./registrationExport.js";
+import {
+  assertOrganizerPayoutReadyForPaidEvent,
+  assertPaidCategoryMutationAllowed,
+  attachEventPaymentAvailability,
+  eventHasPaidActiveCategories,
+  registerStripeConnectRoutes,
+  resolveOrganizerCheckoutDestination,
+} from "./stripeConnect.js";
+import {
+  canOrganizerCreateEvents,
+  canOrganizerEditEvents,
+  canOrganizerManageRegistrations,
+  canOrganizerRecordManualSale,
+  canOrganizerViewAllPayments,
+  canOrganizerViewAnalytics,
+  canOrganizerViewPayments,
+  canOrganizerViewSellerSalesSummary,
+} from "../shared/staffRoles.js";
+import { isValidFeePresentation } from "../shared/checkoutBreakdown.js";
+import {
+  parseEventCoord,
+  resolveEventCatalogLocation,
+} from "./organizerEventGuards.js";
+import { validateEventPublishPricing } from "./eventPricingGuards.js";
+import { parseCheckoutPaymentMetadata } from "./checkoutMetadata.js";
+import {
+  createEventExtraRecord,
+  deleteEventExtraRecord,
+  fetchAllEventExtras,
+  fetchRegistrationPurchasedExtras,
+  patchEventExtraRecord,
+} from "./eventExtras.js";
+import {
+  fetchActiveRegistrationFieldsForEvent,
+  fetchRegistrationFieldsForCategory,
+  fetchStaffRegistrationFields,
+  mapPublicRegistrationField,
+  replaceEventRegistrationFields,
+} from "./registrationFields.js";
+import {
+  fetchStaffFolioSegments,
+  presentStaffFolioSegments,
+  replaceEventFolioSegments,
+  type RegistrationFolioContext,
+} from "./folioSegments.js";
+import {
+  assertOrganizerCanOperateEvents,
+  buildSelfServiceOrganizerAdminEmail,
+  fetchOrganizerOnboardingIntake,
+  registerSelfServiceOrganizer,
+} from "./organizerRegistration.js";
+import { checkPublicOrganizerRateLimit } from "./authRateLimit.js";
+import { buildManualSalePaymentMetadata } from "./paymentRefunds.js";
+
+type ActorType = "athlete" | "organizer" | "admin";
+
+export interface StaffPortalAuth {
+  actor: ActorType;
+  id: number;
+  email: string;
+  organizerId?: number;
+  jti: string;
+}
+
+export interface AuthedRequest extends Request {
+  auth?: StaffPortalAuth;
+}
+
+export interface StaffPortalDeps {
+  pool: Pool;
+  requireAdmin: RequestHandler;
+  requireOrganizer: RequestHandler;
+  newPublicUuid: () => string;
+  newQrToken: () => string;
+  nextRegistrationNumber: (
+    ctx: RegistrationFolioContext,
+    conn?: import("mysql2/promise").PoolConnection,
+  ) => Promise<{ registrationNumber: string; folioSegmentId: number | null }>;
+  normalizeLocale: (value: unknown) => string;
+  sendEmail: (opts: {
+    to: string;
+    subject: string;
+    html: string;
+    text?: string;
+  }) => Promise<{ id: string }>;
+  appUrl: string;
+  getStripeClient?: () => import("stripe").default | null;
+  processPaymentRefund?: (opts: {
+    paymentId: number;
+    requestedByType: "admin" | "organizer_member";
+    requestedById: number;
+    organizerId?: number;
+    reason?: string;
+  }) => Promise<void>;
+  buildWelcomeStaffEmail: (params: {
+    locale: string;
+    firstName: string;
+    audience: "admin" | "organizer";
+    appUrl: string;
+  }) => { subject: string; html: string; text: string };
+  buildEventSubmittedForApprovalEmail: (params: {
+    locale: string;
+    firstName: string;
+    eventTitle: string;
+    appUrl: string;
+  }) => { subject: string; html: string; text: string };
+  buildEventApprovedEmail: (params: {
+    locale: string;
+    firstName: string;
+    eventTitle: string;
+    appUrl: string;
+    eventId: number;
+  }) => { subject: string; html: string; text: string };
+  buildEventRejectedEmail: (params: {
+    locale: string;
+    firstName: string;
+    eventTitle: string;
+    reason: string | null;
+    appUrl: string;
+    eventId: number;
+  }) => { subject: string; html: string; text: string };
+  buildOrganizerPayoutSetupEmail: (params: {
+    locale: string;
+    firstName: string;
+    eventTitle: string;
+    appUrl: string;
+  }) => { subject: string; html: string; text: string };
+  sendStaffLoginOtp: (opts: {
+    adminId: number;
+    to: string;
+    firstName: string;
+    preferredLanguage?: unknown;
+  }) => Promise<void>;
+  /** Optional — staff guest claim emails */
+  deliverRegistrationConfirmedEmail?: (
+    registrationId: number,
+  ) => Promise<{ sent: boolean; skipped?: boolean; error?: string }>;
+}
+
+function slugify(text: string): string {
+  return text
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 100);
+}
+
+async function uniqueEventSlug(
+  pool: Pool,
+  base: string,
+  excludeEventId?: number,
+): Promise<string> {
+  const candidate = base || "event";
+  let n = 0;
+  while (n < 100) {
+    const slug = n === 0 ? candidate : `${candidate}-${n}`;
+    const params: (string | number)[] = [slug];
+    // Match uk_events_slug_global (unique across soft-deleted rows too)
+    let sql = "SELECT id FROM events WHERE slug = ? LIMIT 1";
+    if (excludeEventId != null) {
+      sql = "SELECT id FROM events WHERE slug = ? AND id <> ? LIMIT 1";
+      params.push(excludeEventId);
+    }
+    const [rows] = await pool.query<RowDataPacket[]>(sql, params);
+    if (rows.length === 0) return slug;
+    n += 1;
+  }
+  return `${candidate}-${Date.now()}`;
+}
+
+async function assertEventSubdomainAvailable(
+  pool: Pool,
+  raw: string,
+  excludeEventId?: number,
+): Promise<{ ok: true; subdomain: string } | { ok: false; error: string }> {
+  const subdomain = normalizeEventSubdomain(raw);
+  const formatErr = validateEventSubdomainFormat(subdomain);
+  if (formatErr === "required") {
+    return { ok: false, error: "subdomain required" };
+  }
+  if (formatErr === "too_short") {
+    return { ok: false, error: "subdomain too short (min 3)" };
+  }
+  if (formatErr === "too_long") {
+    return { ok: false, error: "subdomain too long (max 63)" };
+  }
+  if (formatErr === "invalid_chars" || formatErr === "reserved") {
+    return {
+      ok: false,
+      error:
+        formatErr === "reserved"
+          ? "subdomain is reserved"
+          : "subdomain must be lowercase letters, numbers, and hyphens",
+    };
+  }
+  const params: (string | number)[] = [subdomain];
+  // Match uk_events_subdomain (unique across soft-deleted rows too)
+  let sql = "SELECT id FROM events WHERE subdomain = ? LIMIT 1";
+  if (excludeEventId != null) {
+    sql = "SELECT id FROM events WHERE subdomain = ? AND id <> ? LIMIT 1";
+    params.push(excludeEventId);
+  }
+  const [rows] = await pool.query<RowDataPacket[]>(sql, params);
+  if (rows.length > 0) {
+    return { ok: false, error: "subdomain already taken" };
+  }
+  return { ok: true, subdomain };
+}
+
+function isMysqlDuplicateEntry(err: unknown): boolean {
+  if (typeof err !== "object" || err == null) return false;
+  const e = err as { code?: string; errno?: number };
+  return e.code === "ER_DUP_ENTRY" || e.errno === 1062;
+}
+
+/** Map insert unique violations to a clear 400 (do not blame subdomain for slug/uuid). */
+function eventCreateDuplicateError(err: unknown): string {
+  const msg = String(
+    typeof err === "object" && err != null && "message" in err
+      ? (err as { message?: unknown }).message
+      : err,
+  ).toLowerCase();
+  if (msg.includes("uk_events_subdomain") || msg.includes("subdomain")) {
+    return "subdomain already taken";
+  }
+  if (
+    msg.includes("uk_events_slug_global") ||
+    msg.includes("uk_events_organizer_slug") ||
+    msg.includes("slug")
+  ) {
+    return "slug already taken";
+  }
+  if (msg.includes("public_uuid")) {
+    return "event create conflict, please retry";
+  }
+  return "duplicate entry";
+}
+
+function parseFinishTimeToMs(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Math.round(value);
+  }
+  const s = String(value ?? "").trim();
+  if (!s) return null;
+  if (/^\d+$/.test(s)) return Number(s) * 1000;
+  const parts = s.split(":").map((p) => parseFloat(p));
+  if (parts.length === 3 && parts.every((n) => Number.isFinite(n))) {
+    return Math.round((parts[0] * 3600 + parts[1] * 60 + parts[2]) * 1000);
+  }
+  if (parts.length === 2 && parts.every((n) => Number.isFinite(n))) {
+    return Math.round((parts[0] * 60 + parts[1]) * 1000);
+  }
+  return null;
+}
+
+export async function getOrganizerMemberRole(
+  pool: Pool,
+  memberId: number,
+  organizerId: number,
+): Promise<string | null> {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT role FROM organizer_members
+     WHERE id = ? AND organizer_id = ? AND status = 'active' AND deleted_at IS NULL LIMIT 1`,
+    [memberId, organizerId],
+  );
+  return (rows[0]?.role as string) ?? null;
+}
+
+async function assertOrganizerOwnsEvent(
+  pool: Pool,
+  organizerId: number,
+  eventId: number,
+): Promise<boolean> {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    "SELECT id FROM events WHERE id = ? AND organizer_id = ? AND deleted_at IS NULL LIMIT 1",
+    [eventId, organizerId],
+  );
+  return rows.length > 0;
+}
+
+type MemberEventAccess = "all" | number[];
+
+/** Roles that always see every org event (cannot be event-scoped). */
+const ORG_WIDE_EVENT_ROLES = new Set(["owner", "organizer"]);
+
+const ORGANIZER_MEMBER_LIST_SQL = `SELECT id, email, first_name, last_name, phone, role, event_access_scope, status,
+                invited_at, last_login_at, created_at
+         FROM organizer_members WHERE organizer_id = ? AND deleted_at IS NULL
+         ORDER BY FIELD(role,'owner','organizer','operations','marketing','finance','timing','sponsor','seller'), created_at ASC`;
+
+async function enrichMembersWithAssignedEvents(
+  pool: Pool,
+  members: RowDataPacket[],
+): Promise<RowDataPacket[]> {
+  const assignedByMember = new Map<number, number[]>();
+  const memberIds = members.map((m) => Number(m.id));
+  if (memberIds.length > 0) {
+    const placeholders = memberIds.map(() => "?").join(", ");
+    const [assignments] = await pool.query<RowDataPacket[]>(
+      `SELECT organizer_member_id, event_id FROM organizer_member_events
+       WHERE organizer_member_id IN (${placeholders})`,
+      memberIds,
+    );
+    for (const row of assignments) {
+      const mid = Number(row.organizer_member_id);
+      const list = assignedByMember.get(mid) ?? [];
+      list.push(Number(row.event_id));
+      assignedByMember.set(mid, list);
+    }
+  }
+  return members.map((m) => ({
+    ...m,
+    assigned_event_ids: assignedByMember.get(Number(m.id)) ?? [],
+  }));
+}
+
+async function listOrganizerMembersWithAccess(
+  pool: Pool,
+  organizerId: number,
+): Promise<RowDataPacket[]> {
+  const [rows] = await pool.query<RowDataPacket[]>(ORGANIZER_MEMBER_LIST_SQL, [
+    organizerId,
+  ]);
+  return enrichMembersWithAssignedEvents(pool, rows);
+}
+
+/**
+ * Persist event access for a non–org-wide role.
+ * `events` scope requires at least one event_id owned by the organizer.
+ */
+async function applyMemberEventAccess(
+  pool: Pool,
+  organizerId: number,
+  memberId: number,
+  role: string,
+  scopeRaw: unknown,
+  eventIdsRaw: unknown,
+): Promise<{ ok: true; scope: "organization" | "events" } | { ok: false; status: number; error: string }> {
+  if (ORG_WIDE_EVENT_ROLES.has(role)) {
+    await pool.query<ResultSetHeader>(
+      "UPDATE organizer_members SET event_access_scope = 'organization' WHERE id = ? AND organizer_id = ?",
+      [memberId, organizerId],
+    );
+    await pool.query<ResultSetHeader>(
+      "DELETE FROM organizer_member_events WHERE organizer_member_id = ?",
+      [memberId],
+    );
+    return { ok: true, scope: "organization" };
+  }
+
+  const scope =
+    scopeRaw === "events" || scopeRaw === "organization" ? scopeRaw : null;
+  if (!scope) {
+    return {
+      ok: false,
+      status: 400,
+      error: "event_access_scope must be organization or events",
+    };
+  }
+
+  await pool.query<ResultSetHeader>(
+    "UPDATE organizer_members SET event_access_scope = ? WHERE id = ? AND organizer_id = ?",
+    [scope, memberId, organizerId],
+  );
+  await pool.query<ResultSetHeader>(
+    "DELETE FROM organizer_member_events WHERE organizer_member_id = ?",
+    [memberId],
+  );
+
+  if (scope === "events") {
+    if (!Array.isArray(eventIdsRaw) || eventIdsRaw.length === 0) {
+      return {
+        ok: false,
+        status: 400,
+        error: "event_ids required when scope is events",
+      };
+    }
+    const eventIds = [
+      ...new Set(
+        eventIdsRaw
+          .map((id: unknown) => Number(id))
+          .filter((id) => Number.isFinite(id) && id > 0),
+      ),
+    ];
+    if (eventIds.length === 0) {
+      return {
+        ok: false,
+        status: 400,
+        error: "event_ids required when scope is events",
+      };
+    }
+    for (const eventId of eventIds) {
+      if (!(await assertOrganizerOwnsEvent(pool, organizerId, eventId))) {
+        return {
+          ok: false,
+          status: 400,
+          error: `Event ${eventId} is not linked to this organization`,
+        };
+      }
+      await pool.query<ResultSetHeader>(
+        "INSERT INTO organizer_member_events (organizer_member_id, event_id) VALUES (?, ?)",
+        [memberId, eventId],
+      );
+    }
+  }
+
+  return { ok: true, scope };
+}
+
+async function getMemberEventAccess(
+  pool: Pool,
+  memberId: number,
+  organizerId: number,
+): Promise<MemberEventAccess> {
+  const [[member]] = await pool.query<RowDataPacket[]>(
+    `SELECT role, event_access_scope FROM organizer_members
+     WHERE id = ? AND organizer_id = ? AND status = 'active' AND deleted_at IS NULL LIMIT 1`,
+    [memberId, organizerId],
+  );
+  if (!member) return [];
+  // Sellers and other staff honor event_access_scope; owner/organizer stay org-wide.
+  if (
+    ORG_WIDE_EVENT_ROLES.has(String(member.role)) ||
+    member.event_access_scope === "organization"
+  ) {
+    return "all";
+  }
+  const [rows] = await pool.query<RowDataPacket[]>(
+    "SELECT event_id FROM organizer_member_events WHERE organizer_member_id = ?",
+    [memberId],
+  );
+  return rows.map((r) => Number(r.event_id));
+}
+
+export async function listOrganizerMemberEvents(
+  pool: Pool,
+  memberId: number,
+  organizerId: number,
+): Promise<RowDataPacket[]> {
+  const result = await listOrganizerMemberEventsPaginated(
+    pool,
+    memberId,
+    organizerId,
+    {
+      page: 1,
+      limit: 100,
+      sortBy: "start_date",
+      sortDir: "DESC",
+    },
+  );
+  return result.events as unknown as RowDataPacket[];
+}
+
+export async function listOrganizerMemberEventsPaginated(
+  pool: Pool,
+  memberId: number,
+  organizerId: number,
+  options: {
+    q?: string;
+    status?: string;
+    simulation?: "all" | "0" | "1";
+    page?: unknown;
+    limit?: unknown;
+    sortBy?: unknown;
+    sortDir?: unknown;
+  } = {},
+) {
+  const access = await getMemberEventAccess(pool, memberId, organizerId);
+  if (Array.isArray(access) && access.length === 0) {
+    const { page, limit } = parseStaffEventsListQuery(options);
+    return {
+      events: [],
+      pagination: buildStaffEventsPagination(page, limit, 0),
+    };
+  }
+
+  return listStaffEvents(pool, {
+    ...options,
+    organizerId,
+    eventIds: access === "all" ? undefined : access,
+  });
+}
+
+export async function assertMemberCanAccessEvent(
+  pool: Pool,
+  memberId: number,
+  organizerId: number,
+  eventId: number,
+): Promise<boolean> {
+  if (!(await assertOrganizerOwnsEvent(pool, organizerId, eventId))) {
+    return false;
+  }
+  const access = await getMemberEventAccess(pool, memberId, organizerId);
+  if (access === "all") return true;
+  return access.includes(eventId);
+}
+
+async function assignEventsToOrganizer(
+  pool: Pool,
+  organizerId: number,
+  eventIds: number[],
+): Promise<void> {
+  const uniqueIds = [...new Set(eventIds.filter((id) => Number.isFinite(id)))];
+  if (uniqueIds.length === 0) return;
+  const placeholders = uniqueIds.map(() => "?").join(", ");
+  await pool.query<ResultSetHeader>(
+    `UPDATE events SET organizer_id = ? WHERE id IN (${placeholders}) AND deleted_at IS NULL`,
+    [organizerId, ...uniqueIds],
+  );
+}
+
+async function fetchOrganizerLinkedEvents(pool: Pool, organizerId: number) {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT e.id, e.title, e.slug, e.status, e.start_date, e.organizer_id,
+            o.name AS organizer_name,
+            ${EVENT_REGISTRATION_COUNT_SQL} AS registration_count
+     FROM events e
+     JOIN organizers o ON o.id = e.organizer_id
+     WHERE e.organizer_id = ? AND e.deleted_at IS NULL
+     ORDER BY e.start_date DESC, e.id DESC`,
+    [organizerId],
+  );
+  return rows;
+}
+
+async function fetchStaffEventDetail(
+  pool: Pool,
+  eventId: number,
+): Promise<RowDataPacket | null> {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT e.id, e.public_uuid, e.organizer_id, e.sport_type_id, e.slug, e.subdomain, e.title,
+            e.short_description, e.description, e.status, e.visibility, e.featured,
+            e.start_date, e.end_date, e.registration_opens_at, e.registration_closes_at,
+            e.check_in_opens_at, e.check_in_closes_at,
+            e.timezone, e.location_name, e.location_city, e.location_state, e.location_country,
+            e.location_lat, e.location_lng,
+            e.hero_image_url, e.banner_image_url, e.requires_waiver, e.fee_presentation, e.msi_enabled, e.manual_sales_enabled, e.service_fee_percent,
+            e.submitted_for_approval_at, e.approval_rejection_reason,
+            ${EVENT_REGISTRATION_COUNT_SQL} AS registration_count, e.max_registrations,
+            e.max_registrations_per_order, e.bib_mode, e.auto_deactivate_after_event, e.is_simulation,
+            e.simulation_access_token, e.simulation_expires_at, e.simulation_last_activity_at,
+            st.name AS sport_name, o.name AS organizer_name,
+            o.fee_presentation AS organizer_fee_presentation,
+            o.service_fee_percent AS organizer_service_fee_percent
+     FROM events e
+     JOIN sport_types st ON st.id = e.sport_type_id
+     JOIN organizers o ON o.id = e.organizer_id
+     WHERE e.id = ? AND e.deleted_at IS NULL LIMIT 1`,
+    [eventId],
+  );
+  const row = rows[0];
+  if (!row) return null;
+  const legalStatus = await getOrganizerSiteLegalStatus(
+    pool,
+    Number(row.organizer_id),
+    "es",
+  );
+  return {
+    ...row,
+    site_legal_ready: legalStatus.ready ? 1 : 0,
+  };
+}
+
+async function fetchEventCategories(pool: Pool, eventId: number) {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT id, public_uuid, name, description, distance_km, difficulty, capacity,
+            ${CATEGORY_SOLD_COUNT_UNALIASED_SQL} AS sold_count,
+            price_cents, currency, gender_restriction, min_age, max_age, waitlist_enabled,
+            registration_opens_at, registration_closes_at,
+            sort_order, is_active
+     FROM event_categories WHERE event_id = ? ORDER BY sort_order ASC, id ASC`,
+    [eventId],
+  );
+  return rows;
+}
+
+async function assertEventExists(
+  pool: Pool,
+  eventId: number,
+): Promise<boolean> {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    "SELECT id FROM events WHERE id = ? AND deleted_at IS NULL LIMIT 1",
+    [eventId],
+  );
+  return rows.length > 0;
+}
+
+type SortDir = "ASC" | "DESC";
+
+interface ListQueryOptions {
+  page?: unknown;
+  limit?: unknown;
+  sortBy?: unknown;
+  sortDir?: unknown;
+  defaultSort?: string;
+  sortColumns: Record<string, string>;
+}
+
+function parseListQuery(opts: ListQueryOptions) {
+  const page = Math.max(1, Number(opts.page) || 1);
+  const limit = Math.min(100, Math.max(1, Number(opts.limit) || 20));
+  const sortKey = String(opts.sortBy ?? opts.defaultSort ?? "created_at");
+  const sortCol =
+    opts.sortColumns[sortKey] ??
+    opts.sortColumns[opts.defaultSort ?? "created_at"];
+  const sortDir: SortDir =
+    String(opts.sortDir ?? "DESC").toUpperCase() === "ASC" ? "ASC" : "DESC";
+  return {
+    page,
+    limit,
+    offset: (page - 1) * limit,
+    sortCol,
+    sortDir,
+    sortKey,
+  };
+}
+
+function buildPagination(page: number, limit: number, total: number) {
+  return {
+    page,
+    limit,
+    total,
+    totalPages: Math.max(1, Math.ceil(total / limit)),
+  };
+}
+
+const REGISTRATION_SORT_COLUMNS: Record<string, string> = {
+  created_at: "r.created_at",
+  registration_number: "r.registration_number",
+  status: "r.status",
+  total_cents: "r.total_cents",
+  bib_number: "r.bib_number",
+  athlete_last_name: "a.last_name",
+  category_name: "ec.name",
+};
+
+async function fetchEventHubSummary(
+  pool: Pool,
+  eventId: number,
+  stripe?: import("stripe").default | null,
+) {
+  const [[stats]] = await pool.query<RowDataPacket[]>(
+    `SELECT
+       (SELECT COUNT(*) FROM registrations
+        WHERE event_id = ? AND status = 'confirmed' AND deleted_at IS NULL) AS confirmed_count,
+       (SELECT COUNT(*) FROM registrations
+        WHERE event_id = ? AND status = 'pending_payment' AND deleted_at IS NULL) AS pending_count,
+       (SELECT COUNT(*) FROM registrations
+        WHERE event_id = ? AND status IN ('cancelled','refunded') AND deleted_at IS NULL) AS cancelled_count,
+       (SELECT COUNT(*) FROM registrations
+        WHERE event_id = ? AND checked_in_at IS NOT NULL AND deleted_at IS NULL) AS checked_in_count,
+       (SELECT COALESCE(SUM(total_cents), 0) FROM registrations
+        WHERE event_id = ? AND status = 'confirmed' AND deleted_at IS NULL) AS revenue_cents,
+       (SELECT COUNT(*) FROM waitlist_entries
+        WHERE event_id = ? AND status IN ('waiting','offered')) AS waitlist_count`,
+    [eventId, eventId, eventId, eventId, eventId, eventId],
+  );
+
+  const [categories] = await pool.query<RowDataPacket[]>(
+    `SELECT ec.id, ec.name, ec.capacity,
+            (SELECT COUNT(*) FROM registrations r
+             WHERE r.event_category_id = ec.id AND r.status = 'confirmed' AND r.deleted_at IS NULL) AS sold_count
+     FROM event_categories ec
+     WHERE ec.event_id = ?
+     ORDER BY ec.sort_order ASC, ec.id ASC`,
+    [eventId],
+  );
+
+  const [[eventMeta]] = await pool.query<RowDataPacket[]>(
+    `SELECT status, organizer_id FROM events WHERE id = ? AND deleted_at IS NULL LIMIT 1`,
+    [eventId],
+  );
+  const paymentAvailability = eventMeta
+    ? await attachEventPaymentAvailability(
+        pool,
+        {
+          id: eventId,
+          status: String(eventMeta.status),
+          organizer_id: Number(eventMeta.organizer_id),
+        },
+        stripe,
+      )
+    : { has_paid_categories: false, payments_available: true };
+
+  return {
+    confirmed_count: Number(stats?.confirmed_count ?? 0),
+    pending_count: Number(stats?.pending_count ?? 0),
+    cancelled_count: Number(stats?.cancelled_count ?? 0),
+    checked_in_count: Number(stats?.checked_in_count ?? 0),
+    revenue_cents: Number(stats?.revenue_cents ?? 0),
+    waitlist_count: Number(stats?.waitlist_count ?? 0),
+    categories: categories.map((row) => ({
+      id: row.id,
+      name: row.name,
+      capacity: row.capacity != null ? Number(row.capacity) : null,
+      sold_count: Number(row.sold_count ?? 0),
+    })),
+    ...paymentAvailability,
+  };
+}
+
+async function listEventHubRegistrations(
+  pool: Pool,
+  eventId: number,
+  options: {
+    q?: string;
+    page?: unknown;
+    limit?: unknown;
+    sortBy?: unknown;
+    sortDir?: unknown;
+  } = {},
+) {
+  const { page, limit, offset, sortCol, sortDir } = parseListQuery({
+    ...options,
+    defaultSort: "created_at",
+    sortColumns: REGISTRATION_SORT_COLUMNS,
+  });
+
+  const params: (string | number)[] = [eventId];
+  let searchFilter = "";
+  if (options.q) {
+    const like = `%${options.q}%`;
+    searchFilter =
+      " AND (r.registration_number LIKE ? OR a.email LIKE ? OR CONCAT(a.first_name, ' ', a.last_name) LIKE ? OR r.bib_number LIKE ?)";
+    params.push(like, like, like, like);
+  }
+
+  const [[countRow]] = await pool.query<RowDataPacket[]>(
+    `SELECT COUNT(*) AS total
+     FROM registrations r
+     JOIN athletes a ON a.id = r.athlete_id AND a.deleted_at IS NULL
+     WHERE r.event_id = ? AND r.deleted_at IS NULL${searchFilter}`,
+    params,
+  );
+  const total = Number(countRow?.total ?? 0);
+
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT r.id, r.registration_number, r.bib_number, r.status, r.total_cents, r.created_at,
+            r.checked_in_at, r.waiver_signed_at,
+            e.id AS event_id, e.title AS event_title, e.slug AS event_slug,
+            ec.name AS category_name,
+            a.first_name AS athlete_first_name, a.last_name AS athlete_last_name,
+            a.email AS athlete_email
+     FROM registrations r
+     JOIN events e ON e.id = r.event_id AND e.deleted_at IS NULL
+     JOIN event_categories ec ON ec.id = r.event_category_id
+     JOIN athletes a ON a.id = r.athlete_id AND a.deleted_at IS NULL
+     WHERE r.event_id = ? AND r.deleted_at IS NULL${searchFilter}
+     ORDER BY ${sortCol} ${sortDir}, r.id DESC
+     LIMIT ? OFFSET ?`,
+    [...params, limit, offset],
+  );
+
+  const [[eventRow]] = await pool.query<RowDataPacket[]>(
+    `SELECT requires_waiver FROM events WHERE id = ? LIMIT 1`,
+    [eventId],
+  );
+  const enriched = await enrichRegistrationRowsWithWaiverOutdated(
+    pool,
+    rows,
+    Boolean(eventRow?.requires_waiver),
+  );
+
+  return {
+    registrations: enriched,
+    pagination: buildPagination(page, limit, total),
+  };
+}
+
+const ATHLETE_SORT_COLUMNS: Record<string, string> = {
+  created_at: "a.created_at",
+  first_name: "a.first_name",
+  last_name: "a.last_name",
+  email: "a.email",
+  registration_count: "registration_count",
+  status: "a.status",
+};
+
+export async function listAdminAthletes(
+  pool: Pool,
+  options: {
+    q?: string;
+    page?: unknown;
+    limit?: unknown;
+    sortBy?: unknown;
+    sortDir?: unknown;
+  } = {},
+) {
+  const { page, limit, offset, sortCol, sortDir } = parseListQuery({
+    ...options,
+    defaultSort: "created_at",
+    sortColumns: ATHLETE_SORT_COLUMNS,
+  });
+
+  const params: string[] = [];
+  let searchFilter = "";
+  if (options.q) {
+    const like = `%${options.q}%`;
+    searchFilter =
+      " AND (a.email LIKE ? OR a.phone LIKE ? OR CONCAT(a.first_name, ' ', a.last_name) LIKE ?)";
+    params.push(like, like, like);
+  }
+
+  const [[countRow]] = await pool.query<RowDataPacket[]>(
+    `SELECT COUNT(*) AS total FROM athletes a WHERE a.deleted_at IS NULL${searchFilter}`,
+    params,
+  );
+  const total = Number(countRow?.total ?? 0);
+
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT a.id, a.email, a.phone, a.first_name, a.last_name, a.city, a.country, a.status,
+            a.created_at,
+            (SELECT COUNT(*) FROM registrations r
+             WHERE r.athlete_id = a.id AND r.status = 'confirmed' AND r.deleted_at IS NULL) AS registration_count
+     FROM athletes a
+     WHERE a.deleted_at IS NULL${searchFilter}
+     ORDER BY ${sortCol} ${sortDir}, a.id DESC
+     LIMIT ? OFFSET ?`,
+    [...params, limit, offset],
+  );
+
+  return { athletes: rows, pagination: buildPagination(page, limit, total) };
+}
+
+async function uniqueOrganizerSlug(
+  pool: Pool,
+  base: string,
+  excludeOrganizerId?: number,
+): Promise<string> {
+  const candidate = base || "organizer";
+  let n = 0;
+  while (n < 100) {
+    const slug = n === 0 ? candidate : `${candidate}-${n}`;
+    const [rows] = await pool.query<RowDataPacket[]>(
+      excludeOrganizerId != null
+        ? "SELECT id FROM organizers WHERE slug = ? AND id <> ? AND deleted_at IS NULL LIMIT 1"
+        : "SELECT id FROM organizers WHERE slug = ? AND deleted_at IS NULL LIMIT 1",
+      excludeOrganizerId != null ? [slug, excludeOrganizerId] : [slug],
+    );
+    if (rows.length === 0) return slug;
+    n += 1;
+  }
+  return `${candidate}-${Date.now()}`;
+}
+
+/** Resolve organizer city to canonical geo_cities.name when country matches. */
+async function normalizeOrganizerCity(
+  pool: Pool,
+  city: string,
+  country: string,
+): Promise<string | null> {
+  const trimmed = city.trim();
+  if (!trimmed) return null;
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT gc.name
+     FROM geo_cities gc
+     JOIN geo_states gs ON gs.id = gc.state_id
+     WHERE gc.is_active = 1
+       AND gs.is_active = 1
+       AND gs.country = ?
+       AND LOWER(TRIM(gc.name)) = LOWER(?)
+     LIMIT 1`,
+    [country, trimmed],
+  );
+  return rows.length > 0 ? String(rows[0].name) : null;
+}
+
+const ORGANIZER_SORT_COLUMNS: Record<string, string> = {
+  name: "o.name",
+  email: "o.email",
+  city: "o.city",
+  status: "o.status",
+  created_at: "o.created_at",
+  event_count: "event_count",
+  member_count: "member_count",
+};
+
+export async function listAdminOrganizers(
+  pool: Pool,
+  options: {
+    q?: string;
+    status?: string;
+    page?: unknown;
+    limit?: unknown;
+    sortBy?: unknown;
+    sortDir?: unknown;
+  } = {},
+) {
+  const { page, limit, offset, sortCol, sortDir } = parseListQuery({
+    ...options,
+    defaultSort: "name",
+    sortColumns: ORGANIZER_SORT_COLUMNS,
+  });
+
+  const params: string[] = [];
+  let filters = " WHERE o.deleted_at IS NULL";
+  if (
+    options.status &&
+    ["pending", "active", "suspended", "inactive"].includes(options.status)
+  ) {
+    filters += " AND o.status = ?";
+    params.push(options.status);
+  }
+  if (options.q) {
+    const like = `%${options.q}%`;
+    filters +=
+      " AND (o.name LIKE ? OR o.email LIKE ? OR o.slug LIKE ? OR o.city LIKE ?)";
+    params.push(like, like, like, like);
+  }
+
+  const [[countRow]] = await pool.query<RowDataPacket[]>(
+    `SELECT COUNT(*) AS total FROM organizers o${filters}`,
+    params,
+  );
+  const total = Number(countRow?.total ?? 0);
+
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT o.id, o.name, o.slug, o.email, o.city, o.country, o.status, o.logo_url, o.created_at,
+            (SELECT COUNT(*) FROM events e WHERE e.organizer_id = o.id AND e.deleted_at IS NULL) AS event_count,
+            (SELECT COUNT(*) FROM organizer_members om WHERE om.organizer_id = o.id AND om.deleted_at IS NULL) AS member_count
+     FROM organizers o
+     ${filters}
+     ORDER BY ${sortCol} ${sortDir}, o.id DESC
+     LIMIT ? OFFSET ?`,
+    [...params, limit, offset],
+  );
+
+  return { organizers: rows, pagination: buildPagination(page, limit, total) };
+}
+
+const ADMIN_STAFF_SORT_COLUMNS: Record<string, string> = {
+  created_at: "a.created_at",
+  first_name: "a.first_name",
+  last_name: "a.last_name",
+  email: "a.email",
+  role: "a.role",
+  status: "a.status",
+  last_login_at: "a.last_login_at",
+};
+
+export async function listAdminStaff(
+  pool: Pool,
+  options: {
+    q?: string;
+    page?: unknown;
+    limit?: unknown;
+    sortBy?: unknown;
+    sortDir?: unknown;
+  } = {},
+) {
+  const { page, limit, offset, sortCol, sortDir } = parseListQuery({
+    ...options,
+    defaultSort: "created_at",
+    sortColumns: ADMIN_STAFF_SORT_COLUMNS,
+  });
+
+  const params: string[] = [];
+  let filters = " WHERE a.deleted_at IS NULL";
+  if (options.q) {
+    const like = `%${options.q}%`;
+    filters +=
+      " AND (a.email LIKE ? OR CONCAT(a.first_name, ' ', a.last_name) LIKE ? OR a.phone LIKE ?)";
+    params.push(like, like, like);
+  }
+
+  const [[countRow]] = await pool.query<RowDataPacket[]>(
+    `SELECT COUNT(*) AS total FROM admins a${filters}`,
+    params,
+  );
+  const total = Number(countRow?.total ?? 0);
+
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT a.id, a.email, a.first_name, a.last_name, a.phone, a.role, a.status,
+            a.last_login_at, a.created_at
+     FROM admins a
+     ${filters}
+     ORDER BY ${sortCol} ${sortDir}, a.id DESC
+     LIMIT ? OFFSET ?`,
+    [...params, limit, offset],
+  );
+
+  return { admins: rows, pagination: buildPagination(page, limit, total) };
+}
+
+async function getAdminRole(
+  pool: Pool,
+  adminId: number,
+): Promise<string | null> {
+  const [[row]] = await pool.query<RowDataPacket[]>(
+    "SELECT role FROM admins WHERE id = ? AND deleted_at IS NULL LIMIT 1",
+    [adminId],
+  );
+  return row?.role != null ? String(row.role) : null;
+}
+
+function isSuperAdminRole(role: string | null | undefined): boolean {
+  return role === "super_admin";
+}
+
+const PAYMENT_SORT_COLUMNS: Record<string, string> = {
+  created_at: "p.created_at",
+  amount_cents: "p.amount_cents",
+  status: "p.status",
+  paid_at: "p.paid_at",
+};
+
+export async function listAdminPayments(
+  pool: Pool,
+  options: {
+    q?: string;
+    status?: string;
+    provider?: string;
+    organizerId?: number;
+    eventId?: number;
+    recordedByMemberId?: number;
+    recordedByMemberOnline?: boolean;
+    page?: unknown;
+    limit?: unknown;
+    sortBy?: unknown;
+    sortDir?: unknown;
+  } = {},
+) {
+  const { page, limit, offset, sortCol, sortDir } = parseListQuery({
+    ...options,
+    defaultSort: "created_at",
+    sortColumns: PAYMENT_SORT_COLUMNS,
+  });
+
+  const params: (string | number)[] = [];
+  let filters = " WHERE 1=1";
+  // Keep simulation payments out of global revenue lists; allow when scoped to an event.
+  if (options.eventId == null) {
+    filters += " AND COALESCE(p.is_simulation, 0) = 0";
+  }
+  if (
+    options.status &&
+    [
+      "pending",
+      "processing",
+      "succeeded",
+      "failed",
+      "refunded",
+      "partially_refunded",
+    ].includes(options.status)
+  ) {
+    filters += " AND p.status = ?";
+    params.push(options.status);
+  }
+  if (options.organizerId != null) {
+    filters += " AND p.organizer_id = ?";
+    params.push(options.organizerId);
+  }
+  if (options.eventId != null) {
+    filters += " AND p.event_id = ?";
+    params.push(options.eventId);
+  }
+  if (
+    options.provider &&
+    ["stripe", "mock", "manual"].includes(options.provider)
+  ) {
+    filters += " AND p.provider = ?";
+    params.push(options.provider);
+  }
+  if (options.recordedByMemberOnline) {
+    filters += " AND p.recorded_by_member_id IS NULL";
+  } else if (options.recordedByMemberId != null) {
+    filters += " AND p.recorded_by_member_id = ?";
+    params.push(options.recordedByMemberId);
+  }
+  if (options.q) {
+    const like = `%${options.q}%`;
+    filters +=
+      " AND (a.email LIKE ? OR CONCAT(a.first_name, ' ', a.last_name) LIKE ? OR e.title LIKE ? OR r.registration_number LIKE ? OR p.stripe_payment_intent_id LIKE ?)";
+    params.push(like, like, like, like, like);
+  }
+
+  const [[countRow]] = await pool.query<RowDataPacket[]>(
+    `SELECT COUNT(*) AS total
+     FROM payments p
+     LEFT JOIN athletes a ON a.id = p.athlete_id
+     LEFT JOIN events e ON e.id = p.event_id
+     LEFT JOIN registrations r ON r.id = p.registration_id
+     ${filters}`,
+    params,
+  );
+  const total = Number(countRow?.total ?? 0);
+
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT p.id, p.public_uuid, p.registration_id, p.athlete_id, p.organizer_id, p.event_id,
+            p.amount_cents, p.registration_amount_cents, p.service_fee_cents, p.currency, p.status,
+            p.provider, p.recorded_by_member_id, p.stripe_payment_intent_id, p.paid_at, p.created_at,
+            a.first_name AS athlete_first_name, a.last_name AS athlete_last_name, a.email AS athlete_email,
+            e.title AS event_title, e.slug AS event_slug,
+            o.name AS organizer_name,
+            r.registration_number,
+            om.first_name AS seller_first_name, om.last_name AS seller_last_name, om.email AS seller_email
+     FROM payments p
+     LEFT JOIN athletes a ON a.id = p.athlete_id
+     LEFT JOIN events e ON e.id = p.event_id
+     LEFT JOIN organizers o ON o.id = p.organizer_id
+     LEFT JOIN registrations r ON r.id = p.registration_id
+     LEFT JOIN organizer_members om ON om.id = p.recorded_by_member_id
+     ${filters}
+     ORDER BY ${sortCol} ${sortDir}, p.id DESC
+     LIMIT ? OFFSET ?`,
+    [...params, limit, offset],
+  );
+
+  return { payments: rows, pagination: buildPagination(page, limit, total) };
+}
+
+export async function listOrganizerSellerSalesSummary(
+  pool: Pool,
+  organizerId: number,
+): Promise<{
+  sellers: RowDataPacket[];
+  manual_sale_total_cents: number;
+  manual_sale_count: number;
+}> {
+  const [sellerRows] = await pool.query<RowDataPacket[]>(
+    `SELECT om.id AS member_id, om.first_name, om.last_name, om.email,
+            COUNT(p.id) AS sale_count,
+            COALESCE(SUM(p.amount_cents), 0) AS total_cents
+     FROM payments p
+     JOIN organizer_members om ON om.id = p.recorded_by_member_id
+     WHERE p.organizer_id = ?
+       AND p.provider = 'manual'
+       AND p.status = 'succeeded'
+     GROUP BY om.id, om.first_name, om.last_name, om.email
+     ORDER BY total_cents DESC, sale_count DESC, om.first_name ASC`,
+    [organizerId],
+  );
+
+  const [[totals]] = await pool.query<RowDataPacket[]>(
+    `SELECT COUNT(*) AS manual_sale_count,
+            COALESCE(SUM(amount_cents), 0) AS manual_sale_total_cents
+     FROM payments
+     WHERE organizer_id = ?
+       AND provider = 'manual'
+       AND status = 'succeeded'`,
+    [organizerId],
+  );
+
+  return {
+    sellers: sellerRows,
+    manual_sale_total_cents: Number(totals?.manual_sale_total_cents ?? 0),
+    manual_sale_count: Number(totals?.manual_sale_count ?? 0),
+  };
+}
+
+export async function fetchAdminPaymentDetail(
+  pool: Pool,
+  paymentId: number,
+  options: { organizerId?: number } = {},
+) {
+  const params: number[] = [paymentId];
+  let scope = " WHERE p.id = ?";
+  if (options.organizerId != null) {
+    scope += " AND p.organizer_id = ?";
+    params.push(options.organizerId);
+  }
+
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT p.id, p.public_uuid, p.registration_id, p.athlete_id, p.organizer_id, p.event_id,
+            p.amount_cents, p.registration_amount_cents, p.service_fee_cents, p.currency, p.status,
+            p.provider, p.recorded_by_member_id, p.stripe_payment_intent_id, p.paid_at, p.created_at,
+            p.failure_code, p.failure_message, p.metadata_json,
+            a.first_name AS athlete_first_name, a.last_name AS athlete_last_name, a.email AS athlete_email,
+            e.title AS event_title, e.slug AS event_slug,
+            o.name AS organizer_name,
+            r.registration_number, r.status AS registration_status, r.bib_number,
+            om.first_name AS seller_first_name, om.last_name AS seller_last_name, om.email AS seller_email
+     FROM payments p
+     LEFT JOIN athletes a ON a.id = p.athlete_id
+     LEFT JOIN events e ON e.id = p.event_id
+     LEFT JOIN organizers o ON o.id = p.organizer_id
+     LEFT JOIN registrations r ON r.id = p.registration_id
+     LEFT JOIN organizer_members om ON om.id = p.recorded_by_member_id
+     ${scope}
+     LIMIT 1`,
+    params,
+  );
+
+  const row = rows[0];
+  if (!row) return null;
+
+  const meta = parseCheckoutPaymentMetadata(
+    typeof row.metadata_json === "string"
+      ? JSON.parse(row.metadata_json as string)
+      : row.metadata_json,
+  );
+
+  return {
+    ...row,
+    metadata_json: undefined,
+    fee_presentation: meta?.feePresentation ?? meta?.breakdown?.mode ?? null,
+    checkout_breakdown: meta?.breakdown ?? null,
+  };
+}
+
+async function fetchStaffRegistrationDetail(
+  pool: Pool,
+  eventId: number,
+  registrationId: number,
+) {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT r.id, r.public_uuid, r.registration_number, r.bib_number, r.qr_code_token,
+            r.status, r.price_cents, r.service_fee_cents, r.total_cents, r.source,
+            r.waiver_signed_at, r.checked_in_at, r.created_at, r.updated_at, r.payment_id,
+            r.event_category_id, r.athlete_id, r.order_id, r.purchaser_athlete_id, r.guest_claim_token,
+            ec.name AS category_name,
+            a.first_name AS athlete_first_name, a.last_name AS athlete_last_name,
+            a.email AS athlete_email, a.phone AS athlete_phone,
+            e.id AS event_id, e.title AS event_title, e.slug AS event_slug,
+            p.first_name AS purchaser_first_name, p.last_name AS purchaser_last_name,
+            p.email AS purchaser_email
+     FROM registrations r
+     JOIN event_categories ec ON ec.id = r.event_category_id
+     JOIN athletes a ON a.id = r.athlete_id AND a.deleted_at IS NULL
+     JOIN events e ON e.id = r.event_id AND e.deleted_at IS NULL
+     LEFT JOIN athletes p ON p.id = r.purchaser_athlete_id AND p.deleted_at IS NULL
+     WHERE r.id = ? AND r.event_id = ? AND r.deleted_at IS NULL
+     LIMIT 1`,
+    [registrationId, eventId],
+  );
+  if (rows.length === 0) return null;
+
+  const reg = enrichRegistrationPartyFlags(rows[0]);
+  let payment: RowDataPacket | null = null;
+  if (reg.payment_id) {
+    const [payRows] = await pool.query<RowDataPacket[]>(
+      `SELECT id, public_uuid, amount_cents, registration_amount_cents, service_fee_cents,
+              currency, status, provider, stripe_payment_intent_id, stripe_charge_id,
+              paid_at, created_at
+       FROM payments WHERE id = ? LIMIT 1`,
+      [reg.payment_id],
+    );
+    payment = payRows[0] ?? null;
+  } else {
+    const [payRows] = await pool.query<RowDataPacket[]>(
+      `SELECT id, public_uuid, amount_cents, registration_amount_cents, service_fee_cents,
+              currency, status, provider, stripe_payment_intent_id, stripe_charge_id,
+              paid_at, created_at
+       FROM payments WHERE registration_id = ? ORDER BY created_at DESC LIMIT 1`,
+      [registrationId],
+    );
+    payment = payRows[0] ?? null;
+  }
+
+  const [fieldValues] = await pool.query<RowDataPacket[]>(
+    `SELECT erf.field_key, erf.label, erf.field_type, fv.value_text, fv.value_file_url
+     FROM registration_field_values fv
+     JOIN event_registration_fields erf ON erf.id = fv.field_id
+     WHERE fv.registration_id = ?
+     ORDER BY erf.sort_order ASC, erf.id ASC`,
+    [registrationId],
+  );
+
+  const [waiverRows] = await pool.query<RowDataPacket[]>(
+    `SELECT rws.signed_at, rws.signature_data, ew.title AS waiver_name, ew.version AS waiver_version
+     FROM registration_waiver_signatures rws
+     JOIN event_waivers ew ON ew.id = rws.waiver_id
+     WHERE rws.registration_id = ?
+     ORDER BY ew.sort_order ASC, rws.signed_at ASC`,
+    [registrationId],
+  );
+
+  const [statusHistory] = await pool.query<RowDataPacket[]>(
+    `SELECT from_status, to_status, actor_type, reason, created_at
+     FROM registration_status_history
+     WHERE registration_id = ?
+     ORDER BY created_at DESC LIMIT 25`,
+    [registrationId],
+  );
+
+  const [transfers] = await pool.query<RowDataPacket[]>(
+    `SELECT rt.status, rt.transfer_fee_cents, rt.completed_at, rt.created_at,
+            fa.first_name AS from_first_name, fa.last_name AS from_last_name,
+            ta.first_name AS to_first_name, ta.last_name AS to_last_name
+     FROM registration_transfers rt
+     JOIN athletes fa ON fa.id = rt.from_athlete_id
+     JOIN athletes ta ON ta.id = rt.to_athlete_id
+     WHERE rt.registration_id = ?
+     ORDER BY rt.created_at DESC`,
+    [registrationId],
+  );
+
+  const [refunds] = payment
+    ? await pool.query<RowDataPacket[]>(
+        `SELECT id, amount_cents, currency, status, reason, stripe_refund_id, processed_at, created_at
+         FROM payment_refunds WHERE payment_id = ? ORDER BY created_at DESC`,
+        [payment.id],
+      )
+    : [[] as RowDataPacket[]];
+
+  const purchased_extras = await fetchRegistrationPurchasedExtras(
+    pool,
+    registrationId,
+  );
+
+  let order_mates: Array<{
+    id: number;
+    registration_number: string;
+    bib_number?: string | null;
+    status: string;
+    athlete_first_name: string;
+    athlete_last_name: string;
+    athlete_email?: string | null;
+    guest_claim_pending?: boolean;
+    is_managed_participant?: boolean;
+    qr_code_token?: string;
+  }> = [];
+  if (reg.order_id) {
+    const [mates] = await pool.query<RowDataPacket[]>(
+      `SELECT r.id, r.registration_number, r.bib_number, r.status, r.qr_code_token,
+              r.guest_claim_token, r.purchaser_athlete_id, r.athlete_id,
+              a.first_name AS athlete_first_name, a.last_name AS athlete_last_name,
+              a.email AS athlete_email
+       FROM registrations r
+       JOIN athletes a ON a.id = r.athlete_id AND a.deleted_at IS NULL
+       WHERE r.order_id = ? AND r.id <> ? AND r.deleted_at IS NULL
+       ORDER BY r.id ASC`,
+      [reg.order_id, registrationId],
+    );
+    order_mates = mates.map((m) => {
+      const enriched = enrichRegistrationPartyFlags(m);
+      return {
+        id: Number(enriched.id),
+        registration_number: String(enriched.registration_number),
+        bib_number: (enriched.bib_number as string | null) ?? null,
+        status: String(enriched.status),
+        athlete_first_name: String(enriched.athlete_first_name),
+        athlete_last_name: String(enriched.athlete_last_name),
+        athlete_email: (enriched.athlete_email as string | null) ?? null,
+        guest_claim_pending: enriched.guest_claim_pending,
+        is_managed_participant: enriched.is_managed_participant,
+        qr_code_token: enriched.qr_code_token
+          ? String(enriched.qr_code_token)
+          : undefined,
+      };
+    });
+    reg.order_sibling_count = order_mates.length + 1;
+  }
+
+  return {
+    registration: reg,
+    payment,
+    field_values: fieldValues,
+    purchased_extras,
+    waiver: waiverRows[0] ?? null,
+    waivers: waiverRows,
+    status_history: statusHistory,
+    transfers,
+    refunds,
+    order_mates,
+  };
+}
+
+function enrichRegistrationPartyFlags<T extends RowDataPacket>(
+  row: T,
+): T & {
+  guest_claim_pending: boolean;
+  is_managed_participant: boolean;
+} {
+  const guestClaimPending = Boolean(row.guest_claim_token);
+  const purchaserId =
+    row.purchaser_athlete_id != null ? Number(row.purchaser_athlete_id) : null;
+  const athleteId = row.athlete_id != null ? Number(row.athlete_id) : null;
+  const isManaged =
+    purchaserId != null &&
+    athleteId != null &&
+    purchaserId !== athleteId &&
+    !guestClaimPending;
+  const { guest_claim_token: _token, ...rest } = row as T & {
+    guest_claim_token?: string | null;
+  };
+  return {
+    ...(rest as T),
+    guest_claim_pending: guestClaimPending,
+    is_managed_participant: isManaged,
+  };
+}
+
+export async function listStaffRegistrations(
+  pool: Pool,
+  options: {
+    organizerId?: number;
+    eventId?: number;
+    q?: string;
+    page?: unknown;
+    limit?: unknown;
+    sortBy?: unknown;
+    sortDir?: unknown;
+  },
+) {
+  const { page, limit, offset, sortCol, sortDir } = parseListQuery({
+    ...options,
+    defaultSort: "created_at",
+    sortColumns: REGISTRATION_SORT_COLUMNS,
+  });
+
+  const params: (string | number)[] = [];
+  let filters = " WHERE r.deleted_at IS NULL";
+
+  if (options.organizerId != null) {
+    filters += " AND e.organizer_id = ? AND e.deleted_at IS NULL";
+    params.push(options.organizerId);
+  }
+  if (options.eventId != null) {
+    filters += " AND r.event_id = ?";
+    params.push(options.eventId);
+  } else {
+    filters +=
+      " AND COALESCE(r.is_simulation, 0) = 0 AND COALESCE(e.is_simulation, 0) = 0";
+  }
+  if (options.q) {
+    const like = `%${options.q}%`;
+    filters +=
+      " AND (r.registration_number LIKE ? OR r.bib_number LIKE ? OR a.email LIKE ? OR CONCAT(a.first_name, ' ', a.last_name) LIKE ? OR e.title LIKE ?)";
+    params.push(like, like, like, like, like);
+  }
+
+  const [[countRow]] = await pool.query<RowDataPacket[]>(
+    `SELECT COUNT(*) AS total
+     FROM registrations r
+     JOIN events e ON e.id = r.event_id
+     JOIN athletes a ON a.id = r.athlete_id AND a.deleted_at IS NULL
+     ${filters}`,
+    params,
+  );
+  const total = Number(countRow?.total ?? 0);
+
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT r.id, r.registration_number, r.bib_number, r.status, r.total_cents, r.created_at,
+            r.checked_in_at, r.waiver_signed_at, r.order_id, r.purchaser_athlete_id,
+            r.athlete_id, r.guest_claim_token,
+            e.id AS event_id, e.title AS event_title, e.slug AS event_slug,
+            ec.name AS category_name,
+            a.first_name AS athlete_first_name, a.last_name AS athlete_last_name,
+            a.email AS athlete_email,
+            p.first_name AS purchaser_first_name, p.last_name AS purchaser_last_name,
+            p.email AS purchaser_email,
+            (
+              SELECT COUNT(*) FROM registrations ro
+              WHERE ro.order_id = r.order_id AND ro.deleted_at IS NULL AND r.order_id IS NOT NULL
+            ) AS order_sibling_count
+     FROM registrations r
+     JOIN events e ON e.id = r.event_id
+     JOIN event_categories ec ON ec.id = r.event_category_id
+     JOIN athletes a ON a.id = r.athlete_id AND a.deleted_at IS NULL
+     LEFT JOIN athletes p ON p.id = r.purchaser_athlete_id AND p.deleted_at IS NULL
+     ${filters}
+     ORDER BY ${sortCol} ${sortDir}, r.id DESC
+     LIMIT ? OFFSET ?`,
+    [...params, limit, offset],
+  );
+
+  const registrations = rows.map((row) => enrichRegistrationPartyFlags(row));
+
+  return { registrations, pagination: buildPagination(page, limit, total) };
+}
+
+async function assertRegistrationInEvent(
+  pool: Pool,
+  registrationId: number,
+  eventId: number,
+): Promise<RowDataPacket | null> {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT r.id, r.status, r.event_category_id, r.schedule_wave_id, r.checked_in_at,
+            r.waiver_signed_at, r.registration_number, r.bib_number, r.qr_code_token
+     FROM registrations r
+     WHERE r.id = ? AND r.event_id = ? AND r.deleted_at IS NULL LIMIT 1`,
+    [registrationId, eventId],
+  );
+  return rows[0] ?? null;
+}
+
+function staffCheckInActor(req: AuthedRequest): "admin" | "organizer" {
+  return req.auth!.actor === "admin" ? "admin" : "organizer";
+}
+
+async function enforceCheckInWindow(
+  pool: Pool,
+  res: Response,
+  eventId: number,
+  req: AuthedRequest,
+  opts?: { allowAdminLookupBypass?: boolean; bypassWindow?: boolean },
+): Promise<boolean> {
+  const actor = staffCheckInActor(req);
+  const bypassWindow =
+    opts?.bypassWindow ??
+    (actor === "admin" && Boolean(req.body?.bypass_window));
+  const skipForAdminLookup = opts?.allowAdminLookupBypass && actor === "admin";
+
+  if (skipForAdminLookup) {
+    return false;
+  }
+
+  const result = await assertCheckInWindowForEvent(pool, eventId, {
+    actor,
+    bypassWindow,
+  });
+  if ("response" in result) {
+    res.status(result.response.status).json(result.response.body);
+    return true;
+  }
+  return false;
+}
+
+type OrganizerMutateGate = "ok" | "not_found" | "forbidden";
+
+function mountEventHubRoutes(
+  app: Express,
+  pool: Pool,
+  guard: RequestHandler,
+  basePath: string,
+  canAccess: (req: AuthedRequest, eventId: number) => Promise<boolean>,
+  hubHelpers: {
+    newPublicUuid: () => string;
+    newQrToken: () => string;
+    nextRegistrationNumber: (
+      ctx: RegistrationFolioContext,
+      conn?: import("mysql2/promise").PoolConnection,
+    ) => Promise<{ registrationNumber: string; folioSegmentId: number | null }>;
+    getStripeClient?: () => import("stripe").default | null;
+    deliverRegistrationConfirmedEmail?: (
+      registrationId: number,
+    ) => Promise<
+      { sent: boolean; skipped?: boolean; error?: string } | unknown
+    >;
+  },
+  canMutate?: (
+    req: AuthedRequest,
+    eventId: number,
+  ) => Promise<OrganizerMutateGate>,
+  canRecordManualSale?: (
+    req: AuthedRequest,
+    eventId: number,
+  ) => Promise<OrganizerMutateGate>,
+  canMutateRegistrationOps?: (
+    req: AuthedRequest,
+    eventId: number,
+  ) => Promise<OrganizerMutateGate>,
+) {
+  async function assertEventRead(
+    req: AuthedRequest,
+    res: Response,
+    eventId: number,
+  ): Promise<boolean> {
+    if (!Number.isFinite(eventId)) {
+      res.status(400).json({ error: "Invalid event id" });
+      return false;
+    }
+    if (!(await canAccess(req, eventId))) {
+      res.status(404).json({ error: "Event not found" });
+      return false;
+    }
+    return true;
+  }
+
+  async function assertEventWrite(
+    req: AuthedRequest,
+    res: Response,
+    eventId: number,
+  ): Promise<boolean> {
+    if (!Number.isFinite(eventId)) {
+      res.status(400).json({ error: "Invalid event id" });
+      return false;
+    }
+    if (canMutate) {
+      const gate = await canMutate(req, eventId);
+      if (gate === "forbidden") {
+        res
+          .status(403)
+          .json({ error: "Insufficient permissions to edit events" });
+        return false;
+      }
+      if (gate !== "ok") {
+        res.status(404).json({ error: "Event not found" });
+        return false;
+      }
+      return true;
+    }
+    if (!(await canAccess(req, eventId))) {
+      res.status(404).json({ error: "Event not found" });
+      return false;
+    }
+    return true;
+  }
+
+  /** Check-in / bib / cancel — timing included via REGISTRATION_OPS_ROLES. */
+  async function assertRegistrationOpsWrite(
+    req: AuthedRequest,
+    res: Response,
+    eventId: number,
+  ): Promise<boolean> {
+    if (!Number.isFinite(eventId)) {
+      res.status(400).json({ error: "Invalid event id" });
+      return false;
+    }
+    if (canMutateRegistrationOps) {
+      const gate = await canMutateRegistrationOps(req, eventId);
+      if (gate === "forbidden") {
+        res
+          .status(403)
+          .json({
+            error: "Insufficient permissions for registration operations",
+          });
+        return false;
+      }
+      if (gate !== "ok") {
+        res.status(404).json({ error: "Event not found" });
+        return false;
+      }
+      return true;
+    }
+    if (!(await canAccess(req, eventId))) {
+      res.status(404).json({ error: "Event not found" });
+      return false;
+    }
+    return true;
+  }
+
+  async function assertManualSaleWrite(
+    req: AuthedRequest,
+    res: Response,
+    eventId: number,
+  ): Promise<boolean> {
+    if (!Number.isFinite(eventId)) {
+      res.status(400).json({ error: "Invalid event id" });
+      return false;
+    }
+    if (canRecordManualSale) {
+      const gate = await canRecordManualSale(req, eventId);
+      if (gate === "forbidden") {
+        res
+          .status(403)
+          .json({ error: "Insufficient permissions to record manual sales" });
+        return false;
+      }
+      if (gate !== "ok") {
+        res.status(404).json({ error: "Event not found" });
+        return false;
+      }
+      return true;
+    }
+    return assertEventWrite(req, res, eventId);
+  }
+
+  app.get(
+    `${basePath}/:eventId/summary`,
+    guard,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await assertEventRead(req, res, eventId))) return;
+      const summary = await fetchEventHubSummary(
+        pool,
+        eventId,
+        hubHelpers.getStripeClient?.() ?? null,
+      );
+      res.json({ summary });
+    },
+  );
+
+  app.get(
+    `${basePath}/:eventId/registrations`,
+    guard,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await assertEventRead(req, res, eventId))) return;
+      const q = String(req.query.q ?? "").trim();
+      const result = await listEventHubRegistrations(pool, eventId, {
+        q: q || undefined,
+        page: req.query.page,
+        limit: req.query.limit,
+        sortBy: req.query.sortBy,
+        sortDir: req.query.sortDir,
+      });
+      res.json(result);
+    },
+  );
+
+  app.get(
+    `${basePath}/:eventId/check-in/window`,
+    guard,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await assertEventRead(req, res, eventId))) return;
+      const ctx = await loadEventCheckInContext(pool, eventId);
+      if (!ctx) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const window = evaluateEventCheckInWindow(ctx);
+      res.json({
+        window: checkInWindowResponsePayload(ctx, window),
+        canBypassWindow: req.auth!.actor === "admin",
+      });
+    },
+  );
+
+  app.get(
+    `${basePath}/:eventId/registrations/lookup`,
+    guard,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await assertEventRead(req, res, eventId))) return;
+      if (
+        await enforceCheckInWindow(pool, res, eventId, req, {
+          allowAdminLookupBypass: true,
+        })
+      ) {
+        return;
+      }
+      const q = String(req.query.q ?? "").trim();
+      if (!q) {
+        return res.status(400).json({ error: "q required" });
+      }
+
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT r.id, r.registration_number, r.bib_number, r.status, r.qr_code_token,
+                r.checked_in_at, r.waiver_signed_at, r.total_cents, r.created_at,
+                e.id AS event_id, e.title AS event_title, e.slug AS event_slug, e.requires_waiver,
+                ec.name AS category_name,
+                a.first_name AS athlete_first_name, a.last_name AS athlete_last_name,
+                a.email AS athlete_email
+         FROM registrations r
+         JOIN events e ON e.id = r.event_id AND e.deleted_at IS NULL
+         JOIN event_categories ec ON ec.id = r.event_category_id
+         JOIN athletes a ON a.id = r.athlete_id AND a.deleted_at IS NULL
+         WHERE r.event_id = ? AND r.deleted_at IS NULL AND r.status = 'confirmed'
+           AND (r.qr_code_token = ? OR r.registration_number = ? OR r.bib_number = ?)
+         LIMIT 1`,
+        [eventId, q, q, q],
+      );
+
+      if (rows.length === 0) {
+        return res.status(404).json({ error: "Registration not found" });
+      }
+      const registration = rows[0];
+      let waiver_outdated = false;
+      if (Boolean(registration.requires_waiver)) {
+        const status = await getRegistrationWaiverStatus(
+          pool,
+          registration.id as number,
+        );
+        waiver_outdated = status.outdated;
+      }
+      const purchased_extras = await fetchRegistrationPurchasedExtras(
+        pool,
+        registration.id as number,
+      );
+      res.json({
+        registration: { ...registration, waiver_outdated, purchased_extras },
+      });
+    },
+  );
+
+  app.post(
+    `${basePath}/:eventId/registrations/:registrationId/check-in`,
+    guard,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      const registrationId = Number(req.params.registrationId);
+      if (!Number.isFinite(eventId) || !Number.isFinite(registrationId)) {
+        return res.status(400).json({ error: "Invalid id" });
+      }
+      if (!(await assertRegistrationOpsWrite(req, res, eventId))) return;
+      if (await enforceCheckInWindow(pool, res, eventId, req)) {
+        return;
+      }
+
+      const reg = await assertRegistrationInEvent(
+        pool,
+        registrationId,
+        eventId,
+      );
+      if (!reg) {
+        return res.status(404).json({ error: "Registration not found" });
+      }
+      if (reg.status !== "confirmed") {
+        return res
+          .status(400)
+          .json({ error: "Only confirmed registrations can be checked in" });
+      }
+      if (reg.checked_in_at) {
+        return res.status(409).json({ error: "Already checked in" });
+      }
+
+      const [[eventRow]] = await pool.query<RowDataPacket[]>(
+        "SELECT requires_waiver FROM events WHERE id = ? LIMIT 1",
+        [eventId],
+      );
+      const forceCheckIn = Boolean(req.body?.force);
+      const waiverStatus = await getRegistrationWaiverStatus(
+        pool,
+        registrationId,
+      );
+      if (Boolean(eventRow?.requires_waiver) && !forceCheckIn) {
+        if (!reg.waiver_signed_at || waiverStatus.outdated) {
+          return res.status(400).json({
+            error: waiverStatus.outdated
+              ? "Waiver updated — athlete must re-sign or use force check-in"
+              : "Waiver not signed — check in blocked",
+            code: waiverStatus.outdated ? "waiver_outdated" : "waiver_unsigned",
+          });
+        }
+      }
+
+      const method = String(req.body?.method ?? "manual");
+      const validMethods = new Set(["qr_scan", "manual", "kiosk", "api"]);
+      const checkMethod = validMethods.has(method) ? method : "manual";
+      const locationLabel = req.body?.location_label
+        ? String(req.body.location_label).slice(0, 100)
+        : null;
+      const deviceInfo = req.headers["user-agent"]
+        ? String(req.headers["user-agent"]).slice(0, 255)
+        : null;
+      const bypassWindow =
+        req.auth!.actor === "admin" && Boolean(req.body?.bypass_window);
+      const logMeta: Record<string, boolean> = {};
+      if (forceCheckIn) logMeta.force_waiver = true;
+      if (bypassWindow) logMeta.bypass_window = true;
+
+      const conn = await pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        await conn.query<ResultSetHeader>(
+          `INSERT INTO check_in_logs (registration_id, event_id, method, operator_type, operator_id, location_label, device_info, metadata_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            registrationId,
+            eventId,
+            checkMethod,
+            req.auth!.actor === "admin" ? "admin" : "organizer_member",
+            req.auth!.id,
+            locationLabel,
+            deviceInfo,
+            Object.keys(logMeta).length > 0 ? JSON.stringify(logMeta) : null,
+          ],
+        );
+        await conn.query<ResultSetHeader>(
+          "UPDATE registrations SET checked_in_at = NOW() WHERE id = ? AND checked_in_at IS NULL",
+          [registrationId],
+        );
+        await conn.commit();
+      } catch (err) {
+        await conn.rollback();
+        throw err;
+      } finally {
+        conn.release();
+      }
+
+      const [updated] = await pool.query<RowDataPacket[]>(
+        `SELECT r.id, r.registration_number, r.bib_number, r.status, r.checked_in_at,
+                r.total_cents, r.created_at,
+                e.id AS event_id, e.title AS event_title, e.slug AS event_slug,
+                ec.name AS category_name,
+                a.first_name AS athlete_first_name, a.last_name AS athlete_last_name,
+                a.email AS athlete_email
+         FROM registrations r
+         JOIN events e ON e.id = r.event_id
+         JOIN event_categories ec ON ec.id = r.event_category_id
+         JOIN athletes a ON a.id = r.athlete_id
+         WHERE r.id = ? LIMIT 1`,
+        [registrationId],
+      );
+      res.json({ ok: true, registration: updated[0] });
+    },
+  );
+
+  app.patch(
+    `${basePath}/:eventId/registrations/:registrationId/bib`,
+    guard,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      const registrationId = Number(req.params.registrationId);
+      if (!Number.isFinite(eventId) || !Number.isFinite(registrationId)) {
+        return res.status(400).json({ error: "Invalid id" });
+      }
+      if (!(await assertRegistrationOpsWrite(req, res, eventId))) return;
+
+      const bibRaw = req.body?.bib_number;
+      const bib_number =
+        bibRaw === null || bibRaw === undefined || bibRaw === ""
+          ? null
+          : String(bibRaw).trim().slice(0, 30);
+
+      const reg = await assertRegistrationInEvent(
+        pool,
+        registrationId,
+        eventId,
+      );
+      if (!reg) {
+        return res.status(404).json({ error: "Registration not found" });
+      }
+
+      if (bib_number) {
+        const [dup] = await pool.query<RowDataPacket[]>(
+          `SELECT id FROM registrations
+           WHERE event_id = ? AND bib_number = ? AND id <> ? AND deleted_at IS NULL LIMIT 1`,
+          [eventId, bib_number, registrationId],
+        );
+        if (dup.length > 0) {
+          return res.status(409).json({ error: "Bib number already assigned" });
+        }
+      }
+
+      await pool.query<ResultSetHeader>(
+        "UPDATE registrations SET bib_number = ? WHERE id = ?",
+        [bib_number, registrationId],
+      );
+
+      res.json({
+        ok: true,
+        registration: { ...reg, bib_number },
+      });
+    },
+  );
+
+  app.patch(
+    `${basePath}/:eventId/registrations/:registrationId/cancel`,
+    guard,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      const registrationId = Number(req.params.registrationId);
+      if (!Number.isFinite(eventId) || !Number.isFinite(registrationId)) {
+        return res.status(400).json({ error: "Invalid id" });
+      }
+      if (!(await assertRegistrationOpsWrite(req, res, eventId))) return;
+
+      const reg = await assertRegistrationInEvent(
+        pool,
+        registrationId,
+        eventId,
+      );
+      if (!reg) {
+        return res.status(404).json({ error: "Registration not found" });
+      }
+      if (reg.status === "cancelled") {
+        return res
+          .status(409)
+          .json({ error: "Registration is already cancelled" });
+      }
+      if (reg.status === "refunded" || reg.status === "transferred") {
+        return res
+          .status(400)
+          .json({ error: "Registration cannot be cancelled" });
+      }
+
+      const conn = await pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        await conn.query<ResultSetHeader>(
+          "UPDATE registrations SET status = 'cancelled' WHERE id = ?",
+          [registrationId],
+        );
+        if (reg.status === "confirmed") {
+          await conn.query<ResultSetHeader>(
+            "UPDATE event_categories SET sold_count = GREATEST(0, sold_count - 1) WHERE id = ?",
+            [reg.event_category_id],
+          );
+          if (reg.schedule_wave_id) {
+            await conn.query<ResultSetHeader>(
+              `UPDATE event_schedule_waves
+               SET registered_count = GREATEST(0, registered_count - 1)
+               WHERE id = ?`,
+              [reg.schedule_wave_id],
+            );
+          }
+        }
+        await conn.commit();
+      } catch (err) {
+        await conn.rollback();
+        throw err;
+      } finally {
+        conn.release();
+      }
+
+      const [updated] = await pool.query<RowDataPacket[]>(
+        `SELECT r.id, r.registration_number, r.bib_number, r.status, r.total_cents, r.created_at,
+                r.checked_in_at,
+                e.id AS event_id, e.title AS event_title, e.slug AS event_slug,
+                ec.name AS category_name,
+                a.first_name AS athlete_first_name, a.last_name AS athlete_last_name,
+                a.email AS athlete_email
+         FROM registrations r
+         JOIN events e ON e.id = r.event_id
+         JOIN event_categories ec ON ec.id = r.event_category_id
+         JOIN athletes a ON a.id = r.athlete_id
+         WHERE r.id = ? LIMIT 1`,
+        [registrationId],
+      );
+      res.json({ ok: true, registration: updated[0] });
+    },
+  );
+
+  app.post(
+    `${basePath}/:eventId/registrations/bulk-bib`,
+    guard,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await assertRegistrationOpsWrite(req, res, eventId))) return;
+
+      const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+      if (rows.length === 0) {
+        return res.status(400).json({ error: "rows array required" });
+      }
+      if (rows.length > 500) {
+        return res.status(400).json({ error: "Maximum 500 rows per import" });
+      }
+
+      let updated = 0;
+      const errors: Array<{ folio: string; error: string }> = [];
+
+      for (const row of rows) {
+        const folio = String(row?.folio ?? "").trim();
+        const bib = String(row?.bib ?? "")
+          .trim()
+          .slice(0, 30);
+        if (!folio || !bib) {
+          errors.push({ folio: folio || "?", error: "folio and bib required" });
+          continue;
+        }
+
+        const [regRows] = await pool.query<RowDataPacket[]>(
+          `SELECT r.id FROM registrations r
+         WHERE r.event_id = ? AND r.registration_number = ? AND r.deleted_at IS NULL LIMIT 1`,
+          [eventId, folio],
+        );
+        if (regRows.length === 0) {
+          errors.push({ folio, error: "Registration not found" });
+          continue;
+        }
+        const regId = regRows[0].id as number;
+
+        const [dup] = await pool.query<RowDataPacket[]>(
+          `SELECT id FROM registrations
+         WHERE event_id = ? AND bib_number = ? AND id <> ? AND deleted_at IS NULL LIMIT 1`,
+          [eventId, bib, regId],
+        );
+        if (dup.length > 0) {
+          errors.push({
+            folio,
+            error: "Bib number already assigned in this event",
+          });
+          continue;
+        }
+
+        await pool.query<ResultSetHeader>(
+          "UPDATE registrations SET bib_number = ? WHERE id = ?",
+          [bib, regId],
+        );
+        updated += 1;
+      }
+
+      res.json({ updated, errors });
+    },
+  );
+
+  app.get(
+    `${basePath}/:eventId/registrations/export-catalog`,
+    guard,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await assertEventRead(req, res, eventId))) return;
+      const catalog = await buildRegistrationExportCatalog(pool, eventId);
+      if (!catalog) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      res.json(catalog);
+    },
+  );
+
+  app.post(
+    `${basePath}/:eventId/registrations/export`,
+    guard,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await assertEventRead(req, res, eventId))) return;
+
+      const result = await buildRegistrationExport(pool, eventId, {
+        columns: req.body?.columns,
+        statuses: req.body?.statuses,
+        q: req.body?.q ?? req.query?.q,
+      });
+      if (result.ok === false) {
+        return res.status(result.status).json({ error: result.error });
+      }
+
+      const format = String(req.body?.format ?? "csv").toLowerCase();
+      if (format === "json") {
+        return res.json(result.payload);
+      }
+
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${result.filename}"`,
+      );
+      res.send(result.csv);
+    },
+  );
+
+  app.get(
+    `${basePath}/:eventId/registrations/:registrationId`,
+    guard,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      const registrationId = Number(req.params.registrationId);
+      if (!Number.isFinite(eventId) || !Number.isFinite(registrationId)) {
+        return res.status(400).json({ error: "Invalid id" });
+      }
+      if (!(await assertEventRead(req, res, eventId))) return;
+      const detail = await fetchStaffRegistrationDetail(
+        pool,
+        eventId,
+        registrationId,
+      );
+      if (!detail) {
+        return res.status(404).json({ error: "Registration not found" });
+      }
+      res.json(detail);
+    },
+  );
+
+  app.post(
+    `${basePath}/:eventId/registrations`,
+    guard,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      const manualSale = Boolean(req.body?.manual_sale);
+      if (manualSale) {
+        if (!(await assertManualSaleWrite(req, res, eventId))) return;
+        const [[manualSalesGate]] = await pool.query<RowDataPacket[]>(
+          `SELECT manual_sales_enabled FROM events
+           WHERE id = ? AND deleted_at IS NULL LIMIT 1`,
+          [eventId],
+        );
+        if (
+          !manualSalesGate ||
+          Number(manualSalesGate.manual_sales_enabled) !== 1
+        ) {
+          return res.status(400).json({
+            error: "Manual sales are not enabled for this event",
+            code: "manual_sales_disabled",
+          });
+        }
+      } else if (!(await assertEventWrite(req, res, eventId))) {
+        return;
+      }
+
+      const categoryId = Number(req.body?.event_category_id);
+      if (!Number.isFinite(categoryId)) {
+        return res.status(400).json({ error: "event_category_id required" });
+      }
+
+      let athleteId =
+        req.body?.athlete_id != null ? Number(req.body.athlete_id) : null;
+      const athleteEmail = String(req.body?.athlete_email ?? "")
+        .trim()
+        .toLowerCase();
+      const createGuest = Boolean(req.body?.create_guest);
+      let guestClaimToken: string | null = null;
+      let purchaserAthleteId: number | null =
+        req.body?.purchaser_athlete_id != null
+          ? Number(req.body.purchaser_athlete_id)
+          : null;
+      const managedByPurchaser = Boolean(req.body?.managed_by_purchaser);
+
+      if (!athleteId && athleteEmail) {
+        const [athRows] = await pool.query<RowDataPacket[]>(
+          "SELECT id FROM athletes WHERE email = ? AND deleted_at IS NULL LIMIT 1",
+          [athleteEmail],
+        );
+        if (athRows.length === 0) {
+          if (!createGuest) {
+            return res.status(404).json({ error: "Athlete not found" });
+          }
+          const firstName = String(req.body?.guest_first_name ?? "").trim();
+          const lastName = String(req.body?.guest_last_name ?? "").trim();
+          const dob = String(req.body?.guest_date_of_birth ?? "").trim();
+          const gender = String(
+            req.body?.guest_gender ?? "prefer_not_to_say",
+          ).trim();
+          if (!firstName || !lastName || !/^\d{4}-\d{2}-\d{2}$/.test(dob)) {
+            return res.status(400).json({
+              error:
+                "guest_first_name, guest_last_name, and guest_date_of_birth (YYYY-MM-DD) required",
+            });
+          }
+          const [eventRowForAge] = await pool.query<RowDataPacket[]>(
+            "SELECT start_date FROM events WHERE id = ? LIMIT 1",
+            [eventId],
+          );
+          const eventStart =
+            normalizeApiDateOnly(eventRowForAge[0]?.start_date) ??
+            new Date().toISOString().slice(0, 10);
+          const isMinor = isMinorOnReferenceDate(dob, eventStart);
+          const isManaged = managedByPurchaser || isMinor;
+          if (purchaserAthleteId == null && req.body?.purchaser_email) {
+            const purchaserEmail = String(req.body.purchaser_email)
+              .trim()
+              .toLowerCase();
+            const [pRows] = await pool.query<RowDataPacket[]>(
+              "SELECT id FROM athletes WHERE email = ? AND deleted_at IS NULL LIMIT 1",
+              [purchaserEmail],
+            );
+            if (pRows.length) purchaserAthleteId = Number(pRows[0].id);
+          }
+          if (isManaged && purchaserAthleteId == null) {
+            return res.status(400).json({
+              error:
+                "purchaser_email or purchaser_athlete_id required for managed / minor guests",
+              code: "purchaser_required",
+            });
+          }
+          let guestLocale = normalizeAppLocale(
+            req.body?.locale ??
+              (typeof req.headers["accept-language"] === "string"
+                ? req.headers["accept-language"].split(",")[0]?.trim()
+                : undefined),
+          );
+          if (purchaserAthleteId != null && Number.isFinite(purchaserAthleteId)) {
+            const [purchaserRows] = await pool.query<RowDataPacket[]>(
+              `SELECT preferred_language FROM athletes WHERE id = ? AND deleted_at IS NULL LIMIT 1`,
+              [purchaserAthleteId],
+            );
+            if (purchaserRows[0]?.preferred_language) {
+              guestLocale = normalizeAppLocale(
+                purchaserRows[0].preferred_language,
+              );
+            }
+          }
+          const [ins] = await pool.query<ResultSetHeader>(
+            `INSERT INTO athletes (
+             public_uuid, email, first_name, last_name, date_of_birth, gender, preferred_language, status
+           ) VALUES (?,?,?,?,?,?,?, 'active')`,
+            [
+              hubHelpers.newPublicUuid(),
+              athleteEmail,
+              firstName,
+              lastName,
+              dob,
+              gender,
+              guestLocale,
+            ],
+          );
+          athleteId = ins.insertId;
+          if (!isManaged) {
+            guestClaimToken = crypto.randomUUID();
+          }
+        } else {
+          athleteId = Number(athRows[0].id);
+        }
+      }
+      if (!athleteId || !Number.isFinite(athleteId)) {
+        return res
+          .status(400)
+          .json({ error: "athlete_id or athlete_email required" });
+      }
+
+      const comp = Boolean(req.body?.comp);
+      if (manualSale && comp) {
+        return res
+          .status(400)
+          .json({ error: "manual_sale cannot be combined with comp" });
+      }
+      const waiverWaived = Boolean(req.body?.waiver_waived);
+      const bib_number_raw = req.body?.bib_number
+        ? String(req.body.bib_number).trim().slice(0, 30)
+        : null;
+
+      const [[category]] = await pool.query<RowDataPacket[]>(
+        `SELECT ec.id, ec.price_cents, ec.capacity, ec.sold_count, ec.currency, e.organizer_id,
+              e.requires_waiver, e.service_fee_percent, e.bib_mode, o.service_fee_percent AS org_fee_percent
+       FROM event_categories ec
+       JOIN events e ON e.id = ec.event_id AND e.deleted_at IS NULL
+       JOIN organizers o ON o.id = e.organizer_id
+       WHERE ec.id = ? AND ec.event_id = ? AND ec.is_active = 1
+       LIMIT 1`,
+        [categoryId, eventId],
+      );
+      if (!category) {
+        return res.status(404).json({ error: "Category not found" });
+      }
+
+      if (Boolean(category.requires_waiver) && !waiverWaived) {
+        return res.status(400).json({
+          error:
+            "This event requires a waiver — confirm waiver waived for manual registration",
+        });
+      }
+
+      const [dupReg] = await pool.query<RowDataPacket[]>(
+        `SELECT id FROM registrations
+       WHERE event_id = ? AND athlete_id = ? AND status IN ('confirmed','pending_payment')
+         AND deleted_at IS NULL LIMIT 1`,
+        [eventId, athleteId],
+      );
+      if (dupReg.length > 0) {
+        return res
+          .status(409)
+          .json({ error: "Athlete already registered for this event" });
+      }
+
+      if (
+        category.capacity != null &&
+        Number(category.sold_count) >= Number(category.capacity)
+      ) {
+        return res.status(409).json({ error: "Category is sold out" });
+      }
+
+      const priceCents = comp ? 0 : Number(category.price_cents);
+      const feePercent = Number(
+        category.service_fee_percent ?? category.org_fee_percent ?? 11,
+      );
+      let serviceFeeCents = 0;
+      let totalCents = 0;
+      if (manualSale) {
+        if (priceCents <= 0) {
+          return res.status(400).json({
+            error:
+              "Manual sales require a paid category — use comp for free entries",
+          });
+        }
+        serviceFeeCents = 0;
+        totalCents = priceCents;
+      } else {
+        serviceFeeCents = comp
+          ? 0
+          : Math.round(priceCents * (feePercent / 100));
+        totalCents = priceCents + serviceFeeCents;
+      }
+
+      if (!manualSale && !comp && totalCents > 0) {
+        return res.status(400).json({
+          error:
+            "Paid manual registrations require comp mode or manual_sale — athletes must checkout online for standard paid entries",
+        });
+      }
+      const [[eventMetaRow]] = await pool.query<RowDataPacket[]>(
+        "SELECT slug, start_date FROM events WHERE id = ? LIMIT 1",
+        [eventId],
+      );
+      const eventStartsAt = eventMetaRow?.start_date as
+        | string
+        | Date
+        | null
+        | undefined;
+      const eventYear =
+        eventStartsAt != null
+          ? String(new Date(eventStartsAt).getFullYear())
+          : String(new Date().getFullYear());
+      const eventCode = String(eventMetaRow?.slug ?? eventId)
+        .toUpperCase()
+        .replace(/[^A-Z0-9]/g, "")
+        .slice(0, 8);
+
+      const conn = await pool.getConnection();
+      try {
+        await conn.beginTransaction();
+
+        const { registrationNumber: regNumber, folioSegmentId } =
+          await hubHelpers.nextRegistrationNumber(
+            {
+              eventId,
+              categoryId,
+              discountCodeId: null,
+              eventYear,
+              eventCode,
+            },
+            conn,
+          );
+        const qrToken = hubHelpers.newQrToken();
+        const regUuid = hubHelpers.newPublicUuid();
+        const bib_number = resolveRegistrationBibNumber({
+          registrationNumber: regNumber,
+          bibMode: normalizeEventBibMode(category.bib_mode),
+          explicitBib: bib_number_raw,
+        });
+
+        if (bib_number) {
+          const [dupBib] = await conn.query<RowDataPacket[]>(
+            `SELECT id FROM registrations
+           WHERE event_id = ? AND bib_number = ? AND deleted_at IS NULL LIMIT 1`,
+            [eventId, bib_number],
+          );
+          if (dupBib.length > 0) {
+            await conn.rollback();
+            return res
+              .status(409)
+              .json({ error: "Bib number already assigned" });
+          }
+        }
+
+        const [regResult] = await conn.query<ResultSetHeader>(
+          `INSERT INTO registrations (
+           public_uuid, event_id, event_category_id, athlete_id, registration_number,
+           folio_segment_id, qr_code_token, bib_number, status, price_cents, service_fee_cents, total_cents,
+           currency, source, purchaser_athlete_id, guest_claim_token
+         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'admin',?,?)`,
+          [
+            regUuid,
+            eventId,
+            categoryId,
+            athleteId,
+            regNumber,
+            folioSegmentId,
+            qrToken,
+            bib_number,
+            "confirmed",
+            priceCents,
+            serviceFeeCents,
+            totalCents,
+            category.currency || "MXN",
+            purchaserAthleteId,
+            guestClaimToken,
+          ],
+        );
+        const registrationId = regResult.insertId;
+
+        if (comp || manualSale || totalCents === 0) {
+          const payUuid = hubHelpers.newPublicUuid();
+          const paymentProvider = manualSale ? "manual" : "mock";
+          const recordedByMemberId =
+            manualSale && req.auth?.actor === "organizer" ? req.auth.id : null;
+          const paymentMetadata = manualSale
+            ? JSON.stringify(buildManualSalePaymentMetadata())
+            : null;
+          const [payResult] = await conn.query<ResultSetHeader>(
+            `INSERT INTO payments (
+             public_uuid, registration_id, athlete_id, organizer_id, event_id,
+             amount_cents, registration_amount_cents, service_fee_cents, currency,
+             status, provider, recorded_by_member_id, metadata_json, paid_at
+           ) VALUES (?,?,?,?,?,?,?,?,?,'succeeded',?,?,?,NOW())`,
+            [
+              payUuid,
+              registrationId,
+              athleteId,
+              category.organizer_id,
+              eventId,
+              totalCents,
+              priceCents,
+              serviceFeeCents,
+              category.currency || "MXN",
+              paymentProvider,
+              recordedByMemberId,
+              paymentMetadata,
+            ],
+          );
+          await conn.query<ResultSetHeader>(
+            "UPDATE registrations SET payment_id = ? WHERE id = ?",
+            [payResult.insertId, registrationId],
+          );
+        }
+
+        const [soldInc] = await conn.query<ResultSetHeader>(
+          `UPDATE event_categories SET sold_count = sold_count + 1
+         WHERE id = ? AND (capacity IS NULL OR sold_count < capacity)`,
+          [categoryId],
+        );
+        if (soldInc.affectedRows === 0) {
+          await conn.rollback();
+          return res.status(409).json({ error: "Category is sold out" });
+        }
+
+        const fieldValues = req.body?.field_values;
+        if (fieldValues && typeof fieldValues === "object") {
+          const [fieldRows] = await conn.query<RowDataPacket[]>(
+            `SELECT id, field_key FROM event_registration_fields
+           WHERE event_id = ? AND is_active = 1`,
+            [eventId],
+          );
+          for (const field of fieldRows) {
+            const key = field.field_key as string;
+            const raw = (fieldValues as Record<string, unknown>)[key];
+            if (raw == null || String(raw).trim() === "") continue;
+            await conn.query<ResultSetHeader>(
+              `INSERT INTO registration_field_values (registration_id, field_id, value_text)
+             VALUES (?,?,?)`,
+              [registrationId, field.id, String(raw).trim()],
+            );
+          }
+        }
+
+        if (waiverWaived && Boolean(category.requires_waiver)) {
+          await markRegistrationWaiverWaivedByStaff(
+            conn,
+            registrationId,
+            req.auth?.id,
+          );
+        }
+
+        await conn.commit();
+
+        if (guestClaimToken && hubHelpers.deliverRegistrationConfirmedEmail) {
+          void hubHelpers
+            .deliverRegistrationConfirmedEmail(registrationId)
+            .catch((err) => console.error("[email:staff-guest-claim]", err));
+        }
+
+        const detail = await fetchStaffRegistrationDetail(
+          pool,
+          eventId,
+          registrationId,
+        );
+        res.status(201).json(detail);
+      } catch (err) {
+        await conn.rollback();
+        throw err;
+      } finally {
+        conn.release();
+      }
+    },
+  );
+}
+
+function mountEventResultsRoutes(
+  app: Express,
+  pool: Pool,
+  guard: RequestHandler,
+  basePath: string,
+  canAccess: (req: AuthedRequest, eventId: number) => Promise<boolean>,
+  canMutate?: (
+    req: AuthedRequest,
+    eventId: number,
+  ) => Promise<OrganizerMutateGate>,
+  canRecordManualSale?: (
+    req: AuthedRequest,
+    eventId: number,
+  ) => Promise<OrganizerMutateGate>,
+) {
+  async function assertEventRead(
+    req: AuthedRequest,
+    res: Response,
+    eventId: number,
+  ): Promise<boolean> {
+    if (!Number.isFinite(eventId)) {
+      res.status(400).json({ error: "Invalid event id" });
+      return false;
+    }
+    if (!(await canAccess(req, eventId))) {
+      res.status(404).json({ error: "Event not found" });
+      return false;
+    }
+    return true;
+  }
+
+  async function assertEventWrite(
+    req: AuthedRequest,
+    res: Response,
+    eventId: number,
+  ): Promise<boolean> {
+    if (!Number.isFinite(eventId)) {
+      res.status(400).json({ error: "Invalid event id" });
+      return false;
+    }
+    if (canMutate) {
+      const gate = await canMutate(req, eventId);
+      if (gate === "forbidden") {
+        res
+          .status(403)
+          .json({ error: "Insufficient permissions to edit events" });
+        return false;
+      }
+      if (gate !== "ok") {
+        res.status(404).json({ error: "Event not found" });
+        return false;
+      }
+      return true;
+    }
+    if (!(await canAccess(req, eventId))) {
+      res.status(404).json({ error: "Event not found" });
+      return false;
+    }
+    return true;
+  }
+
+  app.get(
+    `${basePath}/:eventId/results`,
+    guard,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await assertEventRead(req, res, eventId))) return;
+
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT er.id, er.registration_id, er.event_category_id,
+              er.overall_rank, er.category_rank, er.gender_rank,
+              er.finish_time_ms, er.status, er.published_at,
+              r.registration_number, r.bib_number,
+              a.first_name AS athlete_first_name, a.last_name AS athlete_last_name,
+              ec.name AS category_name
+       FROM event_results er
+       JOIN registrations r ON r.id = er.registration_id
+       JOIN athletes a ON a.id = r.athlete_id
+       JOIN event_categories ec ON ec.id = er.event_category_id
+       WHERE er.event_id = ?
+       ORDER BY er.overall_rank IS NULL, er.overall_rank ASC, er.id ASC`,
+        [eventId],
+      );
+      res.json({ results: rows });
+    },
+  );
+
+  app.post(
+    `${basePath}/:eventId/results`,
+    guard,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await assertEventWrite(req, res, eventId))) return;
+
+      const items = Array.isArray(req.body?.results)
+        ? req.body.results
+        : req.body?.registration_number
+          ? [req.body]
+          : [];
+      if (items.length === 0) {
+        return res
+          .status(400)
+          .json({ error: "results array or single result required" });
+      }
+
+      const upserted: RowDataPacket[] = [];
+      const errors: string[] = [];
+
+      for (const item of items) {
+        const regNum = String(item.registration_number ?? "").trim();
+        if (!regNum) {
+          errors.push("Missing registration_number");
+          continue;
+        }
+
+        const [regs] = await pool.query<RowDataPacket[]>(
+          `SELECT r.id, r.event_category_id
+         FROM registrations r
+         WHERE r.event_id = ? AND r.registration_number = ? AND r.deleted_at IS NULL
+           AND r.status = 'confirmed' LIMIT 1`,
+          [eventId, regNum],
+        );
+        if (regs.length === 0) {
+          errors.push(`Registration not found: ${regNum}`);
+          continue;
+        }
+
+        const reg = regs[0];
+        const finish_time_ms =
+          item.finish_time_ms != null
+            ? Number(item.finish_time_ms)
+            : parseFinishTimeToMs(item.finish_time ?? item.time);
+        const status = String(item.status ?? "finished");
+        if (!["finished", "dnf", "dns", "dq"].includes(status)) {
+          errors.push(`Invalid status for ${regNum}`);
+          continue;
+        }
+
+        const overall_rank =
+          item.overall_rank != null ? Number(item.overall_rank) : null;
+        const category_rank =
+          item.category_rank != null ? Number(item.category_rank) : null;
+        const gender_rank =
+          item.gender_rank != null ? Number(item.gender_rank) : null;
+
+        await pool.query<ResultSetHeader>(
+          `INSERT INTO event_results (
+           event_id, registration_id, event_category_id,
+           overall_rank, category_rank, gender_rank, finish_time_ms, status
+         ) VALUES (?,?,?,?,?,?,?,?)
+         ON DUPLICATE KEY UPDATE
+           overall_rank = VALUES(overall_rank),
+           category_rank = VALUES(category_rank),
+           gender_rank = VALUES(gender_rank),
+           finish_time_ms = VALUES(finish_time_ms),
+           status = VALUES(status),
+           published_at = NULL`,
+          [
+            eventId,
+            reg.id,
+            reg.event_category_id,
+            overall_rank,
+            category_rank,
+            gender_rank,
+            finish_time_ms,
+            status,
+          ],
+        );
+
+        const [saved] = await pool.query<RowDataPacket[]>(
+          `SELECT er.id, er.registration_id, er.overall_rank, er.category_rank,
+                er.finish_time_ms, er.status, er.published_at,
+                r.registration_number, r.bib_number
+         FROM event_results er
+         JOIN registrations r ON r.id = er.registration_id
+         WHERE er.registration_id = ? LIMIT 1`,
+          [reg.id],
+        );
+        if (saved[0]) upserted.push(saved[0]);
+      }
+
+      res.status(errors.length > 0 && upserted.length === 0 ? 400 : 200).json({
+        results: upserted,
+        errors: errors.length > 0 ? errors : undefined,
+      });
+    },
+  );
+
+  app.patch(
+    `${basePath}/:eventId/results/:resultId`,
+    guard,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      const resultId = Number(req.params.resultId);
+      if (!Number.isFinite(eventId) || !Number.isFinite(resultId)) {
+        return res.status(400).json({ error: "Invalid id" });
+      }
+      if (!(await assertEventWrite(req, res, eventId))) return;
+
+      const updates: string[] = [];
+      const params: (string | number | null)[] = [];
+      const body = req.body ?? {};
+
+      if (body.overall_rank !== undefined) {
+        updates.push("overall_rank = ?");
+        params.push(
+          body.overall_rank == null ? null : Number(body.overall_rank),
+        );
+      }
+      if (body.category_rank !== undefined) {
+        updates.push("category_rank = ?");
+        params.push(
+          body.category_rank == null ? null : Number(body.category_rank),
+        );
+      }
+      if (body.gender_rank !== undefined) {
+        updates.push("gender_rank = ?");
+        params.push(body.gender_rank == null ? null : Number(body.gender_rank));
+      }
+      if (
+        body.finish_time_ms != null ||
+        body.finish_time != null ||
+        body.time != null
+      ) {
+        const ms =
+          body.finish_time_ms != null
+            ? Number(body.finish_time_ms)
+            : parseFinishTimeToMs(body.finish_time ?? body.time);
+        updates.push("finish_time_ms = ?");
+        params.push(ms);
+      }
+      if (body.status != null) {
+        const status = String(body.status);
+        if (!["finished", "dnf", "dns", "dq"].includes(status)) {
+          return res.status(400).json({ error: "invalid status" });
+        }
+        updates.push("status = ?");
+        params.push(status);
+      }
+      if (updates.length === 0) {
+        return res.status(400).json({ error: "No updates provided" });
+      }
+      updates.push("published_at = NULL");
+
+      params.push(resultId, eventId);
+      const [result] = await pool.query<ResultSetHeader>(
+        `UPDATE event_results SET ${updates.join(", ")} WHERE id = ? AND event_id = ?`,
+        params,
+      );
+      if (result.affectedRows === 0) {
+        return res.status(404).json({ error: "Result not found" });
+      }
+
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT er.id, er.registration_id, er.overall_rank, er.category_rank,
+                er.finish_time_ms, er.status, er.published_at,
+                r.registration_number, r.bib_number
+         FROM event_results er
+         JOIN registrations r ON r.id = er.registration_id
+         WHERE er.id = ? LIMIT 1`,
+        [resultId],
+      );
+      res.json({ result: rows[0] });
+    },
+  );
+
+  app.post(
+    `${basePath}/:eventId/results/publish`,
+    guard,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await assertEventWrite(req, res, eventId))) return;
+
+      const ids = Array.isArray(req.body?.result_ids)
+        ? req.body.result_ids.map(Number).filter(Number.isFinite)
+        : null;
+
+      if (ids && ids.length > 0) {
+        const placeholders = ids.map(() => "?").join(",");
+        await pool.query<ResultSetHeader>(
+          `UPDATE event_results SET published_at = NOW()
+         WHERE event_id = ? AND id IN (${placeholders})`,
+          [eventId, ...ids],
+        );
+      } else {
+        await pool.query<ResultSetHeader>(
+          `UPDATE event_results SET published_at = NOW()
+         WHERE event_id = ? AND published_at IS NULL`,
+          [eventId],
+        );
+      }
+
+      const [count] = await pool.query<RowDataPacket[]>(
+        `SELECT COUNT(*) AS published FROM event_results
+       WHERE event_id = ? AND published_at IS NOT NULL`,
+        [eventId],
+      );
+      res.json({ ok: true, published_count: Number(count[0]?.published ?? 0) });
+    },
+  );
+
+  app.delete(
+    `${basePath}/:eventId/results/:resultId`,
+    guard,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      const resultId = Number(req.params.resultId);
+      if (!Number.isFinite(eventId) || !Number.isFinite(resultId)) {
+        return res.status(400).json({ error: "Invalid id" });
+      }
+      if (!(await assertEventWrite(req, res, eventId))) return;
+
+      const [result] = await pool.query<ResultSetHeader>(
+        "DELETE FROM event_results WHERE id = ? AND event_id = ?",
+        [resultId, eventId],
+      );
+      if (result.affectedRows === 0) {
+        return res.status(404).json({ error: "Result not found" });
+      }
+      res.json({ ok: true });
+    },
+  );
+
+  app.get(
+    `${basePath}/:eventId/results/:resultId/splits`,
+    guard,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      const resultId = Number(req.params.resultId);
+      if (!Number.isFinite(eventId) || !Number.isFinite(resultId)) {
+        return res.status(400).json({ error: "Invalid id" });
+      }
+      if (!(await canAccess(req, eventId))) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+
+      const [resultRows] = await pool.query<RowDataPacket[]>(
+        "SELECT id FROM event_results WHERE id = ? AND event_id = ? LIMIT 1",
+        [resultId, eventId],
+      );
+      if (resultRows.length === 0) {
+        return res.status(404).json({ error: "Result not found" });
+      }
+
+      const [splits] = await pool.query<RowDataPacket[]>(
+        `SELECT id, split_name, split_order, distance_km, elapsed_ms, pace_per_km_ms
+         FROM result_splits WHERE result_id = ? ORDER BY split_order ASC, id ASC`,
+        [resultId],
+      );
+      res.json({ splits });
+    },
+  );
+
+  app.put(
+    `${basePath}/:eventId/results/:resultId/splits`,
+    guard,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      const resultId = Number(req.params.resultId);
+      if (!Number.isFinite(eventId) || !Number.isFinite(resultId)) {
+        return res.status(400).json({ error: "Invalid id" });
+      }
+      if (!(await canAccess(req, eventId))) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+
+      const [resultRows] = await pool.query<RowDataPacket[]>(
+        "SELECT id FROM event_results WHERE id = ? AND event_id = ? LIMIT 1",
+        [resultId, eventId],
+      );
+      if (resultRows.length === 0) {
+        return res.status(404).json({ error: "Result not found" });
+      }
+
+      const raw = req.body?.splits;
+      if (!Array.isArray(raw)) {
+        return res.status(400).json({ error: "splits array required" });
+      }
+
+      const splits = raw
+        .map((s: Record<string, unknown>, index: number) => {
+          const split_name = String(s.split_name ?? "").trim();
+          const elapsed_ms = Number(s.elapsed_ms);
+          if (!split_name || !Number.isFinite(elapsed_ms) || elapsed_ms < 0) {
+            return null;
+          }
+          const distance_km =
+            s.distance_km == null || s.distance_km === ""
+              ? null
+              : Number(s.distance_km);
+          const pace_per_km_ms =
+            s.pace_per_km_ms == null || s.pace_per_km_ms === ""
+              ? null
+              : Number(s.pace_per_km_ms);
+          return {
+            split_name: split_name.slice(0, 100),
+            split_order: Number(s.split_order) || index,
+            distance_km:
+              distance_km != null && Number.isFinite(distance_km)
+                ? distance_km
+                : null,
+            elapsed_ms: Math.round(elapsed_ms),
+            pace_per_km_ms:
+              pace_per_km_ms != null && Number.isFinite(pace_per_km_ms)
+                ? Math.round(pace_per_km_ms)
+                : null,
+          };
+        })
+        .filter(Boolean) as Array<{
+        split_name: string;
+        split_order: number;
+        distance_km: number | null;
+        elapsed_ms: number;
+        pace_per_km_ms: number | null;
+      }>;
+
+      const conn = await pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        await conn.query("DELETE FROM result_splits WHERE result_id = ?", [
+          resultId,
+        ]);
+        for (const s of splits) {
+          await conn.query<ResultSetHeader>(
+            `INSERT INTO result_splits (result_id, split_name, split_order, distance_km, elapsed_ms, pace_per_km_ms)
+             VALUES (?,?,?,?,?,?)`,
+            [
+              resultId,
+              s.split_name,
+              s.split_order,
+              s.distance_km,
+              s.elapsed_ms,
+              s.pace_per_km_ms,
+            ],
+          );
+        }
+        await conn.commit();
+      } catch (err) {
+        await conn.rollback();
+        throw err;
+      } finally {
+        conn.release();
+      }
+
+      const [saved] = await pool.query<RowDataPacket[]>(
+        `SELECT id, split_name, split_order, distance_km, elapsed_ms, pace_per_km_ms
+         FROM result_splits WHERE result_id = ? ORDER BY split_order ASC, id ASC`,
+        [resultId],
+      );
+      res.json({ splits: saved });
+    },
+  );
+}
+
+type CategoryRouteError = { status: number; error: string };
+
+async function createEventCategoryRecord(
+  pool: Pool,
+  newUuid: () => string,
+  eventId: number,
+  body: Record<string, unknown>,
+  stripe?: import("stripe").default | null,
+): Promise<CategoryRouteError | null> {
+  const name = String(body?.name ?? "").trim();
+  const price_cents = Number(body?.price_cents);
+  if (!name) return { status: 400, error: "name required" };
+  if (!Number.isFinite(price_cents) || price_cents < 0) {
+    return { status: 400, error: "price_cents required" };
+  }
+
+  const payoutErr = await assertPaidCategoryMutationAllowed(
+    pool,
+    eventId,
+    Math.round(price_cents),
+    stripe,
+  );
+  if (payoutErr) return payoutErr;
+
+  const capacityRaw = body?.capacity;
+  const capacity =
+    capacityRaw === null || capacityRaw === undefined || capacityRaw === ""
+      ? null
+      : Number(capacityRaw);
+
+  const distanceRaw = body?.distance_km;
+  const distance_km =
+    distanceRaw === null || distanceRaw === undefined || distanceRaw === ""
+      ? null
+      : Number(distanceRaw);
+
+  let gender_restriction = "any";
+  if (body?.gender_restriction != null) {
+    const g = String(body.gender_restriction);
+    if (!["any", "male", "female"].includes(g)) {
+      return { status: 400, error: "invalid gender_restriction" };
+    }
+    gender_restriction = g;
+  }
+
+  let difficulty: string | null = null;
+  if (body?.difficulty != null && body.difficulty !== "") {
+    const d = String(body.difficulty);
+    if (!["beginner", "intermediate", "advanced", "expert"].includes(d)) {
+      return { status: 400, error: "invalid difficulty" };
+    }
+    difficulty = d;
+  }
+
+  const min_age =
+    body?.min_age === null ||
+    body?.min_age === undefined ||
+    body?.min_age === ""
+      ? null
+      : Number(body.min_age);
+  const max_age =
+    body?.max_age === null ||
+    body?.max_age === undefined ||
+    body?.max_age === ""
+      ? null
+      : Number(body.max_age);
+
+  await pool.query<ResultSetHeader>(
+    `INSERT INTO event_categories (
+       public_uuid, event_id, name, description, distance_km, difficulty, capacity,
+       price_cents, gender_restriction, min_age, max_age, waitlist_enabled, sort_order, is_active
+     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1)`,
+    [
+      newUuid(),
+      eventId,
+      name.slice(0, 150),
+      body?.description ? String(body.description).slice(0, 2000) : null,
+      distance_km != null && Number.isFinite(distance_km) ? distance_km : null,
+      difficulty,
+      capacity,
+      Math.round(price_cents),
+      gender_restriction,
+      min_age != null && Number.isFinite(min_age) ? min_age : null,
+      max_age != null && Number.isFinite(max_age) ? max_age : null,
+      body?.waitlist_enabled ? 1 : 0,
+      Number(body?.sort_order) || 0,
+    ],
+  );
+  return null;
+}
+
+async function deleteEventCategoryRecord(
+  pool: Pool,
+  eventId: number,
+  categoryId: number,
+): Promise<CategoryRouteError | null> {
+  const [sold] = await pool.query<RowDataPacket[]>(
+    "SELECT sold_count FROM event_categories WHERE id = ? AND event_id = ? LIMIT 1",
+    [categoryId, eventId],
+  );
+  if (sold.length === 0) {
+    return { status: 404, error: "Category not found" };
+  }
+  if (Number(sold[0].sold_count) > 0) {
+    await pool.query(
+      "UPDATE event_categories SET is_active = 0 WHERE id = ? AND event_id = ?",
+      [categoryId, eventId],
+    );
+  } else {
+    await pool.query(
+      "DELETE FROM event_categories WHERE id = ? AND event_id = ?",
+      [categoryId, eventId],
+    );
+  }
+  return null;
+}
+
+async function patchEventCategoryRecord(
+  pool: Pool,
+  eventId: number,
+  categoryId: number,
+  body: Record<string, unknown>,
+  stripe?: import("stripe").default | null,
+): Promise<CategoryRouteError | null> {
+  const [existing] = await pool.query<RowDataPacket[]>(
+    "SELECT id, price_cents FROM event_categories WHERE id = ? AND event_id = ? LIMIT 1",
+    [categoryId, eventId],
+  );
+  if (existing.length === 0) {
+    return { status: 404, error: "Category not found" };
+  }
+
+  let priceToGate: number | null = null;
+  if (body.price_cents != null) {
+    const price_cents = Number(body.price_cents);
+    if (!Number.isFinite(price_cents) || price_cents < 0) {
+      return { status: 400, error: "invalid price_cents" };
+    }
+    priceToGate = Math.round(price_cents);
+  } else if (body.is_active != null && body.is_active) {
+    const existingPrice = Number(existing[0].price_cents ?? 0);
+    if (existingPrice > 0) priceToGate = existingPrice;
+  }
+
+  if (priceToGate != null && priceToGate > 0) {
+    const payoutErr = await assertPaidCategoryMutationAllowed(
+      pool,
+      eventId,
+      priceToGate,
+      stripe,
+    );
+    if (payoutErr) return payoutErr;
+  }
+
+  const updates: string[] = [];
+  const params: (string | number | null)[] = [];
+
+  if (body.name != null) {
+    const name = String(body.name).trim();
+    if (!name) return { status: 400, error: "name cannot be empty" };
+    updates.push("name = ?");
+    params.push(name.slice(0, 150));
+  }
+  if (body.description !== undefined) {
+    updates.push("description = ?");
+    params.push(
+      body.description ? String(body.description).slice(0, 2000) : null,
+    );
+  }
+  if (body.price_cents != null) {
+    const price_cents = Number(body.price_cents);
+    if (!Number.isFinite(price_cents) || price_cents < 0) {
+      return { status: 400, error: "invalid price_cents" };
+    }
+    updates.push("price_cents = ?");
+    params.push(Math.round(price_cents));
+  }
+  if (body.capacity !== undefined) {
+    const cap =
+      body.capacity === null || body.capacity === ""
+        ? null
+        : Number(body.capacity);
+    if (cap != null && (!Number.isFinite(cap) || cap < 0)) {
+      return { status: 400, error: "invalid capacity" };
+    }
+    updates.push("capacity = ?");
+    params.push(cap);
+  }
+  if (body.distance_km !== undefined) {
+    const dist =
+      body.distance_km === null || body.distance_km === ""
+        ? null
+        : Number(body.distance_km);
+    updates.push("distance_km = ?");
+    params.push(dist != null && Number.isFinite(dist) ? dist : null);
+  }
+  if (body.gender_restriction != null) {
+    const g = String(body.gender_restriction);
+    if (!["any", "male", "female"].includes(g)) {
+      return { status: 400, error: "invalid gender_restriction" };
+    }
+    updates.push("gender_restriction = ?");
+    params.push(g);
+  }
+  if (body.min_age !== undefined) {
+    updates.push("min_age = ?");
+    params.push(body.min_age == null ? null : Number(body.min_age));
+  }
+  if (body.max_age !== undefined) {
+    updates.push("max_age = ?");
+    params.push(body.max_age == null ? null : Number(body.max_age));
+  }
+  if (body.difficulty !== undefined) {
+    if (body.difficulty == null || body.difficulty === "") {
+      updates.push("difficulty = ?");
+      params.push(null);
+    } else {
+      const d = String(body.difficulty);
+      if (!["beginner", "intermediate", "advanced", "expert"].includes(d)) {
+        return { status: 400, error: "invalid difficulty" };
+      }
+      updates.push("difficulty = ?");
+      params.push(d);
+    }
+  }
+  if (body.sort_order != null) {
+    updates.push("sort_order = ?");
+    params.push(Number(body.sort_order) || 0);
+  }
+  if (body.is_active != null) {
+    updates.push("is_active = ?");
+    params.push(body.is_active ? 1 : 0);
+  }
+  if (body.waitlist_enabled != null) {
+    updates.push("waitlist_enabled = ?");
+    params.push(body.waitlist_enabled ? 1 : 0);
+  }
+  if (body.registration_opens_at !== undefined) {
+    updates.push("registration_opens_at = ?");
+    params.push(
+      body.registration_opens_at ? String(body.registration_opens_at) : null,
+    );
+  }
+  if (body.registration_closes_at !== undefined) {
+    updates.push("registration_closes_at = ?");
+    params.push(
+      body.registration_closes_at ? String(body.registration_closes_at) : null,
+    );
+  }
+
+  if (updates.length === 0) {
+    return { status: 400, error: "No updates provided" };
+  }
+
+  params.push(categoryId, eventId);
+  await pool.query<ResultSetHeader>(
+    `UPDATE event_categories SET ${updates.join(", ")} WHERE id = ? AND event_id = ?`,
+    params,
+  );
+  return null;
+}
+
+function parseOptionalCoord(value: unknown): number | null {
+  if (value === null || value === undefined || value === "") return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+type ParsedEventBody = {
+  title: string;
+  slug?: string;
+  /** Present when client sent subdomain (create required; update immutable). */
+  subdomain?: string;
+  sport_type_id: number;
+  short_description: string | null;
+  description: string | null;
+  status: string;
+  visibility: string;
+  featured: boolean;
+  start_date: string;
+  end_date: string | null;
+  registration_opens_at: string | null;
+  registration_closes_at: string | null;
+  check_in_opens_at: string | null;
+  check_in_closes_at: string | null;
+  location_city: string | null;
+  location_state: string | null;
+  location_name: string | null;
+  location_lat: number | null;
+  location_lng: number | null;
+  hero_image_url: string | null;
+  banner_image_url: string | null;
+  max_registrations: number | null;
+  max_registrations_per_order: number;
+  requires_waiver: boolean;
+  fee_presentation: string | null;
+  msi_enabled: boolean;
+  manual_sales_enabled: boolean;
+  bib_mode: "folio" | "separate";
+  auto_deactivate_after_event: boolean;
+};
+
+function eventBodySqlTail(): string {
+  return `location_name = ?, location_city = ?, location_state = ?, location_lat = ?, location_lng = ?,
+           hero_image_url = ?, banner_image_url = ?, max_registrations = ?, max_registrations_per_order = ?,
+           bib_mode = ?`;
+}
+
+function eventBodySqlValues(data: ParsedEventBody): (string | number | null)[] {
+  return [
+    data.location_name,
+    data.location_city,
+    data.location_state,
+    data.location_lat,
+    data.location_lng,
+    data.hero_image_url,
+    data.banner_image_url,
+    data.max_registrations,
+    data.max_registrations_per_order,
+    data.bib_mode,
+  ];
+}
+
+function parseEventBody(
+  body: Record<string, unknown>,
+): { error: string } | { data: ParsedEventBody } {
+  const title = String(body.title ?? "").trim();
+  if (!title || title.length > 255) {
+    return { error: "title required (max 255)" };
+  }
+
+  const sport_type_id = Number(body.sport_type_id);
+  if (!Number.isFinite(sport_type_id) || sport_type_id <= 0) {
+    return { error: "sport_type_id required" };
+  }
+
+  const start_date_raw = String(body.start_date ?? "").trim();
+  if (!start_date_raw) {
+    return { error: "start_date required" };
+  }
+  const start_date = parseIncomingEventDateTime(start_date_raw);
+  if (!start_date) {
+    return { error: "start_date required" };
+  }
+
+  const status = String(body.status ?? "draft");
+  if (
+    ![
+      "draft",
+      "pending_approval",
+      "published",
+      "cancelled",
+      "completed",
+    ].includes(status)
+  ) {
+    return { error: "invalid status" };
+  }
+
+  const visibility = String(body.visibility ?? "public");
+  if (!["public", "private", "unlisted"].includes(visibility)) {
+    return { error: "invalid visibility" };
+  }
+
+  const end_date = parseIncomingEventDateTime(body.end_date);
+  if (end_date && end_date < start_date) {
+    return { error: "end_date must be on or after start_date" };
+  }
+  const registration_opens_at = parseIncomingEventDateTime(
+    body.registration_opens_at,
+  );
+  const registration_closes_at = parseIncomingEventDateTime(
+    body.registration_closes_at,
+  );
+  const check_in_opens_at = parseIncomingEventDateTime(body.check_in_opens_at);
+  const check_in_closes_at = parseIncomingEventDateTime(
+    body.check_in_closes_at,
+  );
+
+  if (
+    check_in_opens_at &&
+    check_in_closes_at &&
+    check_in_opens_at >= check_in_closes_at
+  ) {
+    return { error: "check_in_opens_at must be before check_in_closes_at" };
+  }
+  if (
+    (check_in_opens_at && !check_in_closes_at) ||
+    (!check_in_opens_at && check_in_closes_at)
+  ) {
+    return {
+      error:
+        "Set both check-in open and close times, or leave both empty for auto",
+    };
+  }
+
+  const eventEndCap = eventEndWallTime(start_date, end_date);
+  if (check_in_closes_at && check_in_closes_at > eventEndCap) {
+    return {
+      error: "check_in_closes_at cannot be after the event end time",
+    };
+  }
+  if (check_in_opens_at && check_in_opens_at > eventEndCap) {
+    return { error: "check_in_opens_at cannot be after the event end time" };
+  }
+
+  if (
+    registration_opens_at &&
+    registration_closes_at &&
+    registration_opens_at >= registration_closes_at
+  ) {
+    return {
+      error: "registration_opens_at must be before registration_closes_at",
+    };
+  }
+
+  const location_lat = parseEventCoord(body.location_lat, "lat");
+  if (location_lat === "invalid") {
+    return { error: "invalid location_lat" };
+  }
+  const location_lng = parseEventCoord(body.location_lng, "lng");
+  if (location_lng === "invalid") {
+    return { error: "invalid location_lng" };
+  }
+  if (
+    (location_lat != null && location_lng == null) ||
+    (location_lat == null && location_lng != null)
+  ) {
+    return {
+      error: "location_lat and location_lng must both be set or both empty",
+    };
+  }
+
+  const maxRaw = body.max_registrations;
+  const max_registrations =
+    maxRaw === null || maxRaw === undefined || maxRaw === ""
+      ? null
+      : Number(maxRaw);
+  if (
+    max_registrations != null &&
+    (!Number.isFinite(max_registrations) || max_registrations < 0)
+  ) {
+    return { error: "invalid max_registrations" };
+  }
+
+  const maxPerOrderRaw = body.max_registrations_per_order;
+  const max_registrations_per_order =
+    maxPerOrderRaw === null ||
+    maxPerOrderRaw === undefined ||
+    maxPerOrderRaw === ""
+      ? 10
+      : Number(maxPerOrderRaw);
+  if (
+    !Number.isFinite(max_registrations_per_order) ||
+    max_registrations_per_order < 1 ||
+    max_registrations_per_order > 20
+  ) {
+    return { error: "invalid max_registrations_per_order (1-20)" };
+  }
+
+  let fee_presentation: string | null | undefined;
+  if (body.fee_presentation === null || body.fee_presentation === "") {
+    fee_presentation = null;
+  } else if (body.fee_presentation === "inherit") {
+    fee_presentation = null;
+  } else if (isValidFeePresentation(body.fee_presentation)) {
+    fee_presentation = body.fee_presentation;
+  } else if (body.fee_presentation !== undefined) {
+    return { error: "invalid fee_presentation" };
+  }
+
+  let bib_mode: "folio" | "separate" = "folio";
+  if (
+    body.bib_mode === undefined ||
+    body.bib_mode === null ||
+    body.bib_mode === ""
+  ) {
+    bib_mode = "folio";
+  } else if (body.bib_mode === "folio" || body.bib_mode === "separate") {
+    bib_mode = body.bib_mode;
+  } else {
+    return { error: "invalid bib_mode" };
+  }
+
+  const auto_deactivate_after_event =
+    body.auto_deactivate_after_event === undefined
+      ? true
+      : Boolean(body.auto_deactivate_after_event);
+
+  const msi_enabled = Boolean(body.msi_enabled);
+  const manual_sales_enabled = Boolean(body.manual_sales_enabled);
+
+  let subdomain: string | undefined;
+  if (body.subdomain !== undefined && body.subdomain !== null) {
+    subdomain = normalizeEventSubdomain(String(body.subdomain));
+  }
+
+  return {
+    data: {
+      title,
+      slug: body.slug ? String(body.slug).trim().slice(0, 120) : undefined,
+      subdomain,
+      sport_type_id,
+      short_description: body.short_description
+        ? String(body.short_description).trim().slice(0, 500)
+        : null,
+      description: body.description ? String(body.description).trim() : null,
+      status,
+      visibility,
+      featured: Boolean(body.featured),
+      start_date,
+      end_date,
+      registration_opens_at,
+      registration_closes_at,
+      check_in_opens_at,
+      check_in_closes_at,
+      location_city: body.location_city
+        ? String(body.location_city).trim().slice(0, 100)
+        : null,
+      location_state: body.location_state
+        ? String(body.location_state).trim().slice(0, 100)
+        : null,
+      location_name: body.location_name
+        ? String(body.location_name).trim().slice(0, 255)
+        : null,
+      location_lat,
+      location_lng,
+      hero_image_url: body.hero_image_url
+        ? normalizeCdnUploadUrl(String(body.hero_image_url).trim()).slice(
+            0,
+            500,
+          )
+        : null,
+      banner_image_url: body.banner_image_url
+        ? normalizeCdnUploadUrl(String(body.banner_image_url).trim()).slice(
+            0,
+            500,
+          )
+        : null,
+      max_registrations,
+      max_registrations_per_order,
+      requires_waiver:
+        body.requires_waiver === false || body.requires_waiver === 0
+          ? false
+          : true,
+      fee_presentation: fee_presentation ?? null,
+      msi_enabled,
+      manual_sales_enabled,
+      bib_mode,
+      auto_deactivate_after_event,
+    },
+  };
+}
+
+async function analyticsTimeSeries(pool: Pool, organizerId?: number) {
+  const orgFilter = organizerId
+    ? ` AND r.event_id IN (SELECT id FROM events WHERE organizer_id = ${Number(organizerId)} AND COALESCE(is_simulation, 0) = 0)`
+    : "";
+
+  const [regRows] = await pool.query<RowDataPacket[]>(
+    `SELECT DATE(r.created_at) AS day, COUNT(*) AS registrations
+     FROM registrations r
+     WHERE r.status = 'confirmed' AND r.deleted_at IS NULL
+       AND COALESCE(r.is_simulation, 0) = 0
+       AND r.created_at >= DATE_SUB(CURDATE(), INTERVAL 29 DAY)${orgFilter}
+     GROUP BY DATE(r.created_at)
+     ORDER BY day ASC`,
+  );
+
+  const [revRows] = await pool.query<RowDataPacket[]>(
+    `SELECT DATE(p.created_at) AS day, COALESCE(SUM(p.amount_cents), 0) AS revenue_cents
+     FROM payments p
+     WHERE p.status = 'succeeded'
+       AND COALESCE(p.is_simulation, 0) = 0
+       AND p.created_at >= DATE_SUB(CURDATE(), INTERVAL 29 DAY)
+       ${organizerId ? `AND p.organizer_id = ${Number(organizerId)}` : ""}
+     GROUP BY DATE(p.created_at)
+     ORDER BY day ASC`,
+  );
+
+  return {
+    registrations_by_day: regRows.map((r) => ({
+      day: String(r.day).slice(0, 10),
+      registrations: Number(r.registrations),
+    })),
+    revenue_by_day: revRows.map((r) => ({
+      day: String(r.day).slice(0, 10),
+      revenue_cents: Number(r.revenue_cents),
+    })),
+  };
+}
+
+function mapCourseRowFromDb(row: RowDataPacket) {
+  let elevationProfile:
+    | import("../shared/api.js").ElevationProfilePoint[]
+    | null = null;
+  try {
+    const parsed =
+      typeof row.elevation_profile_json === "string"
+        ? JSON.parse(row.elevation_profile_json as string)
+        : row.elevation_profile_json;
+    elevationProfile = Array.isArray(parsed)
+      ? (parsed as import("../shared/api.js").ElevationProfilePoint[])
+      : null;
+  } catch {
+    elevationProfile = null;
+  }
+
+  return normalizeEventCourse({
+    routeGeojson:
+      typeof row.route_geojson === "string"
+        ? JSON.parse(row.route_geojson as string)
+        : row.route_geojson,
+    points:
+      typeof row.points_json === "string"
+        ? JSON.parse(row.points_json as string)
+        : row.points_json,
+    distanceKm: row.distance_km,
+    elevationGainM: row.elevation_gain_m,
+    elevationProfile,
+  });
+}
+
+export function registerStaffPortalRoutes(
+  app: Express,
+  deps: StaffPortalDeps,
+): void {
+  const {
+    pool,
+    requireAdmin,
+    requireOrganizer,
+    newPublicUuid,
+    newQrToken,
+    nextRegistrationNumber,
+    normalizeLocale,
+    sendEmail,
+    appUrl,
+    processPaymentRefund,
+    buildWelcomeStaffEmail,
+    buildEventSubmittedForApprovalEmail,
+    buildEventApprovedEmail,
+    buildEventRejectedEmail,
+    buildOrganizerPayoutSetupEmail,
+    sendStaffLoginOtp,
+    getStripeClient,
+    deliverRegistrationConfirmedEmail,
+  } = deps;
+
+  async function applyOrganizerEventLocation(
+    data: ParsedEventBody,
+  ): Promise<string | null> {
+    if (!data.location_city?.trim()) {
+      return null;
+    }
+    const resolved = await resolveEventCatalogLocation(
+      pool,
+      data.location_city,
+      data.location_state,
+    );
+    if (resolved.ok === false) {
+      return resolved.error;
+    }
+    data.location_city = resolved.location_city;
+    if (resolved.location_state) {
+      data.location_state = resolved.location_state;
+    }
+    return null;
+  }
+
+  async function notifyActiveAdmins(
+    buildForAdmin: (
+      firstName: string,
+      locale: string,
+    ) => {
+      subject: string;
+      html: string;
+      text: string;
+    },
+  ) {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT email, first_name, preferred_language
+       FROM admins
+       WHERE status = 'active' AND deleted_at IS NULL`,
+    );
+    for (const row of rows) {
+      const firstName = String(row.first_name ?? "Admin");
+      const locale = normalizeLocale(row.preferred_language);
+      const mail = buildForAdmin(firstName, locale);
+      void sendEmail({
+        to: String(row.email),
+        subject: mail.subject,
+        html: mail.html,
+        text: mail.text,
+      }).catch((err) => console.error("[email:event-approval-admin]", err));
+    }
+  }
+
+  async function notifyOrganizerEditors(
+    organizerId: number,
+    buildMail: (
+      firstName: string,
+      locale: string,
+    ) => {
+      subject: string;
+      html: string;
+      text: string;
+    },
+  ) {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT email, first_name, preferred_language
+       FROM organizer_members
+       WHERE organizer_id = ?
+         AND status = 'active'
+         AND deleted_at IS NULL
+         AND role IN ('owner', 'organizer')`,
+      [organizerId],
+    );
+    for (const row of rows) {
+      const firstName = String(row.first_name ?? "Organizer");
+      const locale = normalizeLocale(row.preferred_language);
+      const mail = buildMail(firstName, locale);
+      void sendEmail({
+        to: String(row.email),
+        subject: mail.subject,
+        html: mail.html,
+        text: mail.text,
+      }).catch((err) => console.error("[email:event-approval-organizer]", err));
+    }
+  }
+
+  async function notifyOrganizerPayoutContacts(
+    organizerId: number,
+    buildMail: (
+      firstName: string,
+      locale: string,
+    ) => {
+      subject: string;
+      html: string;
+      text: string;
+    },
+  ) {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT email, first_name, preferred_language
+       FROM organizer_members
+       WHERE organizer_id = ?
+         AND status = 'active'
+         AND deleted_at IS NULL
+         AND role IN ('owner', 'organizer', 'finance')`,
+      [organizerId],
+    );
+    for (const row of rows) {
+      const firstName = String(row.first_name ?? "Organizer");
+      const locale = normalizeLocale(row.preferred_language);
+      const mail = buildMail(firstName, locale);
+      void sendEmail({
+        to: String(row.email),
+        subject: mail.subject,
+        html: mail.html,
+        text: mail.text,
+      }).catch((err) => console.error("[email:organizer-payout-setup]", err));
+    }
+  }
+
+  async function sendPayoutSetupNudgeIfNeeded(
+    organizerId: number,
+    eventTitle: string,
+  ): Promise<void> {
+    // Any ready rail (cards / Mercado Pago / Cuenta de Pago) suppresses the nudge.
+    const dest = await resolveOrganizerCheckoutDestination(pool, organizerId);
+    if (dest.ok) return;
+
+    void notifyOrganizerPayoutContacts(organizerId, (firstName, locale) =>
+      buildOrganizerPayoutSetupEmail({
+        locale,
+        firstName,
+        eventTitle,
+        appUrl,
+      }),
+    );
+  }
+
+  app.post(
+    "/api/admin/events/upload-asset",
+    requireAdmin,
+    (req, res) => void handleEventAssetUpload(req, res),
+  );
+
+  app.post(
+    "/api/admin/events/fetch-image",
+    requireAdmin,
+    (req, res) => void handleStaffImageProxy(req, res),
+  );
+
+  app.post(
+    "/api/organizer/events/upload-asset",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      if (!(await guardOrganizerMemberEditor(req, res))) return;
+      void handleEventAssetUpload(req, res);
+    },
+  );
+
+  app.post(
+    "/api/organizer/events/fetch-image",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      if (!(await guardOrganizerMemberEditor(req, res))) return;
+      void handleStaffImageProxy(req, res);
+    },
+  );
+
+  function sendStaffWelcomeEmail(opts: {
+    to: string;
+    firstName: string;
+    audience: "admin" | "organizer";
+    preferredLanguage?: unknown;
+  }) {
+    const welcome = buildWelcomeStaffEmail({
+      locale: normalizeLocale(opts.preferredLanguage),
+      firstName: opts.firstName,
+      audience: opts.audience,
+      appUrl,
+    });
+    void sendEmail({
+      to: opts.to,
+      subject: welcome.subject,
+      html: welcome.html,
+      text: welcome.text,
+    }).catch((err) => console.error("[email:welcome-staff]", err));
+  }
+
+  app.post("/api/public/organizers/register", async (req, res) => {
+    const rate = checkPublicOrganizerRateLimit(req, "organizer-register");
+    if (rate.ok === false) {
+      res.setHeader("Retry-After", String(rate.retryAfterSec));
+      return res.status(429).json({
+        error: "Too many attempts. Please try again later.",
+        code: "rate_limited",
+        retryAfterSec: rate.retryAfterSec,
+      });
+    }
+
+    const result = await registerSelfServiceOrganizer(
+      pool,
+      (req.body ??
+        {}) as import("../shared/api.js").PublicOrganizerRegisterRequest,
+      { newPublicUuid, normalizeLocale },
+    );
+    if (result.ok === false) {
+      return res.status(result.status).json({
+        error: result.error,
+        code: result.code,
+      });
+    }
+
+    sendStaffWelcomeEmail({
+      to: String(req.body?.owner_email ?? "")
+        .trim()
+        .toLowerCase(),
+      firstName: String(req.body?.owner_first_name ?? "").trim(),
+      audience: "organizer",
+      preferredLanguage:
+        req.body?.locale ??
+        (typeof req.headers["accept-language"] === "string"
+          ? req.headers["accept-language"].split(",")[0]?.trim()
+          : undefined),
+    });
+
+    void notifyActiveAdmins((firstName, locale) =>
+      buildSelfServiceOrganizerAdminEmail({
+        locale,
+        adminFirstName: firstName,
+        organizerName: result.organizer.name,
+        ownerEmail: String(req.body?.owner_email ?? "")
+          .trim()
+          .toLowerCase(),
+        city: String(req.body?.city ?? "").trim(),
+        appUrl,
+      }),
+    );
+
+    res.status(201).json({
+      organizer: result.organizer,
+      next: "verify_otp",
+    });
+  });
+
+  async function organizerEventAccess(
+    req: AuthedRequest,
+    eventId: number,
+  ): Promise<boolean> {
+    const organizerId = req.auth!.organizerId;
+    if (!organizerId || !req.auth?.id) return false;
+    return assertMemberCanAccessEvent(pool, req.auth.id, organizerId, eventId);
+  }
+
+  async function organizerEventMutateAccess(
+    req: AuthedRequest,
+    eventId: number,
+  ): Promise<OrganizerMutateGate> {
+    const organizerId = req.auth!.organizerId;
+    if (!organizerId || !req.auth?.id) return "forbidden";
+    if (
+      !(await assertMemberCanAccessEvent(
+        pool,
+        req.auth.id,
+        organizerId,
+        eventId,
+      ))
+    ) {
+      return "not_found";
+    }
+    const memberRole = await getOrganizerMemberRole(
+      pool,
+      req.auth.id,
+      organizerId,
+    );
+    if (!memberRole || !canOrganizerEditEvents(memberRole)) {
+      return "forbidden";
+    }
+    return "ok";
+  }
+
+  async function organizerRegistrationOpsAccess(
+    req: AuthedRequest,
+    eventId: number,
+  ): Promise<OrganizerMutateGate> {
+    const organizerId = req.auth!.organizerId;
+    if (!organizerId || !req.auth?.id) return "forbidden";
+    if (
+      !(await assertMemberCanAccessEvent(
+        pool,
+        req.auth.id,
+        organizerId,
+        eventId,
+      ))
+    ) {
+      return "not_found";
+    }
+    const memberRole = await getOrganizerMemberRole(
+      pool,
+      req.auth.id,
+      organizerId,
+    );
+    if (!memberRole || !canOrganizerManageRegistrations(memberRole)) {
+      return "forbidden";
+    }
+    return "ok";
+  }
+
+  async function organizerManualSaleAccess(
+    req: AuthedRequest,
+    eventId: number,
+  ): Promise<OrganizerMutateGate> {
+    const organizerId = req.auth!.organizerId;
+    if (!organizerId || !req.auth?.id) return "forbidden";
+    if (
+      !(await assertMemberCanAccessEvent(
+        pool,
+        req.auth.id,
+        organizerId,
+        eventId,
+      ))
+    ) {
+      return "not_found";
+    }
+    const memberRole = await getOrganizerMemberRole(
+      pool,
+      req.auth.id,
+      organizerId,
+    );
+    if (!memberRole || !canOrganizerRecordManualSale(memberRole)) {
+      return "forbidden";
+    }
+    return "ok";
+  }
+
+  async function guardOrganizerEventEditor(
+    req: AuthedRequest,
+    res: Response,
+    eventId: number,
+  ): Promise<boolean> {
+    const gate = await organizerEventMutateAccess(req, eventId);
+    if (gate === "forbidden") {
+      res
+        .status(403)
+        .json({ error: "Insufficient permissions to edit events" });
+      return false;
+    }
+    if (gate !== "ok") {
+      res.status(404).json({ error: "Event not found" });
+      return false;
+    }
+    return true;
+  }
+
+  async function guardOrganizerMemberEditor(
+    req: AuthedRequest,
+    res: Response,
+  ): Promise<boolean> {
+    const organizerId = req.auth!.organizerId;
+    if (!organizerId) {
+      res.status(403).json({ error: "Organizer context missing" });
+      return false;
+    }
+    const memberRole = await getOrganizerMemberRole(
+      pool,
+      req.auth!.id,
+      organizerId,
+    );
+    if (!memberRole || !canOrganizerEditEvents(memberRole)) {
+      res
+        .status(403)
+        .json({ error: "Insufficient permissions to edit events" });
+      return false;
+    }
+    return true;
+  }
+
+  const hubHelpers = {
+    newPublicUuid,
+    newQrToken,
+    nextRegistrationNumber,
+    getStripeClient,
+    deliverRegistrationConfirmedEmail,
+  };
+
+  mountEventHubRoutes(
+    app,
+    pool,
+    requireOrganizer,
+    "/api/organizer/events",
+    async (req, eventId) => organizerEventAccess(req, eventId),
+    hubHelpers,
+    organizerEventMutateAccess,
+    organizerManualSaleAccess,
+    organizerRegistrationOpsAccess,
+  );
+
+  mountEventHubRoutes(
+    app,
+    pool,
+    requireAdmin,
+    "/api/admin/events",
+    async (_req, eventId) => assertEventExists(pool, eventId),
+    hubHelpers,
+  );
+
+  mountEventResultsRoutes(
+    app,
+    pool,
+    requireOrganizer,
+    "/api/organizer/events",
+    async (req, eventId) => organizerEventAccess(req, eventId),
+    organizerEventMutateAccess,
+  );
+
+  mountEventResultsRoutes(
+    app,
+    pool,
+    requireAdmin,
+    "/api/admin/events",
+    async (_req, eventId) => assertEventExists(pool, eventId),
+  );
+
+  app.get("/api/admin/registrations", requireAdmin, async (req, res) => {
+    const eventIdRaw = req.query.eventId;
+    const eventId =
+      eventIdRaw != null && String(eventIdRaw).trim() !== ""
+        ? Number(eventIdRaw)
+        : undefined;
+    if (eventId != null && !Number.isFinite(eventId)) {
+      return res.status(400).json({ error: "Invalid eventId" });
+    }
+    const q = String(req.query.q ?? "").trim();
+    const result = await listStaffRegistrations(pool, {
+      eventId,
+      q: q || undefined,
+      page: req.query.page,
+      limit: req.query.limit,
+      sortBy: req.query.sortBy,
+      sortDir: req.query.sortDir,
+    });
+    res.json(result);
+  });
+
+  // ── Organizer: event detail ──────────────────────────────────────────────
+  app.get(
+    "/api/organizer/events/subdomain-available",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const raw = String(req.query.subdomain ?? "");
+      const check = await assertEventSubdomainAvailable(pool, raw);
+      if (check.ok === false) {
+        return res.json({
+          available: false,
+          subdomain: normalizeEventSubdomain(raw),
+          error: check.error,
+        });
+      }
+      res.json({ available: true, subdomain: check.subdomain });
+    },
+  );
+
+  app.get(
+    "/api/organizer/events/:eventId",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json({ error: "Organizer context missing" });
+      }
+      const eventId = Number(req.params.eventId);
+      if (!Number.isFinite(eventId)) {
+        return res.status(400).json({ error: "Invalid event id" });
+      }
+      if (
+        !(await assertMemberCanAccessEvent(
+          pool,
+          req.auth!.id,
+          organizerId,
+          eventId,
+        ))
+      ) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const event = await fetchStaffEventDetail(pool, eventId);
+      const categories = await fetchEventCategories(pool, eventId);
+      if (!event) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const paymentAvailability = await attachEventPaymentAvailability(
+        pool,
+        {
+          id: eventId,
+          status: String(event.status),
+          organizer_id: Number(event.organizer_id),
+        },
+        getStripeClient?.() ?? null,
+      );
+      res.json({
+        event: { ...event, ...paymentAvailability },
+        categories,
+        extras: await fetchAllEventExtras(pool, eventId),
+      });
+    },
+  );
+
+  app.post(
+    "/api/organizer/events",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json({ error: "Organizer context missing" });
+      }
+      const memberRole = await getOrganizerMemberRole(
+        pool,
+        req.auth!.id,
+        organizerId,
+      );
+      if (!memberRole || !canOrganizerCreateEvents(memberRole)) {
+        return res
+          .status(403)
+          .json({ error: "Insufficient permissions to create events" });
+      }
+      const orgGate = await assertOrganizerCanOperateEvents(pool, organizerId);
+      if (orgGate.ok === false) {
+        return res
+          .status(orgGate.status)
+          .json({ error: orgGate.error, code: orgGate.code });
+      }
+      const parsed = parseEventBody(
+        (req.body ?? {}) as Record<string, unknown>,
+      );
+      if ("error" in parsed) {
+        return res.status(400).json({ error: parsed.error });
+      }
+      const { data } = parsed;
+      const locationErr = await applyOrganizerEventLocation(data);
+      if (locationErr) {
+        return res.status(400).json({ error: locationErr });
+      }
+      if (data.subdomain == null || data.subdomain === "") {
+        return res.status(400).json({ error: "subdomain required" });
+      }
+      const subdomainCheck = await assertEventSubdomainAvailable(
+        pool,
+        data.subdomain,
+      );
+      if (subdomainCheck.ok === false) {
+        return res.status(400).json({ error: subdomainCheck.error });
+      }
+      const baseSlug = slugify(data.slug || data.title);
+      const slug = await uniqueEventSlug(pool, baseSlug);
+
+      const [sportRows] = await pool.query<RowDataPacket[]>(
+        "SELECT id FROM sport_types WHERE id = ? AND is_active = 1 LIMIT 1",
+        [data.sport_type_id],
+      );
+      if (sportRows.length === 0) {
+        return res.status(400).json({ error: "Invalid sport_type_id" });
+      }
+
+      let newEventId: number;
+      try {
+        const [result] = await pool.query<ResultSetHeader>(
+          `INSERT INTO events (
+           public_uuid, organizer_id, sport_type_id, slug, subdomain, title, short_description, description,
+           status, visibility, featured, start_date, end_date, registration_opens_at,
+           registration_closes_at, check_in_opens_at, check_in_closes_at,
+           location_name, location_city, location_state, location_lat, location_lng,
+           hero_image_url, banner_image_url, max_registrations, max_registrations_per_order, bib_mode,
+           requires_waiver, auto_deactivate_after_event
+         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          [
+            newPublicUuid(),
+            organizerId,
+            data.sport_type_id,
+            slug,
+            subdomainCheck.subdomain,
+            data.title,
+            data.short_description,
+            data.description,
+            "draft",
+            data.visibility,
+            0,
+            data.start_date,
+            data.end_date,
+            data.registration_opens_at,
+            data.registration_closes_at,
+            data.check_in_opens_at,
+            data.check_in_closes_at,
+            ...eventBodySqlValues(data),
+            data.requires_waiver ? 1 : 0,
+            data.auto_deactivate_after_event ? 1 : 0,
+          ],
+        );
+        newEventId = result.insertId;
+      } catch (err) {
+        if (isMysqlDuplicateEntry(err)) {
+          return res.status(400).json({ error: eventCreateDuplicateError(err) });
+        }
+        throw err;
+      }
+
+      const access = await getMemberEventAccess(
+        pool,
+        req.auth!.id,
+        organizerId,
+      );
+      if (access !== "all") {
+        await pool.query<ResultSetHeader>(
+          "INSERT INTO organizer_member_events (organizer_member_id, event_id) VALUES (?, ?)",
+          [req.auth!.id, newEventId],
+        );
+      }
+
+      const event = await fetchStaffEventDetail(pool, newEventId);
+      res.status(201).json({ event, categories: [] });
+    },
+  );
+
+  app.patch(
+    "/api/organizer/events/:eventId",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json({ error: "Organizer context missing" });
+      }
+      const eventId = Number(req.params.eventId);
+      if (!Number.isFinite(eventId)) {
+        return res.status(400).json({ error: "Invalid event id" });
+      }
+      if (
+        !(await assertMemberCanAccessEvent(
+          pool,
+          req.auth!.id,
+          organizerId,
+          eventId,
+        ))
+      ) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+
+      const memberRole = await getOrganizerMemberRole(
+        pool,
+        req.auth!.id,
+        organizerId,
+      );
+      if (!memberRole || !canOrganizerEditEvents(memberRole)) {
+        return res
+          .status(403)
+          .json({ error: "Insufficient permissions to edit events" });
+      }
+
+      const [[currentEvent]] = await pool.query<RowDataPacket[]>(
+        "SELECT status, featured, subdomain FROM events WHERE id = ? AND organizer_id = ? AND deleted_at IS NULL LIMIT 1",
+        [eventId, organizerId],
+      );
+      if (!currentEvent) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+
+      const parsed = parseEventBody(
+        (req.body ?? {}) as Record<string, unknown>,
+      );
+      if ("error" in parsed) {
+        return res.status(400).json({ error: parsed.error });
+      }
+      const { data } = parsed;
+      if (
+        data.subdomain !== undefined &&
+        data.subdomain !== "" &&
+        data.subdomain !==
+          normalizeEventSubdomain(String(currentEvent.subdomain ?? ""))
+      ) {
+        return res.status(400).json({
+          error: "subdomain cannot be changed after create",
+          code: "subdomain_immutable",
+        });
+      }
+      const locationErr = await applyOrganizerEventLocation(data);
+      if (locationErr) {
+        return res.status(400).json({ error: locationErr });
+      }
+      data.featured = Boolean(currentEvent.featured);
+
+      if (data.status === "published") {
+        return res.status(403).json({
+          error:
+            "Organizers cannot publish directly. Submit the event for admin approval.",
+          code: "organizer_publish_requires_approval",
+        });
+      }
+      if (data.status === "pending_approval") {
+        return res.status(403).json({
+          error: "Use Submit for approval instead of changing status directly.",
+          code: "organizer_submit_requires_publish_endpoint",
+        });
+      }
+
+      const currentStatus = String(currentEvent.status);
+      let statusToSave = data.status;
+      if (currentStatus === "published") {
+        statusToSave = "published";
+      } else if (currentStatus === "pending_approval") {
+        if (
+          !["draft", "pending_approval", "cancelled"].includes(statusToSave)
+        ) {
+          statusToSave = "pending_approval";
+        }
+      }
+
+      let slug = data.slug ? slugify(data.slug) : undefined;
+      if (slug) {
+        slug = await uniqueEventSlug(pool, slug, eventId);
+      }
+
+      const clearSubmittedAt = statusToSave === "draft";
+
+      await pool.query<ResultSetHeader>(
+        `UPDATE events SET
+           title = ?, sport_type_id = ?,
+           ${slug ? "slug = ?," : ""}
+           short_description = ?, description = ?, status = ?, visibility = ?,
+           featured = ?, start_date = ?, end_date = ?,
+           registration_opens_at = ?, registration_closes_at = ?,
+           check_in_opens_at = ?, check_in_closes_at = ?,
+           requires_waiver = ?, fee_presentation = ?, msi_enabled = ?, manual_sales_enabled = ?, auto_deactivate_after_event = ?,
+           ${clearSubmittedAt ? "submitted_for_approval_at = NULL," : ""}
+           ${eventBodySqlTail()}
+         WHERE id = ? AND organizer_id = ?`,
+        [
+          data.title,
+          data.sport_type_id,
+          ...(slug ? [slug] : []),
+          data.short_description,
+          data.description,
+          statusToSave,
+          data.visibility,
+          data.featured ? 1 : 0,
+          data.start_date,
+          data.end_date,
+          data.registration_opens_at,
+          data.registration_closes_at,
+          data.check_in_opens_at,
+          data.check_in_closes_at,
+          data.requires_waiver ? 1 : 0,
+          data.fee_presentation,
+          data.msi_enabled ? 1 : 0,
+          data.manual_sales_enabled ? 1 : 0,
+          data.auto_deactivate_after_event ? 1 : 0,
+          ...eventBodySqlValues(data),
+          eventId,
+          organizerId,
+        ],
+      );
+
+      const event = await fetchStaffEventDetail(pool, eventId);
+      const categories = await fetchEventCategories(pool, eventId);
+      res.json({ event, categories });
+    },
+  );
+
+  app.post(
+    "/api/organizer/events/:eventId/deactivate-listing",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json({ error: "Organizer context missing" });
+      }
+      const eventId = Number(req.params.eventId);
+      if (!Number.isFinite(eventId)) {
+        return res.status(400).json({ error: "Invalid event id" });
+      }
+      if (
+        !(await assertMemberCanAccessEvent(
+          pool,
+          req.auth!.id,
+          organizerId,
+          eventId,
+        ))
+      ) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const memberRole = await getOrganizerMemberRole(
+        pool,
+        req.auth!.id,
+        organizerId,
+      );
+      if (!memberRole || !canOrganizerEditEvents(memberRole)) {
+        return res
+          .status(403)
+          .json({ error: "Insufficient permissions to edit events" });
+      }
+      const [[owned]] = await pool.query<RowDataPacket[]>(
+        `SELECT id FROM events WHERE id = ? AND organizer_id = ? AND deleted_at IS NULL LIMIT 1`,
+        [eventId, organizerId],
+      );
+      if (!owned) return res.status(404).json({ error: "Event not found" });
+
+      const result = await deactivateEventFromListing(pool, eventId);
+      if ("error" in result) {
+        return res.status(404).json({ error: result.error });
+      }
+      const event = await fetchStaffEventDetail(pool, eventId);
+      res.json({ ok: true, event });
+    },
+  );
+
+  app.delete(
+    "/api/organizer/events/:eventId",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json({ error: "Organizer context missing" });
+      }
+      const eventId = Number(req.params.eventId);
+      if (!Number.isFinite(eventId)) {
+        return res.status(400).json({ error: "Invalid event id" });
+      }
+      if (
+        !(await assertMemberCanAccessEvent(
+          pool,
+          req.auth!.id,
+          organizerId,
+          eventId,
+        ))
+      ) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const memberRole = await getOrganizerMemberRole(
+        pool,
+        req.auth!.id,
+        organizerId,
+      );
+      if (!memberRole || !["owner", "organizer"].includes(memberRole)) {
+        return res
+          .status(403)
+          .json({ error: "Only owner/organizer can delete events" });
+      }
+      const [[owned]] = await pool.query<RowDataPacket[]>(
+        `SELECT id FROM events WHERE id = ? AND organizer_id = ? AND deleted_at IS NULL LIMIT 1`,
+        [eventId, organizerId],
+      );
+      if (!owned) return res.status(404).json({ error: "Event not found" });
+
+      const result = await softDeleteStaffEvent(pool, eventId);
+      if ("error" in result) {
+        return res.status(404).json({ error: result.error });
+      }
+      res.json({
+        ok: true,
+        cancelledRegistrations: result.cancelledRegistrations,
+      });
+    },
+  );
+
+  app.post(
+    "/api/organizer/events/:eventId/publish",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json({ error: "Organizer context missing" });
+      }
+      const eventId = Number(req.params.eventId);
+      if (
+        !(await assertMemberCanAccessEvent(
+          pool,
+          req.auth!.id,
+          organizerId,
+          eventId,
+        ))
+      ) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+
+      const memberRole = await getOrganizerMemberRole(
+        pool,
+        req.auth!.id,
+        organizerId,
+      );
+      if (!memberRole || !canOrganizerEditEvents(memberRole)) {
+        return res
+          .status(403)
+          .json({ error: "Insufficient permissions to publish events" });
+      }
+      const orgGate = await assertOrganizerCanOperateEvents(pool, organizerId);
+      if (orgGate.ok === false) {
+        return res
+          .status(orgGate.status)
+          .json({ error: orgGate.error, code: orgGate.code });
+      }
+
+      const [[eventRow]] = await pool.query<RowDataPacket[]>(
+        "SELECT status, is_simulation FROM events WHERE id = ? AND organizer_id = ? AND deleted_at IS NULL LIMIT 1",
+        [eventId, organizerId],
+      );
+      if (!eventRow) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      if (Number(eventRow.is_simulation) === 1) {
+        return res.status(400).json({
+          error:
+            "Simulation events cannot be published or submitted for approval",
+          code: "simulation_not_publishable",
+        });
+      }
+      const currentStatus = String(eventRow.status);
+      if (currentStatus === "pending_approval") {
+        return res
+          .status(409)
+          .json({ error: "Event is already pending admin approval" });
+      }
+      if (currentStatus === "published") {
+        return res.status(409).json({ error: "Event is already published" });
+      }
+      if (currentStatus !== "draft") {
+        return res
+          .status(400)
+          .json({ error: "Only draft events can be submitted for approval" });
+      }
+
+      const categories = await fetchEventCategories(pool, eventId);
+      const activeCategories = categories.filter((c) => c.is_active);
+      if (activeCategories.length === 0) {
+        return res.status(400).json({
+          error: "Add at least one active category before publishing",
+        });
+      }
+
+      const waiverCheck = await validateEventPublishWaivers(pool, eventId);
+      if ("error" in waiverCheck) {
+        return res.status(400).json({ error: waiverCheck.error });
+      }
+
+      const siteLegalCheck = await validateOrganizerSiteLegalReady(
+        pool,
+        organizerId,
+        "es",
+      );
+      if (siteLegalCheck.ok === false) {
+        return res.status(400).json({
+          error: siteLegalCheck.error,
+          code: siteLegalCheck.code,
+          missing: siteLegalCheck.missing,
+        });
+      }
+
+      const pricingCheck = await validateEventPublishPricing(
+        pool,
+        eventId,
+        categories,
+      );
+      if (pricingCheck.ok === false) {
+        return res.status(400).json({ error: pricingCheck.error });
+      }
+
+      if (await eventHasPaidActiveCategories(pool, eventId)) {
+        const payoutCheck = await assertOrganizerPayoutReadyForPaidEvent(
+          pool,
+          organizerId,
+          getStripeClient?.() ?? null,
+        );
+        if (payoutCheck.ok === false) {
+          return res.status(403).json({
+            error: payoutCheck.message,
+            code: payoutCheck.code,
+          });
+        }
+      }
+
+      await pool.query<ResultSetHeader>(
+        `UPDATE events SET status = 'pending_approval', submitted_for_approval_at = NOW(),
+                approval_rejection_reason = NULL
+         WHERE id = ? AND organizer_id = ?`,
+        [eventId, organizerId],
+      );
+
+      const event = await fetchStaffEventDetail(pool, eventId);
+      const eventTitle = String(event?.title ?? "Event");
+      void notifyActiveAdmins((firstName, locale) =>
+        buildEventSubmittedForApprovalEmail({
+          locale,
+          firstName,
+          eventTitle,
+          appUrl,
+        }),
+      );
+
+      res.json({
+        event,
+        categories: await fetchEventCategories(pool, eventId),
+      });
+    },
+  );
+
+  app.post(
+    "/api/organizer/events/:eventId/categories",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await guardOrganizerEventEditor(req, res, eventId))) return;
+
+      const err = await createEventCategoryRecord(
+        pool,
+        newPublicUuid,
+        eventId,
+        (req.body ?? {}) as Record<string, unknown>,
+        getStripeClient?.() ?? null,
+      );
+      if (err) return res.status(err.status).json({ error: err.error });
+
+      res
+        .status(201)
+        .json({ categories: await fetchEventCategories(pool, eventId) });
+    },
+  );
+
+  app.delete(
+    "/api/organizer/events/:eventId/categories/:categoryId",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      const categoryId = Number(req.params.categoryId);
+      if (!(await guardOrganizerEventEditor(req, res, eventId))) return;
+
+      const err = await deleteEventCategoryRecord(pool, eventId, categoryId);
+      if (err) return res.status(err.status).json({ error: err.error });
+
+      res.json({ categories: await fetchEventCategories(pool, eventId) });
+    },
+  );
+
+  app.patch(
+    "/api/organizer/events/:eventId/categories/:categoryId",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      const categoryId = Number(req.params.categoryId);
+      if (!(await guardOrganizerEventEditor(req, res, eventId))) return;
+
+      const err = await patchEventCategoryRecord(
+        pool,
+        eventId,
+        categoryId,
+        (req.body ?? {}) as Record<string, unknown>,
+        getStripeClient?.() ?? null,
+      );
+      if (err) return res.status(err.status).json({ error: err.error });
+
+      res.json({ categories: await fetchEventCategories(pool, eventId) });
+    },
+  );
+
+  app.post(
+    "/api/organizer/events/:eventId/extras",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await guardOrganizerEventEditor(req, res, eventId))) return;
+
+      const err = await createEventExtraRecord(
+        pool,
+        newPublicUuid,
+        eventId,
+        (req.body ?? {}) as Record<string, unknown>,
+        getStripeClient?.() ?? null,
+      );
+      if (err)
+        return res
+          .status(err.status)
+          .json({ error: err.error, code: err.code });
+
+      res
+        .status(201)
+        .json({ extras: await fetchAllEventExtras(pool, eventId) });
+    },
+  );
+
+  app.patch(
+    "/api/organizer/events/:eventId/extras/:extraId",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      const extraId = Number(req.params.extraId);
+      if (!(await guardOrganizerEventEditor(req, res, eventId))) return;
+
+      const err = await patchEventExtraRecord(
+        pool,
+        eventId,
+        extraId,
+        (req.body ?? {}) as Record<string, unknown>,
+        getStripeClient?.() ?? null,
+      );
+      if (err)
+        return res
+          .status(err.status)
+          .json({ error: err.error, code: err.code });
+
+      res.json({ extras: await fetchAllEventExtras(pool, eventId) });
+    },
+  );
+
+  app.delete(
+    "/api/organizer/events/:eventId/extras/:extraId",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      const extraId = Number(req.params.extraId);
+      if (!(await guardOrganizerEventEditor(req, res, eventId))) return;
+
+      const err = await deleteEventExtraRecord(pool, eventId, extraId);
+      if (err) return res.status(err.status).json({ error: err.error });
+
+      res.json({ extras: await fetchAllEventExtras(pool, eventId) });
+    },
+  );
+
+  // ── Organizer: registration fields & waivers ─────────────────────────────
+  app.get(
+    "/api/organizer/events/:eventId/registration-fields",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json({ error: "Organizer context missing" });
+      }
+      const eventId = Number(req.params.eventId);
+      if (
+        !(await assertMemberCanAccessEvent(
+          pool,
+          req.auth!.id,
+          organizerId,
+          eventId,
+        ))
+      ) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      res.json({ fields: await fetchStaffRegistrationFields(pool, eventId) });
+    },
+  );
+
+  app.put(
+    "/api/organizer/events/:eventId/registration-fields",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await guardOrganizerEventEditor(req, res, eventId))) return;
+
+      const result = await replaceEventRegistrationFields(
+        pool,
+        eventId,
+        req.body?.fields,
+      );
+      if (result.ok === false) {
+        return res
+          .status(result.error.status)
+          .json({ error: result.error.error });
+      }
+      res.json({ fields: result.fields });
+    },
+  );
+
+  app.get(
+    "/api/organizer/events/:eventId/folio-segments",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json({ error: "Organizer context missing" });
+      }
+      const eventId = Number(req.params.eventId);
+      if (
+        !(await assertMemberCanAccessEvent(
+          pool,
+          req.auth!.id,
+          organizerId,
+          eventId,
+        ))
+      ) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const rows = await fetchStaffFolioSegments(pool, eventId);
+      res.json({
+        segments: await presentStaffFolioSegments(pool, eventId, rows),
+      });
+    },
+  );
+
+  app.put(
+    "/api/organizer/events/:eventId/folio-segments",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await guardOrganizerEventEditor(req, res, eventId))) return;
+
+      const result = await replaceEventFolioSegments(
+        pool,
+        eventId,
+        req.body?.segments,
+      );
+      if (result.ok === false) {
+        return res
+          .status(result.error.status)
+          .json({ error: result.error.error });
+      }
+      res.json({
+        segments: await presentStaffFolioSegments(
+          pool,
+          eventId,
+          result.segments,
+        ),
+      });
+    },
+  );
+
+  app.get(
+    "/api/organizer/events/:eventId/waivers",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json({ error: "Organizer context missing" });
+      }
+      const eventId = Number(req.params.eventId);
+      if (
+        !(await assertMemberCanAccessEvent(
+          pool,
+          req.auth!.id,
+          organizerId,
+          eventId,
+        ))
+      ) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT id, event_id, title, content_html, pdf_url, content_type,
+                version, is_active, sort_order, created_at
+         FROM event_waivers WHERE event_id = ? ORDER BY is_active DESC, sort_order ASC, id ASC`,
+        [eventId],
+      );
+      res.json({ waivers: rows });
+    },
+  );
+
+  app.put(
+    "/api/organizer/events/:eventId/waivers",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await guardOrganizerEventEditor(req, res, eventId))) return;
+
+      const result = await syncEventWaivers(pool, eventId, req.body);
+      if ("error" in result) {
+        return res.status(result.status).json({ error: result.error });
+      }
+      res.json({ waivers: result.waivers });
+    },
+  );
+
+  // ── Organizer: check-in ──────────────────────────────────────────────────
+  app.get(
+    "/api/organizer/registrations/lookup",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json({ error: "Organizer context missing" });
+      }
+      const q = String(req.query.q ?? "").trim();
+      if (!q) {
+        return res.status(400).json({ error: "q required" });
+      }
+
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT r.id, r.registration_number, r.bib_number, r.status, r.qr_code_token,
+                r.checked_in_at, r.waiver_signed_at, r.total_cents, r.created_at,
+                e.id AS event_id, e.title AS event_title, e.slug AS event_slug, e.requires_waiver,
+                ec.name AS category_name,
+                a.first_name AS athlete_first_name, a.last_name AS athlete_last_name,
+                a.email AS athlete_email
+         FROM registrations r
+         JOIN events e ON e.id = r.event_id AND e.organizer_id = ?
+         JOIN event_categories ec ON ec.id = r.event_category_id
+         JOIN athletes a ON a.id = r.athlete_id
+         WHERE r.deleted_at IS NULL AND r.status = 'confirmed'
+           AND (r.qr_code_token = ? OR r.registration_number = ?)
+         LIMIT 1`,
+        [organizerId, q, q],
+      );
+
+      if (rows.length === 0) {
+        return res.status(404).json({ error: "Registration not found" });
+      }
+      const registration = rows[0];
+      const lookupEventId = Number(registration.event_id);
+      if (
+        !(await assertMemberCanAccessEvent(
+          pool,
+          req.auth!.id,
+          organizerId,
+          lookupEventId,
+        ))
+      ) {
+        return res.status(404).json({ error: "Registration not found" });
+      }
+      if (await enforceCheckInWindow(pool, res, lookupEventId, req)) {
+        return;
+      }
+      let waiver_outdated = false;
+      if (Boolean(registration.requires_waiver)) {
+        const status = await getRegistrationWaiverStatus(
+          pool,
+          registration.id as number,
+        );
+        waiver_outdated = status.outdated;
+      }
+      const purchased_extras = await fetchRegistrationPurchasedExtras(
+        pool,
+        registration.id as number,
+      );
+      res.json({
+        registration: { ...registration, waiver_outdated, purchased_extras },
+      });
+    },
+  );
+
+  app.get(
+    "/api/organizer/onboarding-intake",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json({ error: "Organizer context missing" });
+      }
+      const intake = await fetchOrganizerOnboardingIntake(pool, organizerId);
+      res.json({ intake });
+    },
+  );
+
+  // ── Organizer: team ──────────────────────────────────────────────────────
+  app.get(
+    "/api/organizer/members",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json({ error: "Organizer context missing" });
+      }
+      const members = await listOrganizerMembersWithAccess(pool, organizerId);
+      res.json({ members });
+    },
+  );
+
+  app.post(
+    "/api/organizer/members",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json({ error: "Organizer context missing" });
+      }
+
+      const actorRole = await getOrganizerMemberRole(
+        pool,
+        req.auth!.id,
+        organizerId,
+      );
+      if (actorRole !== "owner") {
+        return res
+          .status(403)
+          .json({ error: "Only owners can add team members" });
+      }
+
+      const email = String(req.body?.email ?? "")
+        .trim()
+        .toLowerCase();
+      const first_name = String(req.body?.first_name ?? "").trim();
+      const last_name = String(req.body?.last_name ?? "").trim();
+      const role = String(req.body?.role ?? "organizer");
+      const validRoles = new Set([
+        "organizer",
+        "marketing",
+        "finance",
+        "timing",
+        "operations",
+        "sponsor",
+        "seller",
+      ]);
+      if (!email || !first_name || !last_name) {
+        return res
+          .status(400)
+          .json({ error: "email, first_name, last_name required" });
+      }
+      if (!validRoles.has(role)) {
+        return res.status(400).json({ error: "invalid role" });
+      }
+
+      // Sellers default to per-event access; other roles default to org-wide.
+      const defaultScope = role === "seller" ? "events" : "organization";
+      const scopeRaw =
+        req.body?.event_access_scope === "events" ||
+        req.body?.event_access_scope === "organization"
+          ? req.body.event_access_scope
+          : defaultScope;
+
+      const [existing] = await pool.query<RowDataPacket[]>(
+        "SELECT id FROM organizer_members WHERE organizer_id = ? AND email = ? AND deleted_at IS NULL LIMIT 1",
+        [organizerId, email],
+      );
+      if (existing.length > 0) {
+        return res.status(409).json({ error: "Member already exists" });
+      }
+
+      const [insertResult] = await pool.query<ResultSetHeader>(
+        `INSERT INTO organizer_members (
+           public_uuid, organizer_id, email, first_name, last_name, phone, role,
+           event_access_scope, status, invited_at, invited_by_member_id
+         ) VALUES (?,?,?,?,?,?,?,?,'active',NOW(),?)`,
+        [
+          newPublicUuid(),
+          organizerId,
+          email,
+          first_name.slice(0, 100),
+          last_name.slice(0, 100),
+          req.body?.phone ? String(req.body.phone).slice(0, 20) : null,
+          role,
+          ORG_WIDE_EVENT_ROLES.has(role) ? "organization" : scopeRaw,
+          req.auth!.id,
+        ],
+      );
+      const newMemberId = Number(insertResult.insertId);
+
+      if (!ORG_WIDE_EVENT_ROLES.has(role)) {
+        const access = await applyMemberEventAccess(
+          pool,
+          organizerId,
+          newMemberId,
+          role,
+          scopeRaw,
+          req.body?.event_ids,
+        );
+        if (access.ok === false) {
+          await pool.query<ResultSetHeader>(
+            "DELETE FROM organizer_members WHERE id = ? AND organizer_id = ?",
+            [newMemberId, organizerId],
+          );
+          return res.status(access.status).json({ error: access.error });
+        }
+      }
+
+      sendStaffWelcomeEmail({
+        to: email,
+        firstName: first_name,
+        audience: "organizer",
+        preferredLanguage: req.body?.preferred_language,
+      });
+
+      const members = await listOrganizerMembersWithAccess(pool, organizerId);
+      res.status(201).json({ members });
+    },
+  );
+
+  app.patch(
+    "/api/organizer/members/:memberId",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json({ error: "Organizer context missing" });
+      }
+
+      const actorRole = await getOrganizerMemberRole(
+        pool,
+        req.auth!.id,
+        organizerId,
+      );
+      if (actorRole !== "owner") {
+        return res
+          .status(403)
+          .json({ error: "Only owners can update members" });
+      }
+
+      const memberId = Number(req.params.memberId);
+      const [target] = await pool.query<RowDataPacket[]>(
+        "SELECT id, role FROM organizer_members WHERE id = ? AND organizer_id = ? AND deleted_at IS NULL LIMIT 1",
+        [memberId, organizerId],
+      );
+      if (target.length === 0) {
+        return res.status(404).json({ error: "Member not found" });
+      }
+      if (target[0].role === "owner" && memberId !== req.auth!.id) {
+        return res.status(403).json({ error: "Cannot modify owner" });
+      }
+
+      const status = req.body?.status ? String(req.body.status) : null;
+      const role = req.body?.role ? String(req.body.role) : null;
+      const updates: string[] = [];
+      const params: (string | number)[] = [];
+      let nextRole = String(target[0].role);
+
+      if (status) {
+        if (!["invited", "active", "inactive", "suspended"].includes(status)) {
+          return res.status(400).json({ error: "invalid status" });
+        }
+        updates.push("status = ?");
+        params.push(status);
+        if (status === "active") {
+          updates.push("invited_at = COALESCE(invited_at, NOW())");
+        }
+      }
+      if (role && target[0].role !== "owner") {
+        const validRoles = new Set([
+          "organizer",
+          "marketing",
+          "finance",
+          "timing",
+          "operations",
+          "sponsor",
+          "seller",
+        ]);
+        if (!validRoles.has(role)) {
+          return res.status(400).json({ error: "invalid role" });
+        }
+        updates.push("role = ?");
+        params.push(role);
+        nextRole = role;
+      }
+
+      const wantsAccessUpdate =
+        req.body?.event_access_scope !== undefined ||
+        req.body?.event_ids !== undefined;
+
+      if (updates.length === 0 && !wantsAccessUpdate) {
+        return res.status(400).json({ error: "No updates provided" });
+      }
+
+      if (updates.length > 0) {
+        params.push(memberId, organizerId);
+        await pool.query<ResultSetHeader>(
+          `UPDATE organizer_members SET ${updates.join(", ")} WHERE id = ? AND organizer_id = ?`,
+          params,
+        );
+      }
+
+      if (ORG_WIDE_EVENT_ROLES.has(nextRole) && (role != null || wantsAccessUpdate)) {
+        const access = await applyMemberEventAccess(
+          pool,
+          organizerId,
+          memberId,
+          nextRole,
+          "organization",
+          undefined,
+        );
+        if (access.ok === false) {
+          return res.status(access.status).json({ error: access.error });
+        }
+      } else if (wantsAccessUpdate) {
+        const scopeForApply =
+          req.body?.event_access_scope ??
+          (req.body?.event_ids !== undefined ? "events" : null);
+        if (!scopeForApply) {
+          return res.status(400).json({
+            error: "event_access_scope must be organization or events",
+          });
+        }
+        const access = await applyMemberEventAccess(
+          pool,
+          organizerId,
+          memberId,
+          nextRole,
+          scopeForApply,
+          req.body?.event_ids,
+        );
+        if (access.ok === false) {
+          return res.status(access.status).json({ error: access.error });
+        }
+      }
+
+      const members = await listOrganizerMembersWithAccess(pool, organizerId);
+      res.json({ members });
+    },
+  );
+
+  app.get(
+    "/api/organizer/analytics",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json({ error: "Organizer context missing" });
+      }
+      const memberRole = await getOrganizerMemberRole(
+        pool,
+        req.auth!.id,
+        organizerId,
+      );
+      if (!memberRole || !canOrganizerViewAnalytics(memberRole)) {
+        return res
+          .status(403)
+          .json({ error: "Insufficient permissions for analytics" });
+      }
+
+      const [[stats]] = await pool.query<RowDataPacket[]>(
+        `SELECT
+           (SELECT COUNT(*) FROM events e WHERE e.organizer_id = ? AND e.deleted_at IS NULL AND COALESCE(e.is_simulation, 0) = 0) AS total_events,
+           (SELECT COUNT(*) FROM events e WHERE e.organizer_id = ? AND e.status = 'published' AND e.deleted_at IS NULL AND COALESCE(e.is_simulation, 0) = 0) AS published_events,
+           (SELECT COUNT(*) FROM registrations r JOIN events e ON e.id = r.event_id
+            WHERE e.organizer_id = ? AND r.status = 'confirmed' AND r.deleted_at IS NULL
+              AND COALESCE(r.is_simulation, 0) = 0 AND COALESCE(e.is_simulation, 0) = 0) AS confirmed_registrations,
+           (SELECT COALESCE(SUM(p.amount_cents),0) FROM payments p WHERE p.organizer_id = ? AND p.status = 'succeeded' AND COALESCE(p.is_simulation, 0) = 0) AS total_revenue_cents`,
+        [organizerId, organizerId, organizerId, organizerId],
+      );
+
+      const timeSeries = await analyticsTimeSeries(pool, organizerId);
+      res.json({ stats: stats ?? {}, ...timeSeries });
+    },
+  );
+
+  app.get(
+    "/api/organizer/payments",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json({ error: "Organizer context missing" });
+      }
+      const memberRole = await getOrganizerMemberRole(
+        pool,
+        req.auth!.id,
+        organizerId,
+      );
+      if (!memberRole || !canOrganizerViewPayments(memberRole)) {
+        return res
+          .status(403)
+          .json({ error: "Insufficient permissions for payments" });
+      }
+
+      const q = String(req.query.q ?? "").trim();
+      const status = String(req.query.status ?? "").trim();
+      const provider = String(req.query.provider ?? "").trim();
+      const eventIdRaw = req.query.eventId;
+      const eventId =
+        eventIdRaw != null && String(eventIdRaw).trim() !== ""
+          ? Number(eventIdRaw)
+          : undefined;
+
+      let recordedByMemberId: number | undefined;
+      let recordedByMemberOnline = false;
+      if (canOrganizerViewAllPayments(memberRole)) {
+        const sellerFilter = String(req.query.sellerFilter ?? "").trim();
+        if (sellerFilter === "online") {
+          recordedByMemberOnline = true;
+        } else if (sellerFilter && sellerFilter !== "all") {
+          const parsed = Number(sellerFilter);
+          if (Number.isFinite(parsed) && parsed > 0) {
+            recordedByMemberId = parsed;
+          }
+        } else {
+          const legacyRaw = req.query.recordedByMemberId;
+          if (legacyRaw != null && String(legacyRaw).trim() !== "") {
+            const parsed = Number(legacyRaw);
+            if (Number.isFinite(parsed) && parsed > 0) {
+              recordedByMemberId = parsed;
+            }
+          }
+        }
+      } else {
+        recordedByMemberId = req.auth!.id;
+      }
+
+      const result = await listAdminPayments(pool, {
+        q: q || undefined,
+        status: status || undefined,
+        provider: provider || undefined,
+        organizerId,
+        eventId: Number.isFinite(eventId!) ? eventId : undefined,
+        recordedByMemberId,
+        recordedByMemberOnline,
+        page: req.query.page,
+        limit: req.query.limit,
+        sortBy: req.query.sortBy,
+        sortDir: req.query.sortDir,
+      });
+      res.json(result);
+    },
+  );
+
+  app.get(
+    "/api/organizer/payments/seller-summary",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json({ error: "Organizer context missing" });
+      }
+      const memberRole = await getOrganizerMemberRole(
+        pool,
+        req.auth!.id,
+        organizerId,
+      );
+      if (!memberRole || !canOrganizerViewSellerSalesSummary(memberRole)) {
+        return res.status(403).json({ error: "Insufficient permissions" });
+      }
+      const summary = await listOrganizerSellerSalesSummary(pool, organizerId);
+      res.json(summary);
+    },
+  );
+
+  app.get(
+    "/api/organizer/payments/:paymentId",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json({ error: "Organizer context missing" });
+      }
+      const memberRole = await getOrganizerMemberRole(
+        pool,
+        req.auth!.id,
+        organizerId,
+      );
+      if (!memberRole || !canOrganizerViewPayments(memberRole)) {
+        return res
+          .status(403)
+          .json({ error: "Insufficient permissions for payments" });
+      }
+
+      const paymentId = Number(req.params.paymentId);
+      if (!Number.isFinite(paymentId)) {
+        return res.status(400).json({ error: "Invalid payment id" });
+      }
+      const payment = await fetchAdminPaymentDetail(pool, paymentId, {
+        organizerId,
+      });
+      if (!payment) {
+        return res.status(404).json({ error: "Payment not found" });
+      }
+      if (
+        !canOrganizerViewAllPayments(memberRole) &&
+        Number(
+          (payment as { recorded_by_member_id?: number | null })
+            .recorded_by_member_id,
+        ) !== Number(req.auth!.id)
+      ) {
+        return res.status(404).json({ error: "Payment not found" });
+      }
+      res.json({ payment });
+    },
+  );
+
+  app.post(
+    "/api/organizer/payments/:paymentId/refund",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json({ error: "Organizer context missing" });
+      }
+      const memberRole = await getOrganizerMemberRole(
+        pool,
+        req.auth!.id,
+        organizerId,
+      );
+      if (
+        !memberRole ||
+        !["owner", "finance", "organizer"].includes(memberRole)
+      ) {
+        return res
+          .status(403)
+          .json({ error: "Insufficient permissions for refunds" });
+      }
+
+      const paymentId = Number(req.params.paymentId);
+      if (!Number.isFinite(paymentId)) {
+        return res.status(400).json({ error: "Invalid payment id" });
+      }
+      if (!processPaymentRefund) {
+        return res.status(503).json({ error: "Refunds are not configured" });
+      }
+
+      const payment = await fetchAdminPaymentDetail(pool, paymentId, {
+        organizerId,
+      });
+      if (!payment) {
+        return res.status(404).json({ error: "Payment not found" });
+      }
+
+      const reason = req.body?.reason
+        ? String(req.body.reason).slice(0, 500)
+        : undefined;
+      try {
+        await processPaymentRefund({
+          paymentId,
+          requestedByType: "organizer_member",
+          requestedById: req.auth!.id,
+          organizerId,
+          reason,
+        });
+        const refreshed = await fetchAdminPaymentDetail(pool, paymentId, {
+          organizerId,
+        });
+        res.json({ ok: true, payment: refreshed });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Refund failed";
+        res.status(400).json({ error: message });
+      }
+    },
+  );
+
+  // ── Admin: athlete detail / suspend ──────────────────────────────────────
+  app.get(
+    "/api/admin/athletes/:athleteId",
+    requireAdmin,
+    async (req: AuthedRequest, res) => {
+      const athleteId = Number(req.params.athleteId);
+      if (!Number.isFinite(athleteId)) {
+        return res.status(400).json({ error: "Invalid athlete id" });
+      }
+
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT a.id, a.email, a.phone, a.first_name, a.last_name, a.city, a.country,
+                a.status, a.date_of_birth, a.gender, a.shirt_size, a.created_at, a.last_login_at,
+                (SELECT COUNT(*) FROM registrations r
+                 WHERE r.athlete_id = a.id AND r.status = 'confirmed' AND r.deleted_at IS NULL) AS registration_count
+         FROM athletes a
+         WHERE a.id = ? AND a.deleted_at IS NULL LIMIT 1`,
+        [athleteId],
+      );
+      if (rows.length === 0) {
+        return res.status(404).json({ error: "Athlete not found" });
+      }
+
+      const [regs] = await pool.query<RowDataPacket[]>(
+        `SELECT r.id, r.registration_number, r.status, r.total_cents, r.created_at,
+          e.id AS event_id, e.title AS event_title, e.slug AS event_slug
+   FROM registrations r
+   JOIN events e ON e.id = r.event_id
+   WHERE r.athlete_id = ? AND r.deleted_at IS NULL
+   ORDER BY r.created_at DESC LIMIT 20`,
+        [athleteId],
+      );
+
+      res.json({ athlete: rows[0], registrations: regs });
+    },
+  );
+
+  app.patch(
+    "/api/admin/athletes/:athleteId",
+    requireAdmin,
+    async (req: AuthedRequest, res) => {
+      const athleteId = Number(req.params.athleteId);
+      const status = String(req.body?.status ?? "").trim();
+      if (!["active", "suspended"].includes(status)) {
+        return res
+          .status(400)
+          .json({ error: "status must be active or suspended" });
+      }
+
+      const [result] = await pool.query<ResultSetHeader>(
+        "UPDATE athletes SET status = ? WHERE id = ? AND deleted_at IS NULL",
+        [status, athleteId],
+      );
+      if (result.affectedRows === 0) {
+        return res.status(404).json({ error: "Athlete not found" });
+      }
+
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT id, email, phone, first_name, last_name, city, country, status, created_at
+         FROM athletes WHERE id = ? LIMIT 1`,
+        [athleteId],
+      );
+      res.json({ athlete: rows[0] });
+    },
+  );
+
+  // ── Admin: event detail / publish ────────────────────────────────────────
+  app.get(
+    "/api/admin/events/:eventId",
+    requireAdmin,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!Number.isFinite(eventId)) {
+        return res.status(400).json({ error: "Invalid event id" });
+      }
+      const event = await fetchStaffEventDetail(pool, eventId);
+      if (!event) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const categories = await fetchEventCategories(pool, eventId);
+      const paymentAvailability = await attachEventPaymentAvailability(
+        pool,
+        {
+          id: eventId,
+          status: String(event.status),
+          organizer_id: Number(event.organizer_id),
+        },
+        getStripeClient?.() ?? null,
+      );
+      res.json({
+        event: { ...event, ...paymentAvailability },
+        categories,
+        extras: await fetchAllEventExtras(pool, eventId),
+      });
+    },
+  );
+
+  app.patch(
+    "/api/admin/events/:eventId",
+    requireAdmin,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      const event = await fetchStaffEventDetail(pool, eventId);
+      if (!event) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+
+      const parsed = parseEventBody(
+        (req.body ?? {}) as Record<string, unknown>,
+      );
+      if ("error" in parsed) {
+        return res.status(400).json({ error: parsed.error });
+      }
+      const { data } = parsed;
+      const currentStatus = String(event.status ?? "");
+      if (
+        data.status === "published" &&
+        currentStatus !== "published"
+      ) {
+        return res.status(400).json({
+          error:
+            "Use POST /api/admin/events/:eventId/publish to publish an event",
+          code: "admin_publish_requires_publish_endpoint",
+        });
+      }
+      if (
+        data.subdomain !== undefined &&
+        data.subdomain !== "" &&
+        data.subdomain !==
+          normalizeEventSubdomain(String(event.subdomain ?? ""))
+      ) {
+        return res.status(400).json({
+          error: "subdomain cannot be changed after create",
+          code: "subdomain_immutable",
+        });
+      }
+
+      let slug = data.slug ? slugify(data.slug) : undefined;
+      if (slug) {
+        slug = await uniqueEventSlug(pool, slug, eventId);
+      }
+
+      await pool.query<ResultSetHeader>(
+        `UPDATE events SET
+           title = ?, sport_type_id = ?,
+           ${slug ? "slug = ?," : ""}
+           short_description = ?, description = ?, status = ?, visibility = ?,
+           featured = ?, start_date = ?, end_date = ?,
+           registration_opens_at = ?, registration_closes_at = ?,
+           check_in_opens_at = ?, check_in_closes_at = ?,
+           requires_waiver = ?, fee_presentation = ?, msi_enabled = ?, manual_sales_enabled = ?, auto_deactivate_after_event = ?,
+           ${eventBodySqlTail()}
+         WHERE id = ?`,
+        [
+          data.title,
+          data.sport_type_id,
+          ...(slug ? [slug] : []),
+          data.short_description,
+          data.description,
+          data.status,
+          data.visibility,
+          data.featured ? 1 : 0,
+          data.start_date,
+          data.end_date,
+          data.registration_opens_at,
+          data.registration_closes_at,
+          data.check_in_opens_at,
+          data.check_in_closes_at,
+          data.requires_waiver ? 1 : 0,
+          data.fee_presentation,
+          data.msi_enabled ? 1 : 0,
+          data.manual_sales_enabled ? 1 : 0,
+          data.auto_deactivate_after_event ? 1 : 0,
+          ...eventBodySqlValues(data),
+          eventId,
+        ],
+      );
+
+      res.json({
+        event: await fetchStaffEventDetail(pool, eventId),
+        categories: await fetchEventCategories(pool, eventId),
+      });
+    },
+  );
+
+  app.post(
+    "/api/admin/events/:eventId/deactivate-listing",
+    requireAdmin,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!Number.isFinite(eventId)) {
+        return res.status(400).json({ error: "Invalid event id" });
+      }
+      const result = await deactivateEventFromListing(pool, eventId);
+      if ("error" in result) {
+        return res.status(404).json({ error: result.error });
+      }
+      res.json({ ok: true, event: await fetchStaffEventDetail(pool, eventId) });
+    },
+  );
+
+  app.delete(
+    "/api/admin/events/:eventId",
+    requireAdmin,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!Number.isFinite(eventId)) {
+        return res.status(400).json({ error: "Invalid event id" });
+      }
+      const result = await softDeleteStaffEvent(pool, eventId);
+      if ("error" in result) {
+        return res.status(404).json({ error: result.error });
+      }
+      res.json({
+        ok: true,
+        cancelledRegistrations: result.cancelledRegistrations,
+      });
+    },
+  );
+
+  app.post(
+    "/api/admin/events/:eventId/publish",
+    requireAdmin,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      const event = await fetchStaffEventDetail(pool, eventId);
+      if (!event) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      if (Number(event.is_simulation) === 1) {
+        return res.status(400).json({
+          error: "Simulation events cannot be published",
+          code: "simulation_not_publishable",
+        });
+      }
+      if (String(event.status) !== "pending_approval") {
+        return res.status(400).json({
+          error: "Only events pending approval can be published by admin",
+        });
+      }
+
+      const categories = await fetchEventCategories(pool, eventId);
+      if (categories.filter((c) => c.is_active).length === 0) {
+        return res.status(400).json({
+          error: "Add at least one active category before publishing",
+        });
+      }
+
+      const waiverCheck = await validateEventPublishWaivers(pool, eventId);
+      if ("error" in waiverCheck) {
+        return res.status(400).json({ error: waiverCheck.error });
+      }
+
+      const siteLegalCheck = await validateOrganizerSiteLegalReady(
+        pool,
+        Number(event.organizer_id),
+        "es",
+      );
+      if (siteLegalCheck.ok === false) {
+        return res.status(400).json({
+          error: siteLegalCheck.error,
+          code: siteLegalCheck.code,
+          missing: siteLegalCheck.missing,
+        });
+      }
+
+      const pricingCheck = await validateEventPublishPricing(
+        pool,
+        eventId,
+        categories,
+      );
+      if (pricingCheck.ok === false) {
+        return res.status(400).json({ error: pricingCheck.error });
+      }
+
+      if (await eventHasPaidActiveCategories(pool, eventId)) {
+        const organizerId = Number(event.organizer_id);
+        const payoutCheck = await assertOrganizerPayoutReadyForPaidEvent(
+          pool,
+          organizerId,
+          getStripeClient?.() ?? null,
+        );
+        if (payoutCheck.ok === false) {
+          return res.status(403).json({
+            error: payoutCheck.message,
+            code: payoutCheck.code,
+          });
+        }
+      }
+
+      await pool.query<ResultSetHeader>(
+        `UPDATE events SET status = 'published', submitted_for_approval_at = NULL,
+                approval_rejection_reason = NULL
+         WHERE id = ?`,
+        [eventId],
+      );
+
+      const eventTitle = String(event.title);
+      const organizerId = Number(event.organizer_id);
+      void notifyOrganizerEditors(organizerId, (firstName, locale) =>
+        buildEventApprovedEmail({
+          locale,
+          firstName,
+          eventTitle,
+          appUrl,
+          eventId,
+        }),
+      );
+      void sendPayoutSetupNudgeIfNeeded(organizerId, eventTitle);
+
+      res.json({
+        event: await fetchStaffEventDetail(pool, eventId),
+        categories: await fetchEventCategories(pool, eventId),
+      });
+    },
+  );
+
+  app.post(
+    "/api/admin/events/:eventId/reject",
+    requireAdmin,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      const event = await fetchStaffEventDetail(pool, eventId);
+      if (!event) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      if (String(event.status) !== "pending_approval") {
+        return res
+          .status(400)
+          .json({ error: "Only pending approval events can be rejected" });
+      }
+
+      const reason = req.body?.reason
+        ? String(req.body.reason).trim().slice(0, 500)
+        : null;
+
+      await pool.query<ResultSetHeader>(
+        `UPDATE events SET status = 'draft', submitted_for_approval_at = NULL,
+                approval_rejection_reason = ?
+         WHERE id = ?`,
+        [reason, eventId],
+      );
+
+      const eventTitle = String(event.title);
+      const organizerId = Number(event.organizer_id);
+      void notifyOrganizerEditors(organizerId, (firstName, locale) =>
+        buildEventRejectedEmail({
+          locale,
+          firstName,
+          eventTitle,
+          reason,
+          appUrl,
+          eventId,
+        }),
+      );
+
+      res.json({
+        ok: true,
+        event: await fetchStaffEventDetail(pool, eventId),
+        categories: await fetchEventCategories(pool, eventId),
+        reason,
+      });
+    },
+  );
+
+  app.get(
+    "/api/admin/analytics/timeseries",
+    requireAdmin,
+    async (_req, res) => {
+      const timeSeries = await analyticsTimeSeries(pool);
+      res.json(timeSeries);
+    },
+  );
+
+  // ── Organizer: schedule waves ──────────────────────────────────────────────
+  app.get(
+    "/api/organizer/events/:eventId/schedule-waves",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json({ error: "Organizer context missing" });
+      }
+      const eventId = Number(req.params.eventId);
+      if (
+        !(await assertMemberCanAccessEvent(
+          pool,
+          req.auth!.id,
+          organizerId,
+          eventId,
+        ))
+      ) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT id, event_category_id, name, starts_at, capacity, ${WAVE_REGISTERED_COUNT_SQL} AS registered_count, sort_order
+         FROM event_schedule_waves WHERE event_id = ? ORDER BY sort_order ASC, starts_at ASC`,
+        [eventId],
+      );
+      res.json({ waves: rows });
+    },
+  );
+
+  app.put(
+    "/api/organizer/events/:eventId/schedule-waves",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await guardOrganizerEventEditor(req, res, eventId))) return;
+
+      const raw = req.body?.waves;
+      if (!Array.isArray(raw)) {
+        return res.status(400).json({ error: "waves array required" });
+      }
+
+      const waves = raw
+        .map((w: Record<string, unknown>, index: number) => {
+          const name = String(w.name ?? "").trim();
+          const starts_at = String(w.starts_at ?? "").trim();
+          if (!name || !starts_at) return null;
+          const startsAtDate = new Date(starts_at);
+          if (Number.isNaN(startsAtDate.getTime())) return null;
+          const event_category_id =
+            w.event_category_id != null && Number(w.event_category_id) > 0
+              ? Number(w.event_category_id)
+              : null;
+          const capacity =
+            w.capacity != null && w.capacity !== ""
+              ? Math.max(0, Number(w.capacity))
+              : null;
+          return {
+            name: name.slice(0, 100),
+            starts_at: startsAtDate
+              .toISOString()
+              .slice(0, 19)
+              .replace("T", " "),
+            event_category_id,
+            capacity,
+            sort_order: Number(w.sort_order) || index,
+          };
+        })
+        .filter(Boolean) as Array<{
+        name: string;
+        starts_at: string;
+        event_category_id: number | null;
+        capacity: number | null;
+        sort_order: number;
+      }>;
+
+      const conn = await pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        await conn.query(
+          "DELETE FROM event_schedule_waves WHERE event_id = ?",
+          [eventId],
+        );
+        for (const w of waves) {
+          await conn.query<ResultSetHeader>(
+            `INSERT INTO event_schedule_waves (
+               event_id, event_category_id, name, starts_at, capacity, sort_order
+             ) VALUES (?,?,?,?,?,?)`,
+            [
+              eventId,
+              w.event_category_id,
+              w.name,
+              w.starts_at,
+              w.capacity,
+              w.sort_order,
+            ],
+          );
+        }
+        await conn.commit();
+      } catch (err) {
+        await conn.rollback();
+        throw err;
+      } finally {
+        conn.release();
+      }
+
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT id, event_category_id, name, starts_at, capacity, ${WAVE_REGISTERED_COUNT_SQL} AS registered_count, sort_order
+         FROM event_schedule_waves WHERE event_id = ? ORDER BY sort_order ASC, starts_at ASC`,
+        [eventId],
+      );
+      res.json({ waves: rows });
+    },
+  );
+
+  // ── Organizer: course map ──────────────────────────────────────────────────
+  app.get(
+    "/api/organizer/events/:eventId/course",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json({ error: "Organizer context missing" });
+      }
+      const eventId = Number(req.params.eventId);
+      if (
+        !(await assertMemberCanAccessEvent(
+          pool,
+          req.auth!.id,
+          organizerId,
+          eventId,
+        ))
+      ) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT route_geojson, points_json, distance_km, elevation_gain_m, elevation_profile_json
+         FROM event_courses WHERE event_id = ? LIMIT 1`,
+        [eventId],
+      );
+      const row = rows[0];
+      if (!row) {
+        return res.json({ course: null });
+      }
+
+      res.json({
+        course: mapCourseRowFromDb(row),
+      });
+    },
+  );
+
+  app.put(
+    "/api/organizer/events/:eventId/course",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await guardOrganizerEventEditor(req, res, eventId))) return;
+
+      const routeGeojson = req.body?.routeGeojson;
+      const points = req.body?.points;
+      if (!routeGeojson || !Array.isArray(points)) {
+        return res
+          .status(400)
+          .json({ error: "routeGeojson and points array required" });
+      }
+
+      const courseValidation = validateCoursePayload({
+        routeGeojson,
+        points,
+        distanceKm: req.body?.distanceKm,
+        elevationGainM: req.body?.elevationGainM,
+        elevationProfile: req.body?.elevationProfile,
+      });
+      if (courseValidation.ok === false) {
+        return res.status(400).json({ error: courseValidation.error });
+      }
+
+      const distanceKm =
+        req.body?.distanceKm != null && req.body.distanceKm !== ""
+          ? Number(req.body.distanceKm)
+          : null;
+      const elevationGainM =
+        req.body?.elevationGainM != null && req.body.elevationGainM !== ""
+          ? Math.max(0, Number(req.body.elevationGainM))
+          : null;
+      const elevationProfile =
+        req.body?.elevationProfile != null ? req.body.elevationProfile : null;
+
+      await pool.query<ResultSetHeader>(
+        `INSERT INTO event_courses (event_id, route_geojson, points_json, distance_km, elevation_gain_m, elevation_profile_json)
+         VALUES (?,?,?,?,?,?)
+         ON DUPLICATE KEY UPDATE
+           route_geojson = VALUES(route_geojson),
+           points_json = VALUES(points_json),
+           distance_km = VALUES(distance_km),
+           elevation_gain_m = VALUES(elevation_gain_m),
+           elevation_profile_json = VALUES(elevation_profile_json),
+           updated_at = NOW()`,
+        [
+          eventId,
+          JSON.stringify(routeGeojson),
+          JSON.stringify(points),
+          distanceKm,
+          elevationGainM,
+          elevationProfile ? JSON.stringify(elevationProfile) : null,
+        ],
+      );
+
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT route_geojson, points_json, distance_km, elevation_gain_m, elevation_profile_json
+         FROM event_courses WHERE event_id = ? LIMIT 1`,
+        [eventId],
+      );
+      const row = rows[0];
+      res.json({
+        course: mapCourseRowFromDb(row),
+      });
+    },
+  );
+
+  // ── Organizer: discount codes ──────────────────────────────────────────────
+  app.get(
+    "/api/organizer/events/:eventId/discount-codes",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json({ error: "Organizer context missing" });
+      }
+      const eventId = Number(req.params.eventId);
+      if (
+        !(await assertMemberCanAccessEvent(
+          pool,
+          req.auth!.id,
+          organizerId,
+          eventId,
+        ))
+      ) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT id, event_id, code, description, discount_type, discount_value, applies_to,
+                max_uses, ${DISCOUNT_USED_COUNT_SQL} AS used_count, min_purchase_cents, valid_from, valid_until, is_active, created_at
+         FROM discount_codes
+         WHERE event_id = ? AND organizer_id = ?
+         ORDER BY created_at DESC`,
+        [eventId, organizerId],
+      );
+      res.json({ discountCodes: rows });
+    },
+  );
+
+  app.post(
+    "/api/organizer/events/:eventId/discount-codes",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json({ error: "Organizer context missing" });
+      }
+      const eventId = Number(req.params.eventId);
+      if (!(await guardOrganizerEventEditor(req, res, eventId))) return;
+
+      const code = String(req.body?.code ?? "")
+        .trim()
+        .toUpperCase()
+        .slice(0, 40);
+      const discount_value = Number(req.body?.discount_value);
+      if (!code || !Number.isFinite(discount_value) || discount_value <= 0) {
+        return res
+          .status(400)
+          .json({ error: "code and discount_value required" });
+      }
+
+      const discount_type = String(req.body?.discount_type ?? "percent");
+      if (!["percent", "fixed_cents"].includes(discount_type)) {
+        return res.status(400).json({ error: "Invalid discount_type" });
+      }
+      if (discount_type === "percent" && discount_value > 100) {
+        return res
+          .status(400)
+          .json({ error: "Percent discount cannot exceed 100" });
+      }
+
+      const applies_to = String(req.body?.applies_to ?? "registration");
+      if (!["registration", "service_fee", "total"].includes(applies_to)) {
+        return res.status(400).json({ error: "Invalid applies_to" });
+      }
+
+      try {
+        const [result] = await pool.query<ResultSetHeader>(
+          `INSERT INTO discount_codes (
+             event_id, organizer_id, code, description, discount_type, discount_value,
+             applies_to, max_uses, min_purchase_cents, valid_from, valid_until, is_active
+           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,1)`,
+          [
+            eventId,
+            organizerId,
+            code,
+            req.body?.description
+              ? String(req.body.description).slice(0, 255)
+              : null,
+            discount_type,
+            Math.round(discount_value),
+            applies_to,
+            req.body?.max_uses != null
+              ? Math.max(0, Number(req.body.max_uses))
+              : null,
+            req.body?.min_purchase_cents != null
+              ? Math.max(0, Number(req.body.min_purchase_cents))
+              : null,
+            req.body?.valid_from || null,
+            req.body?.valid_until || null,
+          ],
+        );
+
+        const [rows] = await pool.query<RowDataPacket[]>(
+          `SELECT id, event_id, code, description, discount_type, discount_value, applies_to,
+                  max_uses, ${DISCOUNT_USED_COUNT_SQL} AS used_count, min_purchase_cents, valid_from, valid_until, is_active, created_at
+           FROM discount_codes WHERE id = ? LIMIT 1`,
+          [result.insertId],
+        );
+        res.status(201).json({ discountCode: rows[0] });
+      } catch (err: unknown) {
+        const mysqlErr = err as { code?: string };
+        if (mysqlErr.code === "ER_DUP_ENTRY") {
+          return res
+            .status(409)
+            .json({ error: "Discount code already exists for this event" });
+        }
+        throw err;
+      }
+    },
+  );
+
+  app.patch(
+    "/api/organizer/events/:eventId/discount-codes/:codeId",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json({ error: "Organizer context missing" });
+      }
+      const eventId = Number(req.params.eventId);
+      const codeId = Number(req.params.codeId);
+      if (!(await guardOrganizerEventEditor(req, res, eventId))) return;
+
+      const [existing] = await pool.query<RowDataPacket[]>(
+        `SELECT id FROM discount_codes
+         WHERE id = ? AND event_id = ? AND organizer_id = ? LIMIT 1`,
+        [codeId, eventId, organizerId],
+      );
+      if (existing.length === 0) {
+        return res.status(404).json({ error: "Discount code not found" });
+      }
+
+      const updates: string[] = [];
+      const params: unknown[] = [];
+
+      if (req.body?.description !== undefined) {
+        updates.push("description = ?");
+        params.push(
+          req.body.description
+            ? String(req.body.description).slice(0, 255)
+            : null,
+        );
+      }
+      if (req.body?.discount_type != null) {
+        const dt = String(req.body.discount_type);
+        if (!["percent", "fixed_cents"].includes(dt)) {
+          return res.status(400).json({ error: "Invalid discount_type" });
+        }
+        updates.push("discount_type = ?");
+        params.push(dt);
+      }
+      if (req.body?.discount_value != null) {
+        const dv = Math.round(Number(req.body.discount_value));
+        if (!Number.isFinite(dv) || dv <= 0) {
+          return res.status(400).json({ error: "Invalid discount_value" });
+        }
+        updates.push("discount_value = ?");
+        params.push(dv);
+      }
+      if (req.body?.applies_to != null) {
+        const at = String(req.body.applies_to);
+        if (!["registration", "service_fee", "total"].includes(at)) {
+          return res.status(400).json({ error: "Invalid applies_to" });
+        }
+        updates.push("applies_to = ?");
+        params.push(at);
+      }
+      if (req.body?.max_uses !== undefined) {
+        updates.push("max_uses = ?");
+        params.push(
+          req.body.max_uses != null
+            ? Math.max(0, Number(req.body.max_uses))
+            : null,
+        );
+      }
+      if (req.body?.min_purchase_cents !== undefined) {
+        updates.push("min_purchase_cents = ?");
+        params.push(
+          req.body.min_purchase_cents != null
+            ? Math.max(0, Number(req.body.min_purchase_cents))
+            : null,
+        );
+      }
+      if (req.body?.valid_from !== undefined) {
+        updates.push("valid_from = ?");
+        params.push(req.body.valid_from || null);
+      }
+      if (req.body?.valid_until !== undefined) {
+        updates.push("valid_until = ?");
+        params.push(req.body.valid_until || null);
+      }
+      if (req.body?.is_active !== undefined) {
+        updates.push("is_active = ?");
+        params.push(req.body.is_active ? 1 : 0);
+      }
+
+      if (updates.length === 0) {
+        return res.status(400).json({ error: "No fields to update" });
+      }
+
+      params.push(codeId);
+      await pool.query<ResultSetHeader>(
+        `UPDATE discount_codes SET ${updates.join(", ")} WHERE id = ?`,
+        params,
+      );
+
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT id, event_id, code, description, discount_type, discount_value, applies_to,
+                max_uses, ${DISCOUNT_USED_COUNT_SQL} AS used_count, min_purchase_cents, valid_from, valid_until, is_active, created_at
+         FROM discount_codes WHERE id = ? LIMIT 1`,
+        [codeId],
+      );
+      res.json({ discountCode: rows[0] });
+    },
+  );
+
+  app.delete(
+    "/api/organizer/events/:eventId/discount-codes/:codeId",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json({ error: "Organizer context missing" });
+      }
+      const eventId = Number(req.params.eventId);
+      const codeId = Number(req.params.codeId);
+      if (!(await guardOrganizerEventEditor(req, res, eventId))) return;
+
+      const [result] = await pool.query<ResultSetHeader>(
+        `DELETE FROM discount_codes
+         WHERE id = ? AND event_id = ? AND organizer_id = ?`,
+        [codeId, eventId, organizerId],
+      );
+      if (result.affectedRows === 0) {
+        return res.status(404).json({ error: "Discount code not found" });
+      }
+      res.json({ ok: true });
+    },
+  );
+
+  // ── Organizer: waitlist ────────────────────────────────────────────────────
+  app.get(
+    "/api/organizer/events/:eventId/waitlist",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json({ error: "Organizer context missing" });
+      }
+      const eventId = Number(req.params.eventId);
+      if (
+        !(await assertMemberCanAccessEvent(
+          pool,
+          req.auth!.id,
+          organizerId,
+          eventId,
+        ))
+      ) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT w.id, w.event_id, w.event_category_id, w.athlete_id, w.status, w.position,
+                w.offered_at, w.offer_expires_at, w.created_at,
+                ec.name AS category_name,
+                a.first_name AS athlete_first_name, a.last_name AS athlete_last_name,
+                a.email AS athlete_email
+         FROM waitlist_entries w
+         JOIN event_categories ec ON ec.id = w.event_category_id
+         JOIN athletes a ON a.id = w.athlete_id
+         WHERE w.event_id = ?
+         ORDER BY w.event_category_id ASC, w.position ASC, w.created_at ASC`,
+        [eventId],
+      );
+      res.json({ entries: rows });
+    },
+  );
+
+  app.post(
+    "/api/organizer/events/:eventId/waitlist/offer",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await guardOrganizerEventEditor(req, res, eventId))) return;
+
+      const waitlistEntryId = Number(req.body?.waitlistEntryId);
+      const offerExpiresHours = Math.min(
+        168,
+        Math.max(1, Number(req.body?.offerExpiresHours ?? 24) || 24),
+      );
+
+      if (!Number.isFinite(waitlistEntryId)) {
+        return res.status(400).json({ error: "waitlistEntryId required" });
+      }
+
+      const [entryRows] = await pool.query<RowDataPacket[]>(
+        `SELECT w.id, w.event_id, w.event_category_id, w.athlete_id, w.status,
+                e.title AS event_title, e.slug AS event_slug,
+                ec.name AS category_name,
+                a.email AS athlete_email, a.first_name AS athlete_first_name,
+                a.preferred_language
+         FROM waitlist_entries w
+         JOIN events e ON e.id = w.event_id
+         JOIN event_categories ec ON ec.id = w.event_category_id
+         JOIN athletes a ON a.id = w.athlete_id
+         WHERE w.id = ? AND w.event_id = ? LIMIT 1`,
+        [waitlistEntryId, eventId],
+      );
+      if (entryRows.length === 0) {
+        return res.status(404).json({ error: "Waitlist entry not found" });
+      }
+      const entry = entryRows[0];
+      if (entry.status !== "waiting") {
+        return res
+          .status(409)
+          .json({ error: "Entry is not in waiting status" });
+      }
+
+      await pool.query<ResultSetHeader>(
+        `UPDATE waitlist_entries
+         SET status = 'offered', offered_at = NOW(),
+             offer_expires_at = DATE_ADD(NOW(), INTERVAL ? HOUR)
+         WHERE id = ?`,
+        [offerExpiresHours, waitlistEntryId],
+      );
+
+      const athleteEmail = entry.athlete_email as string | null;
+      if (athleteEmail) {
+        const locale = entry.preferred_language === "en" ? "en" : "es";
+        const eventUrl = `${appUrl}/events/${entry.event_slug}`;
+        const subject =
+          locale === "en"
+            ? `Spot available: ${entry.event_title}`
+            : `Cupo disponible: ${entry.event_title}`;
+        const body =
+          locale === "en"
+            ? `Hi ${entry.athlete_first_name},\n\nA spot has opened for ${entry.category_name} at ${entry.event_title}. Register within ${offerExpiresHours} hours:\n${eventUrl}`
+            : `Hola ${entry.athlete_first_name},\n\nSe abrió un cupo para ${entry.category_name} en ${entry.event_title}. Regístrate en las próximas ${offerExpiresHours} horas:\n${eventUrl}`;
+
+        await pool.query<ResultSetHeader>(
+          `INSERT INTO notification_queue (
+             recipient_type, recipient_id, channel, to_address, subject, body, payload_json
+           ) VALUES ('athlete', ?, 'email', ?, ?, ?, ?)`,
+          [
+            entry.athlete_id,
+            athleteEmail,
+            subject,
+            body,
+            JSON.stringify({
+              type: "waitlist_offer",
+              waitlist_entry_id: waitlistEntryId,
+              event_id: eventId,
+              event_slug: entry.event_slug,
+            }),
+          ],
+        );
+
+        void sendEmail({
+          to: athleteEmail,
+          subject,
+          text: body,
+          html: body.replace(/\n/g, "<br>"),
+        }).catch((err) => console.error("[email:waitlist-offer]", err));
+      }
+
+      const [updated] = await pool.query<RowDataPacket[]>(
+        `SELECT id, event_id, event_category_id, athlete_id, status, position,
+                offered_at, offer_expires_at, created_at
+         FROM waitlist_entries WHERE id = ? LIMIT 1`,
+        [waitlistEntryId],
+      );
+      res.json({ ok: true, entry: updated[0] });
+    },
+  );
+
+  app.post(
+    "/api/organizer/events/:eventId/waitlist/revoke",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await guardOrganizerEventEditor(req, res, eventId))) return;
+
+      const waitlistEntryId = Number(req.body?.waitlistEntryId);
+      if (!Number.isFinite(waitlistEntryId)) {
+        return res.status(400).json({ error: "waitlistEntryId required" });
+      }
+
+      const [result] = await pool.query<ResultSetHeader>(
+        `UPDATE waitlist_entries
+         SET status = 'cancelled', offered_at = NULL, offer_expires_at = NULL
+         WHERE id = ? AND event_id = ? AND status IN ('waiting', 'offered')`,
+        [waitlistEntryId, eventId],
+      );
+      if (result.affectedRows === 0) {
+        return res
+          .status(404)
+          .json({ error: "Waitlist entry not found or already resolved" });
+      }
+
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT w.id, w.event_id, w.event_category_id, w.athlete_id, w.status, w.position,
+                w.offered_at, w.offer_expires_at, w.created_at,
+                ec.name AS category_name,
+                a.first_name AS athlete_first_name, a.last_name AS athlete_last_name,
+                a.email AS athlete_email
+         FROM waitlist_entries w
+         JOIN event_categories ec ON ec.id = w.event_category_id
+         JOIN athletes a ON a.id = w.athlete_id
+         WHERE w.event_id = ?
+         ORDER BY w.event_category_id ASC, w.position ASC, w.created_at ASC`,
+        [eventId],
+      );
+      res.json({ ok: true, entries: rows });
+    },
+  );
+
+  // ── Organizer: event media ───────────────────────────────────────────────────
+  app.get(
+    "/api/organizer/events/:eventId/media",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json({ error: "Organizer context missing" });
+      }
+      const eventId = Number(req.params.eventId);
+      if (
+        !(await assertMemberCanAccessEvent(
+          pool,
+          req.auth!.id,
+          organizerId,
+          eventId,
+        ))
+      ) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT id, public_uuid, asset_type, url, alt_text, mime_type,
+                file_size_bytes, width_px, height_px, sort_order, is_primary
+         FROM media_assets
+         WHERE entity_type = 'event' AND entity_id = ? AND deleted_at IS NULL
+         ORDER BY sort_order ASC, id ASC`,
+        [eventId],
+      );
+      res.json({ media: rows });
+    },
+  );
+
+  app.put(
+    "/api/organizer/events/:eventId/media",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await guardOrganizerEventEditor(req, res, eventId))) return;
+
+      const raw = req.body?.media;
+      if (!Array.isArray(raw)) {
+        return res.status(400).json({ error: "media array required" });
+      }
+
+      const validAssetTypes = new Set([
+        "hero",
+        "banner",
+        "logo",
+        "gallery",
+        "document",
+        "route_map",
+        "other",
+      ]);
+
+      const mediaItems = raw
+        .map((m: Record<string, unknown>, index: number) => {
+          const url = String(m.url ?? "").trim();
+          if (!url) return null;
+          const asset_type = String(m.asset_type ?? "other");
+          if (!validAssetTypes.has(asset_type)) return null;
+          return {
+            asset_type,
+            url: url.slice(0, 1000),
+            alt_text: m.alt_text
+              ? String(m.alt_text).trim().slice(0, 255)
+              : null,
+            mime_type: m.mime_type
+              ? String(m.mime_type).trim().slice(0, 100)
+              : null,
+            file_size_bytes:
+              m.file_size_bytes != null
+                ? Number(m.file_size_bytes) || null
+                : null,
+            width_px: m.width_px != null ? Number(m.width_px) || null : null,
+            height_px: m.height_px != null ? Number(m.height_px) || null : null,
+            sort_order: Number(m.sort_order) || index,
+            is_primary: m.is_primary ? 1 : 0,
+          };
+        })
+        .filter(Boolean) as Array<{
+        asset_type: string;
+        url: string;
+        alt_text: string | null;
+        mime_type: string | null;
+        file_size_bytes: number | null;
+        width_px: number | null;
+        height_px: number | null;
+        sort_order: number;
+        is_primary: number;
+      }>;
+
+      const conn = await pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        await conn.query(
+          `UPDATE media_assets SET deleted_at = NOW()
+           WHERE entity_type = 'event' AND entity_id = ? AND deleted_at IS NULL`,
+          [eventId],
+        );
+        for (const item of mediaItems) {
+          await conn.query<ResultSetHeader>(
+            `INSERT INTO media_assets (
+               public_uuid, entity_type, entity_id, asset_type, url, alt_text, mime_type,
+               file_size_bytes, width_px, height_px, sort_order, is_primary
+             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+            [
+              newPublicUuid(),
+              "event",
+              eventId,
+              item.asset_type,
+              item.url,
+              item.alt_text,
+              item.mime_type,
+              item.file_size_bytes,
+              item.width_px,
+              item.height_px,
+              item.sort_order,
+              item.is_primary,
+            ],
+          );
+        }
+        await conn.commit();
+      } catch (err) {
+        await conn.rollback();
+        throw err;
+      } finally {
+        conn.release();
+      }
+
+      const [saved] = await pool.query<RowDataPacket[]>(
+        `SELECT id, public_uuid, asset_type, url, alt_text, mime_type,
+                file_size_bytes, width_px, height_px, sort_order, is_primary
+         FROM media_assets
+         WHERE entity_type = 'event' AND entity_id = ? AND deleted_at IS NULL
+         ORDER BY sort_order ASC, id ASC`,
+        [eventId],
+      );
+      res.json({ media: saved });
+    },
+  );
+
+  // ── Admin: course / waves (mirror organizer, any event) ────────────────────
+  async function adminEventExists(eventId: number): Promise<boolean> {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      "SELECT id FROM events WHERE id = ? AND deleted_at IS NULL LIMIT 1",
+      [eventId],
+    );
+    return rows.length > 0;
+  }
+
+  app.get(
+    "/api/admin/events/:eventId/course",
+    requireAdmin,
+    async (req, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await adminEventExists(eventId))) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT route_geojson, points_json, distance_km, elevation_gain_m, elevation_profile_json
+       FROM event_courses WHERE event_id = ? LIMIT 1`,
+        [eventId],
+      );
+      const row = rows[0];
+      if (!row) return res.json({ course: null });
+      res.json({
+        course: mapCourseRowFromDb(row),
+      });
+    },
+  );
+
+  app.put(
+    "/api/admin/events/:eventId/course",
+    requireAdmin,
+    async (req, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await adminEventExists(eventId))) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const routeGeojson = req.body?.routeGeojson;
+      const points = req.body?.points;
+      if (!routeGeojson || !Array.isArray(points)) {
+        return res
+          .status(400)
+          .json({ error: "routeGeojson and points array required" });
+      }
+
+      const courseValidation = validateCoursePayload({
+        routeGeojson,
+        points,
+        distanceKm: req.body?.distanceKm,
+        elevationGainM: req.body?.elevationGainM,
+        elevationProfile: req.body?.elevationProfile,
+      });
+      if (courseValidation.ok === false) {
+        return res.status(400).json({ error: courseValidation.error });
+      }
+
+      const distanceKm =
+        req.body?.distanceKm != null && req.body.distanceKm !== ""
+          ? Number(req.body.distanceKm)
+          : null;
+      const elevationGainM =
+        req.body?.elevationGainM != null && req.body.elevationGainM !== ""
+          ? Math.max(0, Number(req.body.elevationGainM))
+          : null;
+      const elevationProfile =
+        req.body?.elevationProfile != null ? req.body.elevationProfile : null;
+      await pool.query<ResultSetHeader>(
+        `INSERT INTO event_courses (event_id, route_geojson, points_json, distance_km, elevation_gain_m, elevation_profile_json)
+       VALUES (?,?,?,?,?,?)
+       ON DUPLICATE KEY UPDATE
+         route_geojson = VALUES(route_geojson),
+         points_json = VALUES(points_json),
+         distance_km = VALUES(distance_km),
+         elevation_gain_m = VALUES(elevation_gain_m),
+         elevation_profile_json = VALUES(elevation_profile_json),
+         updated_at = NOW()`,
+        [
+          eventId,
+          JSON.stringify(routeGeojson),
+          JSON.stringify(points),
+          distanceKm,
+          elevationGainM,
+          elevationProfile ? JSON.stringify(elevationProfile) : null,
+        ],
+      );
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT route_geojson, points_json, distance_km, elevation_gain_m, elevation_profile_json
+       FROM event_courses WHERE event_id = ? LIMIT 1`,
+        [eventId],
+      );
+      const row = rows[0];
+      res.json({
+        course: mapCourseRowFromDb(row),
+      });
+    },
+  );
+
+  app.get(
+    "/api/admin/events/:eventId/schedule-waves",
+    requireAdmin,
+    async (req, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await adminEventExists(eventId))) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT id, event_category_id, name, starts_at, capacity, ${WAVE_REGISTERED_COUNT_SQL} AS registered_count, sort_order
+       FROM event_schedule_waves WHERE event_id = ? ORDER BY sort_order ASC, starts_at ASC`,
+        [eventId],
+      );
+      res.json({ waves: rows });
+    },
+  );
+
+  app.put(
+    "/api/admin/events/:eventId/schedule-waves",
+    requireAdmin,
+    async (req, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await adminEventExists(eventId))) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+
+      const raw = req.body?.waves;
+      if (!Array.isArray(raw)) {
+        return res.status(400).json({ error: "waves array required" });
+      }
+
+      const waves = raw
+        .map((w: Record<string, unknown>, index: number) => {
+          const name = String(w.name ?? "").trim();
+          const starts_at = String(w.starts_at ?? "").trim();
+          if (!name || !starts_at) return null;
+          const startsAtDate = new Date(starts_at);
+          if (Number.isNaN(startsAtDate.getTime())) return null;
+          const event_category_id =
+            w.event_category_id != null && Number(w.event_category_id) > 0
+              ? Number(w.event_category_id)
+              : null;
+          const capacity =
+            w.capacity != null && w.capacity !== ""
+              ? Math.max(0, Number(w.capacity))
+              : null;
+          return {
+            name: name.slice(0, 100),
+            starts_at: startsAtDate
+              .toISOString()
+              .slice(0, 19)
+              .replace("T", " "),
+            event_category_id,
+            capacity,
+            sort_order: Number(w.sort_order) || index,
+          };
+        })
+        .filter(Boolean) as Array<{
+        name: string;
+        starts_at: string;
+        event_category_id: number | null;
+        capacity: number | null;
+        sort_order: number;
+      }>;
+
+      const conn = await pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        await conn.query(
+          "DELETE FROM event_schedule_waves WHERE event_id = ?",
+          [eventId],
+        );
+        for (const w of waves) {
+          await conn.query<ResultSetHeader>(
+            `INSERT INTO event_schedule_waves (
+               event_id, event_category_id, name, starts_at, capacity, sort_order
+             ) VALUES (?,?,?,?,?,?)`,
+            [
+              eventId,
+              w.event_category_id,
+              w.name,
+              w.starts_at,
+              w.capacity,
+              w.sort_order,
+            ],
+          );
+        }
+        await conn.commit();
+      } catch (err) {
+        await conn.rollback();
+        throw err;
+      } finally {
+        conn.release();
+      }
+
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT id, event_category_id, name, starts_at, capacity, ${WAVE_REGISTERED_COUNT_SQL} AS registered_count, sort_order
+         FROM event_schedule_waves WHERE event_id = ? ORDER BY sort_order ASC, starts_at ASC`,
+        [eventId],
+      );
+      res.json({ waves: rows });
+    },
+  );
+
+  app.get(
+    "/api/admin/events/:eventId/discount-codes",
+    requireAdmin,
+    async (req, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await adminEventExists(eventId))) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT id, event_id, code, description, discount_type, discount_value, applies_to,
+              max_uses, ${DISCOUNT_USED_COUNT_SQL} AS used_count, min_purchase_cents, valid_from, valid_until, is_active, created_at
+       FROM discount_codes WHERE event_id = ? ORDER BY created_at DESC`,
+        [eventId],
+      );
+      res.json({ discountCodes: rows });
+    },
+  );
+
+  // ── Admin: waitlist, media, fields, waivers, discount mutations ─────────────
+  app.get(
+    "/api/admin/events/:eventId/waitlist",
+    requireAdmin,
+    async (req, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await adminEventExists(eventId))) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT w.id, w.event_id, w.event_category_id, w.athlete_id, w.status, w.position,
+              w.offered_at, w.offer_expires_at, w.created_at,
+              ec.name AS category_name,
+              a.first_name AS athlete_first_name, a.last_name AS athlete_last_name,
+              a.email AS athlete_email
+       FROM waitlist_entries w
+       JOIN event_categories ec ON ec.id = w.event_category_id
+       JOIN athletes a ON a.id = w.athlete_id
+       WHERE w.event_id = ?
+       ORDER BY w.event_category_id ASC, w.position ASC, w.created_at ASC`,
+        [eventId],
+      );
+      res.json({ entries: rows });
+    },
+  );
+
+  app.post(
+    "/api/admin/events/:eventId/waitlist/offer",
+    requireAdmin,
+    async (req, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await adminEventExists(eventId))) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const waitlistEntryId = Number(req.body?.waitlistEntryId);
+      const offerExpiresHours = Math.min(
+        168,
+        Math.max(1, Number(req.body?.offerExpiresHours ?? 24) || 24),
+      );
+      if (!Number.isFinite(waitlistEntryId)) {
+        return res.status(400).json({ error: "waitlistEntryId required" });
+      }
+      const [entryRows] = await pool.query<RowDataPacket[]>(
+        `SELECT w.id, w.event_id, w.event_category_id, w.athlete_id, w.status,
+              e.title AS event_title, e.slug AS event_slug,
+              ec.name AS category_name,
+              a.email AS athlete_email, a.first_name AS athlete_first_name,
+              a.preferred_language
+       FROM waitlist_entries w
+       JOIN events e ON e.id = w.event_id
+       JOIN event_categories ec ON ec.id = w.event_category_id
+       JOIN athletes a ON a.id = w.athlete_id
+       WHERE w.id = ? AND w.event_id = ? LIMIT 1`,
+        [waitlistEntryId, eventId],
+      );
+      if (entryRows.length === 0) {
+        return res.status(404).json({ error: "Waitlist entry not found" });
+      }
+      const entry = entryRows[0];
+      if (entry.status !== "waiting") {
+        return res
+          .status(409)
+          .json({ error: "Entry is not in waiting status" });
+      }
+      await pool.query<ResultSetHeader>(
+        `UPDATE waitlist_entries
+       SET status = 'offered', offered_at = NOW(),
+           offer_expires_at = DATE_ADD(NOW(), INTERVAL ? HOUR)
+       WHERE id = ?`,
+        [offerExpiresHours, waitlistEntryId],
+      );
+      const athleteEmail = entry.athlete_email as string | null;
+      if (athleteEmail) {
+        const locale = entry.preferred_language === "en" ? "en" : "es";
+        const eventUrl = `${appUrl}/events/${entry.event_slug}`;
+        const subject =
+          locale === "en"
+            ? `Spot available: ${entry.event_title}`
+            : `Cupo disponible: ${entry.event_title}`;
+        const body =
+          locale === "en"
+            ? `Hi ${entry.athlete_first_name},\n\nA spot has opened for ${entry.category_name} at ${entry.event_title}. Register within ${offerExpiresHours} hours:\n${eventUrl}`
+            : `Hola ${entry.athlete_first_name},\n\nSe abrió un cupo para ${entry.category_name} en ${entry.event_title}. Regístrate en las próximas ${offerExpiresHours} horas:\n${eventUrl}`;
+        void sendEmail({
+          to: athleteEmail,
+          subject,
+          text: body,
+          html: body.replace(/\n/g, "<br>"),
+        }).catch((err) => console.error("[email:waitlist-offer]", err));
+      }
+      const [updated] = await pool.query<RowDataPacket[]>(
+        `SELECT id, event_id, event_category_id, athlete_id, status, position,
+              offered_at, offer_expires_at, created_at
+       FROM waitlist_entries WHERE id = ? LIMIT 1`,
+        [waitlistEntryId],
+      );
+      res.json({ ok: true, entry: updated[0] });
+    },
+  );
+
+  app.post(
+    "/api/admin/events/:eventId/waitlist/revoke",
+    requireAdmin,
+    async (req, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await adminEventExists(eventId))) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const waitlistEntryId = Number(req.body?.waitlistEntryId);
+      if (!Number.isFinite(waitlistEntryId)) {
+        return res.status(400).json({ error: "waitlistEntryId required" });
+      }
+      const [result] = await pool.query<ResultSetHeader>(
+        `UPDATE waitlist_entries
+       SET status = 'cancelled', offered_at = NULL, offer_expires_at = NULL
+       WHERE id = ? AND event_id = ? AND status IN ('waiting', 'offered')`,
+        [waitlistEntryId, eventId],
+      );
+      if (result.affectedRows === 0) {
+        return res
+          .status(404)
+          .json({ error: "Waitlist entry not found or already resolved" });
+      }
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT w.id, w.event_id, w.event_category_id, w.athlete_id, w.status, w.position,
+              w.offered_at, w.offer_expires_at, w.created_at,
+              ec.name AS category_name,
+              a.first_name AS athlete_first_name, a.last_name AS athlete_last_name,
+              a.email AS athlete_email
+       FROM waitlist_entries w
+       JOIN event_categories ec ON ec.id = w.event_category_id
+       JOIN athletes a ON a.id = w.athlete_id
+       WHERE w.event_id = ?
+       ORDER BY w.event_category_id ASC, w.position ASC, w.created_at ASC`,
+        [eventId],
+      );
+      res.json({ ok: true, entries: rows });
+    },
+  );
+
+  app.post(
+    "/api/admin/events/:eventId/categories",
+    requireAdmin,
+    async (req, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await adminEventExists(eventId))) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const err = await createEventCategoryRecord(
+        pool,
+        newPublicUuid,
+        eventId,
+        (req.body ?? {}) as Record<string, unknown>,
+        getStripeClient?.() ?? null,
+      );
+      if (err) return res.status(err.status).json({ error: err.error });
+      res
+        .status(201)
+        .json({ categories: await fetchEventCategories(pool, eventId) });
+    },
+  );
+
+  app.patch(
+    "/api/admin/events/:eventId/categories/:categoryId",
+    requireAdmin,
+    async (req, res) => {
+      const eventId = Number(req.params.eventId);
+      const categoryId = Number(req.params.categoryId);
+      if (!(await adminEventExists(eventId))) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const err = await patchEventCategoryRecord(
+        pool,
+        eventId,
+        categoryId,
+        (req.body ?? {}) as Record<string, unknown>,
+        getStripeClient?.() ?? null,
+      );
+      if (err) return res.status(err.status).json({ error: err.error });
+      res.json({ categories: await fetchEventCategories(pool, eventId) });
+    },
+  );
+
+  app.delete(
+    "/api/admin/events/:eventId/categories/:categoryId",
+    requireAdmin,
+    async (req, res) => {
+      const eventId = Number(req.params.eventId);
+      const categoryId = Number(req.params.categoryId);
+      if (!(await adminEventExists(eventId))) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const err = await deleteEventCategoryRecord(pool, eventId, categoryId);
+      if (err) return res.status(err.status).json({ error: err.error });
+      res.json({ categories: await fetchEventCategories(pool, eventId) });
+    },
+  );
+
+  app.post(
+    "/api/admin/events/:eventId/extras",
+    requireAdmin,
+    async (req, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await adminEventExists(eventId))) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const err = await createEventExtraRecord(
+        pool,
+        newPublicUuid,
+        eventId,
+        (req.body ?? {}) as Record<string, unknown>,
+        getStripeClient?.() ?? null,
+      );
+      if (err)
+        return res
+          .status(err.status)
+          .json({ error: err.error, code: err.code });
+      res
+        .status(201)
+        .json({ extras: await fetchAllEventExtras(pool, eventId) });
+    },
+  );
+
+  app.patch(
+    "/api/admin/events/:eventId/extras/:extraId",
+    requireAdmin,
+    async (req, res) => {
+      const eventId = Number(req.params.eventId);
+      const extraId = Number(req.params.extraId);
+      if (!(await adminEventExists(eventId))) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const err = await patchEventExtraRecord(
+        pool,
+        eventId,
+        extraId,
+        (req.body ?? {}) as Record<string, unknown>,
+        getStripeClient?.() ?? null,
+      );
+      if (err)
+        return res
+          .status(err.status)
+          .json({ error: err.error, code: err.code });
+      res.json({ extras: await fetchAllEventExtras(pool, eventId) });
+    },
+  );
+
+  app.delete(
+    "/api/admin/events/:eventId/extras/:extraId",
+    requireAdmin,
+    async (req, res) => {
+      const eventId = Number(req.params.eventId);
+      const extraId = Number(req.params.extraId);
+      if (!(await adminEventExists(eventId))) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const err = await deleteEventExtraRecord(pool, eventId, extraId);
+      if (err) return res.status(err.status).json({ error: err.error });
+      res.json({ extras: await fetchAllEventExtras(pool, eventId) });
+    },
+  );
+
+  app.get(
+    "/api/admin/events/:eventId/media",
+    requireAdmin,
+    async (req, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await adminEventExists(eventId))) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT id, public_uuid, asset_type, url, alt_text, mime_type,
+              file_size_bytes, width_px, height_px, sort_order, is_primary
+       FROM media_assets
+       WHERE entity_type = 'event' AND entity_id = ? AND deleted_at IS NULL
+       ORDER BY sort_order ASC, id ASC`,
+        [eventId],
+      );
+      res.json({ media: rows });
+    },
+  );
+
+  app.put(
+    "/api/admin/events/:eventId/media",
+    requireAdmin,
+    async (req, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await adminEventExists(eventId))) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const raw = req.body?.media;
+      if (!Array.isArray(raw)) {
+        return res.status(400).json({ error: "media array required" });
+      }
+      const validAssetTypes = new Set([
+        "hero",
+        "banner",
+        "logo",
+        "gallery",
+        "document",
+        "route_map",
+        "other",
+      ]);
+      const mediaItems = raw
+        .map((m: Record<string, unknown>, index: number) => {
+          const url = String(m.url ?? "").trim();
+          if (!url) return null;
+          const asset_type = String(m.asset_type ?? "other");
+          if (!validAssetTypes.has(asset_type)) return null;
+          return {
+            asset_type,
+            url: url.slice(0, 1000),
+            alt_text: m.alt_text
+              ? String(m.alt_text).trim().slice(0, 255)
+              : null,
+            mime_type: m.mime_type
+              ? String(m.mime_type).trim().slice(0, 100)
+              : null,
+            file_size_bytes:
+              m.file_size_bytes != null
+                ? Number(m.file_size_bytes) || null
+                : null,
+            width_px: m.width_px != null ? Number(m.width_px) || null : null,
+            height_px: m.height_px != null ? Number(m.height_px) || null : null,
+            sort_order: Number(m.sort_order) || index,
+            is_primary: m.is_primary ? 1 : 0,
+          };
+        })
+        .filter(Boolean) as Array<{
+        asset_type: string;
+        url: string;
+        alt_text: string | null;
+        mime_type: string | null;
+        file_size_bytes: number | null;
+        width_px: number | null;
+        height_px: number | null;
+        sort_order: number;
+        is_primary: number;
+      }>;
+      const conn = await pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        await conn.query(
+          `UPDATE media_assets SET deleted_at = NOW()
+         WHERE entity_type = 'event' AND entity_id = ? AND deleted_at IS NULL`,
+          [eventId],
+        );
+        for (const item of mediaItems) {
+          await conn.query<ResultSetHeader>(
+            `INSERT INTO media_assets (
+             public_uuid, entity_type, entity_id, asset_type, url, alt_text, mime_type,
+             file_size_bytes, width_px, height_px, sort_order, is_primary
+           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+            [
+              newPublicUuid(),
+              "event",
+              eventId,
+              item.asset_type,
+              item.url,
+              item.alt_text,
+              item.mime_type,
+              item.file_size_bytes,
+              item.width_px,
+              item.height_px,
+              item.sort_order,
+              item.is_primary,
+            ],
+          );
+        }
+        await conn.commit();
+      } catch (err) {
+        await conn.rollback();
+        throw err;
+      } finally {
+        conn.release();
+      }
+      const [saved] = await pool.query<RowDataPacket[]>(
+        `SELECT id, public_uuid, asset_type, url, alt_text, mime_type,
+              file_size_bytes, width_px, height_px, sort_order, is_primary
+       FROM media_assets
+       WHERE entity_type = 'event' AND entity_id = ? AND deleted_at IS NULL
+       ORDER BY sort_order ASC, id ASC`,
+        [eventId],
+      );
+      res.json({ media: saved });
+    },
+  );
+
+  app.get(
+    "/api/admin/events/:eventId/registration-fields",
+    requireAdmin,
+    async (req, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await adminEventExists(eventId))) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      res.json({ fields: await fetchStaffRegistrationFields(pool, eventId) });
+    },
+  );
+
+  app.put(
+    "/api/admin/events/:eventId/registration-fields",
+    requireAdmin,
+    async (req, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await adminEventExists(eventId))) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const result = await replaceEventRegistrationFields(
+        pool,
+        eventId,
+        req.body?.fields,
+      );
+      if (result.ok === false) {
+        return res
+          .status(result.error.status)
+          .json({ error: result.error.error });
+      }
+      res.json({ fields: result.fields });
+    },
+  );
+
+  app.get(
+    "/api/admin/events/:eventId/folio-segments",
+    requireAdmin,
+    async (req, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await adminEventExists(eventId))) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const rows = await fetchStaffFolioSegments(pool, eventId);
+      res.json({
+        segments: await presentStaffFolioSegments(pool, eventId, rows),
+      });
+    },
+  );
+
+  app.put(
+    "/api/admin/events/:eventId/folio-segments",
+    requireAdmin,
+    async (req, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await adminEventExists(eventId))) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const result = await replaceEventFolioSegments(
+        pool,
+        eventId,
+        req.body?.segments,
+      );
+      if (result.ok === false) {
+        return res
+          .status(result.error.status)
+          .json({ error: result.error.error });
+      }
+      res.json({
+        segments: await presentStaffFolioSegments(
+          pool,
+          eventId,
+          result.segments,
+        ),
+      });
+    },
+  );
+
+  app.get(
+    "/api/admin/events/:eventId/waivers",
+    requireAdmin,
+    async (req, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await adminEventExists(eventId))) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const rows = await fetchEventWaiversForStaff(pool, eventId);
+      res.json({ waivers: rows });
+    },
+  );
+
+  app.put(
+    "/api/admin/events/:eventId/waivers",
+    requireAdmin,
+    async (req, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await adminEventExists(eventId))) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const result = await syncEventWaivers(pool, eventId, req.body);
+      if ("error" in result) {
+        return res.status(result.status).json({ error: result.error });
+      }
+      res.json({ waivers: result.waivers });
+    },
+  );
+
+  app.post(
+    "/api/admin/events/:eventId/discount-codes",
+    requireAdmin,
+    async (req, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await adminEventExists(eventId))) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const [[eventRow]] = await pool.query<RowDataPacket[]>(
+        "SELECT organizer_id FROM events WHERE id = ? LIMIT 1",
+        [eventId],
+      );
+      const organizerId = Number(eventRow?.organizer_id);
+      if (!Number.isFinite(organizerId)) {
+        return res.status(400).json({ error: "Event has no organizer" });
+      }
+      const code = String(req.body?.code ?? "")
+        .trim()
+        .toUpperCase()
+        .slice(0, 40);
+      const discount_value = Number(req.body?.discount_value);
+      if (!code || !Number.isFinite(discount_value) || discount_value <= 0) {
+        return res
+          .status(400)
+          .json({ error: "code and discount_value required" });
+      }
+      const discount_type = String(req.body?.discount_type ?? "percent");
+      if (!["percent", "fixed_cents"].includes(discount_type)) {
+        return res.status(400).json({ error: "Invalid discount_type" });
+      }
+      if (discount_type === "percent" && discount_value > 100) {
+        return res
+          .status(400)
+          .json({ error: "Percent discount cannot exceed 100" });
+      }
+      const applies_to = String(req.body?.applies_to ?? "registration");
+      if (!["registration", "service_fee", "total"].includes(applies_to)) {
+        return res.status(400).json({ error: "Invalid applies_to" });
+      }
+      try {
+        const [result] = await pool.query<ResultSetHeader>(
+          `INSERT INTO discount_codes (
+           event_id, organizer_id, code, description, discount_type, discount_value,
+           applies_to, max_uses, min_purchase_cents, valid_from, valid_until, is_active
+         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,1)`,
+          [
+            eventId,
+            organizerId,
+            code,
+            req.body?.description
+              ? String(req.body.description).slice(0, 255)
+              : null,
+            discount_type,
+            Math.round(discount_value),
+            applies_to,
+            req.body?.max_uses != null
+              ? Math.max(0, Number(req.body.max_uses))
+              : null,
+            req.body?.min_purchase_cents != null
+              ? Math.max(0, Number(req.body.min_purchase_cents))
+              : null,
+            req.body?.valid_from || null,
+            req.body?.valid_until || null,
+          ],
+        );
+        const [rows] = await pool.query<RowDataPacket[]>(
+          `SELECT id, event_id, code, description, discount_type, discount_value, applies_to,
+                max_uses, ${DISCOUNT_USED_COUNT_SQL} AS used_count, min_purchase_cents, valid_from, valid_until, is_active, created_at
+         FROM discount_codes WHERE id = ? LIMIT 1`,
+          [result.insertId],
+        );
+        res.status(201).json({ discountCode: rows[0] });
+      } catch (err: unknown) {
+        const mysqlErr = err as { code?: string };
+        if (mysqlErr.code === "ER_DUP_ENTRY") {
+          return res
+            .status(409)
+            .json({ error: "Discount code already exists for this event" });
+        }
+        throw err;
+      }
+    },
+  );
+
+  app.patch(
+    "/api/admin/events/:eventId/discount-codes/:codeId",
+    requireAdmin,
+    async (req, res) => {
+      const eventId = Number(req.params.eventId);
+      const codeId = Number(req.params.codeId);
+      if (!(await adminEventExists(eventId))) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const [existing] = await pool.query<RowDataPacket[]>(
+        "SELECT id FROM discount_codes WHERE id = ? AND event_id = ? LIMIT 1",
+        [codeId, eventId],
+      );
+      if (existing.length === 0) {
+        return res.status(404).json({ error: "Discount code not found" });
+      }
+      const updates: string[] = [];
+      const params: unknown[] = [];
+      if (req.body?.description !== undefined) {
+        updates.push("description = ?");
+        params.push(
+          req.body.description
+            ? String(req.body.description).slice(0, 255)
+            : null,
+        );
+      }
+      if (req.body?.is_active !== undefined) {
+        updates.push("is_active = ?");
+        params.push(req.body.is_active ? 1 : 0);
+      }
+      if (updates.length === 0) {
+        return res.status(400).json({ error: "No fields to update" });
+      }
+      params.push(codeId);
+      await pool.query<ResultSetHeader>(
+        `UPDATE discount_codes SET ${updates.join(", ")} WHERE id = ?`,
+        params,
+      );
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT id, event_id, code, description, discount_type, discount_value, applies_to,
+                max_uses, ${DISCOUNT_USED_COUNT_SQL} AS used_count, min_purchase_cents, valid_from, valid_until, is_active, created_at
+         FROM discount_codes WHERE id = ? LIMIT 1`,
+        [codeId],
+      );
+      res.json({ discountCode: rows[0] });
+    },
+  );
+
+  app.delete(
+    "/api/admin/events/:eventId/discount-codes/:codeId",
+    requireAdmin,
+    async (req, res) => {
+      const eventId = Number(req.params.eventId);
+      const codeId = Number(req.params.codeId);
+      if (!(await adminEventExists(eventId))) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      const [result] = await pool.query<ResultSetHeader>(
+        "DELETE FROM discount_codes WHERE id = ? AND event_id = ?",
+        [codeId, eventId],
+      );
+      if (result.affectedRows === 0) {
+        return res.status(404).json({ error: "Discount code not found" });
+      }
+      res.json({ ok: true });
+    },
+  );
+
+  app.post(
+    "/api/admin/events",
+    requireAdmin,
+    async (req: AuthedRequest, res) => {
+      const organizer_id = Number(req.body?.organizer_id);
+      if (!Number.isFinite(organizer_id) || organizer_id <= 0) {
+        return res.status(400).json({ error: "organizer_id required" });
+      }
+
+      const [orgRows] = await pool.query<RowDataPacket[]>(
+        "SELECT id FROM organizers WHERE id = ? AND deleted_at IS NULL LIMIT 1",
+        [organizer_id],
+      );
+      if (orgRows.length === 0) {
+        return res.status(400).json({ error: "Invalid organizer_id" });
+      }
+
+      const parsed = parseEventBody(
+        (req.body ?? {}) as Record<string, unknown>,
+      );
+      if ("error" in parsed) {
+        return res.status(400).json({ error: parsed.error });
+      }
+      const { data } = parsed;
+      if (data.subdomain == null || data.subdomain === "") {
+        return res.status(400).json({ error: "subdomain required" });
+      }
+      const subdomainCheck = await assertEventSubdomainAvailable(
+        pool,
+        data.subdomain,
+      );
+      if (subdomainCheck.ok === false) {
+        return res.status(400).json({ error: subdomainCheck.error });
+      }
+      const baseSlug = slugify(data.slug || data.title);
+      const slug = await uniqueEventSlug(pool, baseSlug);
+
+      const [sportRows] = await pool.query<RowDataPacket[]>(
+        "SELECT id FROM sport_types WHERE id = ? AND is_active = 1 LIMIT 1",
+        [data.sport_type_id],
+      );
+      if (sportRows.length === 0) {
+        return res.status(400).json({ error: "Invalid sport_type_id" });
+      }
+
+      try {
+        const [result] = await pool.query<ResultSetHeader>(
+          `INSERT INTO events (
+           public_uuid, organizer_id, sport_type_id, slug, subdomain, title, short_description, description,
+           status, visibility, featured, start_date, end_date, registration_opens_at,
+           registration_closes_at, check_in_opens_at, check_in_closes_at,
+           location_name, location_city, location_state, location_lat, location_lng,
+           hero_image_url, banner_image_url, max_registrations, max_registrations_per_order, bib_mode,
+           requires_waiver, auto_deactivate_after_event
+         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          [
+            newPublicUuid(),
+            organizer_id,
+            data.sport_type_id,
+            slug,
+            subdomainCheck.subdomain,
+            data.title,
+            data.short_description,
+            data.description,
+            "draft",
+            data.visibility,
+            data.featured ? 1 : 0,
+            data.start_date,
+            data.end_date,
+            data.registration_opens_at,
+            data.registration_closes_at,
+            data.check_in_opens_at,
+            data.check_in_closes_at,
+            ...eventBodySqlValues(data),
+            data.requires_waiver ? 1 : 0,
+            data.auto_deactivate_after_event ? 1 : 0,
+          ],
+        );
+
+        const event = await fetchStaffEventDetail(pool, result.insertId);
+        res.status(201).json({ event, categories: [] });
+      } catch (err) {
+        if (isMysqlDuplicateEntry(err)) {
+          return res.status(400).json({ error: eventCreateDuplicateError(err) });
+        }
+        throw err;
+      }
+    },
+  );
+
+  app.get("/api/admin/organizers", requireAdmin, async (req, res) => {
+    const q = String(req.query.q ?? "").trim();
+    const pageRaw = req.query.page;
+    if (pageRaw != null && String(pageRaw).trim() !== "") {
+      const status = String(req.query.status ?? "").trim();
+      const result = await listAdminOrganizers(pool, {
+        q: q || undefined,
+        status: status || undefined,
+        page: req.query.page,
+        limit: req.query.limit,
+        sortBy: req.query.sortBy,
+        sortDir: req.query.sortDir,
+      });
+      return res.json(result);
+    }
+
+    const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 20));
+    const params: (string | number)[] = [];
+    let where = "deleted_at IS NULL AND status IN ('active','pending')";
+    if (q) {
+      where +=
+        " AND (name LIKE ? OR email LIKE ? OR slug LIKE ? OR city LIKE ?)";
+      const like = `%${q}%`;
+      params.push(like, like, like, like);
+    }
+    params.push(limit);
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT id, name, slug, email, city, status, logo_url
+       FROM organizers WHERE ${where}
+       ORDER BY name ASC LIMIT ?`,
+      params,
+    );
+    res.json({ organizers: rows });
+  });
+
+  app.post(
+    "/api/admin/organizers",
+    requireAdmin,
+    async (req: AuthedRequest, res) => {
+      const name = String(req.body?.name ?? "").trim();
+      const email = String(req.body?.email ?? "")
+        .trim()
+        .toLowerCase();
+      const ownerEmail = String(req.body?.owner_email ?? "")
+        .trim()
+        .toLowerCase();
+      const ownerFirst = String(req.body?.owner_first_name ?? "").trim();
+      const ownerLast = String(req.body?.owner_last_name ?? "").trim();
+      const country = String(req.body?.country ?? "MX")
+        .trim()
+        .slice(0, 2)
+        .toUpperCase();
+      const cityRaw = req.body?.city
+        ? String(req.body.city).trim().slice(0, 100)
+        : null;
+      let city: string | null = null;
+      if (cityRaw) {
+        const canonicalCity = await normalizeOrganizerCity(
+          pool,
+          cityRaw,
+          country,
+        );
+        if (!canonicalCity) {
+          return res.status(400).json({
+            error: "City must be selected from the location catalog",
+            code: "invalid_organizer_city",
+          });
+        }
+        city = canonicalCity;
+      }
+      const phone = req.body?.phone
+        ? String(req.body.phone).trim().slice(0, 20)
+        : null;
+
+      if (!name || !email || !ownerEmail || !ownerFirst || !ownerLast) {
+        return res.status(400).json({
+          error:
+            "name, email, owner_email, owner_first_name, owner_last_name required",
+        });
+      }
+
+      const baseSlug = slugify(String(req.body?.slug ?? name).trim() || name);
+      const slug = await uniqueOrganizerSlug(pool, baseSlug);
+
+      const serviceFeeRaw = req.body?.service_fee_percent;
+      const serviceFeePercent =
+        serviceFeeRaw === null ||
+        serviceFeeRaw === undefined ||
+        serviceFeeRaw === ""
+          ? 11
+          : Number(serviceFeeRaw);
+      if (
+        !Number.isFinite(serviceFeePercent) ||
+        serviceFeePercent < 0 ||
+        serviceFeePercent > 100
+      ) {
+        return res
+          .status(400)
+          .json({ error: "Invalid service_fee_percent (0–100)" });
+      }
+
+      const legalName = req.body?.legal_name
+        ? String(req.body.legal_name).trim().slice(0, 255)
+        : null;
+      const rfc = req.body?.rfc
+        ? String(req.body.rfc).trim().slice(0, 13).toUpperCase()
+        : null;
+
+      const [existingOrg] = await pool.query<RowDataPacket[]>(
+        "SELECT id FROM organizers WHERE email = ? AND deleted_at IS NULL LIMIT 1",
+        [email],
+      );
+      if (existingOrg.length > 0) {
+        return res
+          .status(409)
+          .json({ error: "Organizer email already exists" });
+      }
+
+      const conn = await pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        const [orgResult] = await conn.query<ResultSetHeader>(
+          `INSERT INTO organizers (
+           public_uuid, slug, name, email, phone, city, country, status,
+           service_fee_percent, legal_name, rfc
+         ) VALUES (?,?,?,?,?,?,?,'active',?,?,?)`,
+          [
+            newPublicUuid(),
+            slug,
+            name.slice(0, 200),
+            email,
+            phone,
+            city,
+            country,
+            serviceFeePercent,
+            legalName,
+            rfc,
+          ],
+        );
+        const organizerId = orgResult.insertId;
+
+        const [existingMember] = await conn.query<RowDataPacket[]>(
+          "SELECT id FROM organizer_members WHERE organizer_id = ? AND email = ? AND deleted_at IS NULL LIMIT 1",
+          [organizerId, ownerEmail],
+        );
+        if (existingMember.length === 0) {
+          await conn.query<ResultSetHeader>(
+            `INSERT INTO organizer_members (
+             public_uuid, organizer_id, email, first_name, last_name, role, status, invited_at
+           ) VALUES (?,?,?,?,?,'owner','active',NOW())`,
+            [
+              newPublicUuid(),
+              organizerId,
+              ownerEmail,
+              ownerFirst.slice(0, 100),
+              ownerLast.slice(0, 100),
+            ],
+          );
+        }
+
+        await conn.commit();
+
+        const eventIdsRaw = req.body?.event_ids;
+        if (Array.isArray(eventIdsRaw) && eventIdsRaw.length > 0) {
+          const eventIds = eventIdsRaw
+            .map((id: unknown) => Number(id))
+            .filter((id) => Number.isFinite(id));
+          await assignEventsToOrganizer(pool, organizerId, eventIds);
+        }
+
+        sendStaffWelcomeEmail({
+          to: ownerEmail,
+          firstName: ownerFirst,
+          audience: "organizer",
+          preferredLanguage: req.body?.preferred_language,
+        });
+
+        const [[organizer]] = await pool.query<RowDataPacket[]>(
+          `SELECT o.id, o.name, o.slug, o.email, o.city, o.country, o.status, o.logo_url, o.created_at,
+                (SELECT COUNT(*) FROM events e WHERE e.organizer_id = o.id AND e.deleted_at IS NULL) AS event_count,
+                (SELECT COUNT(*) FROM organizer_members om WHERE om.organizer_id = o.id AND om.deleted_at IS NULL) AS member_count
+         FROM organizers o WHERE o.id = ? LIMIT 1`,
+          [organizerId],
+        );
+        res.status(201).json({ organizer });
+      } catch (err) {
+        await conn.rollback();
+        throw err;
+      } finally {
+        conn.release();
+      }
+    },
+  );
+
+  app.get(
+    "/api/admin/organizers/:organizerId",
+    requireAdmin,
+    async (req, res) => {
+      const organizerId = Number(req.params.organizerId);
+      if (!Number.isFinite(organizerId)) {
+        return res.status(400).json({ error: "Invalid organizer id" });
+      }
+      const [[organizer]] = await pool.query<RowDataPacket[]>(
+        `SELECT o.id, o.name, o.slug, o.email, o.city, o.country, o.status, o.logo_url,
+              o.phone, o.website_url, o.description, o.legal_name, o.billing_email, o.created_at,
+              o.stripe_account_id, o.stripe_onboarding_complete, o.stripe_connect_status,
+              o.stripe_charges_enabled, o.stripe_payouts_enabled, o.stripe_details_submitted,
+              o.stripe_connect_onboarded_at, o.stripe_connect_last_synced_at,
+              o.stripe_connect_onboarding_mode, o.payout_terms_accepted_at,
+              o.payout_fee_acknowledged_at, o.service_fee_percent, o.fee_presentation, o.rfc, o.tax_regime,
+              (SELECT COUNT(*) FROM events e WHERE e.organizer_id = o.id AND e.deleted_at IS NULL) AS event_count,
+              (SELECT COUNT(*) FROM organizer_members om WHERE om.organizer_id = o.id AND om.deleted_at IS NULL) AS member_count
+       FROM organizers o
+       WHERE o.id = ? AND o.deleted_at IS NULL
+       LIMIT 1`,
+        [organizerId],
+      );
+      if (!organizer) {
+        return res.status(404).json({ error: "Organizer not found" });
+      }
+      const onboardingIntake = await fetchOrganizerOnboardingIntake(
+        pool,
+        organizerId,
+      );
+      const [members] = await pool.query<RowDataPacket[]>(
+        `SELECT id, email, first_name, last_name, phone, role, event_access_scope, status,
+              invited_at, last_login_at, created_at
+       FROM organizer_members
+       WHERE organizer_id = ? AND deleted_at IS NULL
+       ORDER BY FIELD(role,'owner','organizer','operations','marketing','finance','timing','sponsor','seller'), created_at ASC`,
+        [organizerId],
+      );
+      const memberIds = members.map((m) => Number(m.id));
+      const assignedByMember = new Map<number, number[]>();
+      if (memberIds.length > 0) {
+        const placeholders = memberIds.map(() => "?").join(", ");
+        const [assignments] = await pool.query<RowDataPacket[]>(
+          `SELECT organizer_member_id, event_id FROM organizer_member_events
+         WHERE organizer_member_id IN (${placeholders})`,
+          memberIds,
+        );
+        for (const row of assignments) {
+          const memberId = Number(row.organizer_member_id);
+          const list = assignedByMember.get(memberId) ?? [];
+          list.push(Number(row.event_id));
+          assignedByMember.set(memberId, list);
+        }
+      }
+      const events = await fetchOrganizerLinkedEvents(pool, organizerId);
+      res.json({
+        organizer: { ...organizer, onboarding_intake: onboardingIntake },
+        members: members.map((m) => ({
+          ...m,
+          assigned_event_ids: assignedByMember.get(Number(m.id)) ?? [],
+        })),
+        events,
+      });
+    },
+  );
+
+  app.post(
+    "/api/admin/organizers/:organizerId/events/assign",
+    requireAdmin,
+    async (req, res) => {
+      const organizerId = Number(req.params.organizerId);
+      if (!Number.isFinite(organizerId)) {
+        return res.status(400).json({ error: "Invalid organizer id" });
+      }
+      const [[orgRow]] = await pool.query<RowDataPacket[]>(
+        "SELECT id FROM organizers WHERE id = ? AND deleted_at IS NULL LIMIT 1",
+        [organizerId],
+      );
+      if (!orgRow) {
+        return res.status(404).json({ error: "Organizer not found" });
+      }
+      const eventIdsRaw = req.body?.event_ids;
+      if (!Array.isArray(eventIdsRaw) || eventIdsRaw.length === 0) {
+        return res.status(400).json({ error: "event_ids array required" });
+      }
+      const eventIds = eventIdsRaw
+        .map((id: unknown) => Number(id))
+        .filter((id) => Number.isFinite(id));
+      if (eventIds.length === 0) {
+        return res.status(400).json({ error: "No valid event ids" });
+      }
+      await assignEventsToOrganizer(pool, organizerId, eventIds);
+      const events = await fetchOrganizerLinkedEvents(pool, organizerId);
+      res.json({ events });
+    },
+  );
+
+  app.patch(
+    "/api/admin/organizers/:organizerId/members/:memberId/access",
+    requireAdmin,
+    async (req, res) => {
+      const organizerId = Number(req.params.organizerId);
+      const memberId = Number(req.params.memberId);
+      if (!Number.isFinite(organizerId) || !Number.isFinite(memberId)) {
+        return res.status(400).json({ error: "Invalid id" });
+      }
+      const [[target]] = await pool.query<RowDataPacket[]>(
+        "SELECT id, role FROM organizer_members WHERE id = ? AND organizer_id = ? AND deleted_at IS NULL LIMIT 1",
+        [memberId, organizerId],
+      );
+      if (!target) {
+        return res.status(404).json({ error: "Member not found" });
+      }
+      if (target.role === "owner") {
+        return res
+          .status(403)
+          .json({ error: "Owner always has organization-wide event access" });
+      }
+
+      const access = await applyMemberEventAccess(
+        pool,
+        organizerId,
+        memberId,
+        String(target.role),
+        req.body?.event_access_scope,
+        req.body?.event_ids,
+      );
+      if (access.ok === false) {
+        return res.status(access.status).json({ error: access.error });
+      }
+
+      const members = await listOrganizerMembersWithAccess(pool, organizerId);
+      res.json({ members });
+    },
+  );
+
+  app.patch(
+    "/api/admin/organizers/:organizerId",
+    requireAdmin,
+    async (req, res) => {
+      const organizerId = Number(req.params.organizerId);
+      if (!Number.isFinite(organizerId)) {
+        return res.status(400).json({ error: "Invalid organizer id" });
+      }
+      const [[existing]] = await pool.query<RowDataPacket[]>(
+        "SELECT id, slug FROM organizers WHERE id = ? AND deleted_at IS NULL LIMIT 1",
+        [organizerId],
+      );
+      if (!existing) {
+        return res.status(404).json({ error: "Organizer not found" });
+      }
+
+      const updates: string[] = [];
+      const params: (string | number)[] = [];
+
+      if (req.body?.name != null) {
+        updates.push("name = ?");
+        params.push(String(req.body.name).trim().slice(0, 200));
+      }
+      if (req.body?.email != null) {
+        updates.push("email = ?");
+        params.push(String(req.body.email).trim().toLowerCase().slice(0, 255));
+      }
+      let patchCountry =
+        req.body?.country != null
+          ? String(req.body.country).trim().slice(0, 2).toUpperCase()
+          : null;
+      if (req.body?.country != null) {
+        updates.push("country = ?");
+        params.push(patchCountry!);
+      }
+      if (req.body?.city != null) {
+        const cityRaw = String(req.body.city).trim().slice(0, 100);
+        if (!cityRaw) {
+          updates.push("city = ?");
+          params.push(null);
+        } else {
+          const [[orgCountryRow]] = await pool.query<RowDataPacket[]>(
+            "SELECT country FROM organizers WHERE id = ? AND deleted_at IS NULL LIMIT 1",
+            [organizerId],
+          );
+          const countryForCity =
+            patchCountry ?? String(orgCountryRow?.country ?? "MX");
+          const canonicalCity = await normalizeOrganizerCity(
+            pool,
+            cityRaw,
+            countryForCity,
+          );
+          if (!canonicalCity) {
+            return res.status(400).json({
+              error: "City must be selected from the location catalog",
+              code: "invalid_organizer_city",
+            });
+          }
+          updates.push("city = ?");
+          params.push(canonicalCity);
+        }
+      }
+      if (req.body?.phone != null) {
+        updates.push("phone = ?");
+        params.push(String(req.body.phone).trim().slice(0, 20) || null);
+      }
+      if (req.body?.status != null && String(req.body.status).trim() !== "") {
+        const status = String(req.body.status).trim().toLowerCase();
+        if (!["pending", "active", "suspended", "inactive"].includes(status)) {
+          return res.status(400).json({ error: "Invalid status" });
+        }
+        updates.push("status = ?");
+        params.push(status);
+      }
+      if (req.body?.slug != null) {
+        const baseSlug = slugify(String(req.body.slug).trim());
+        const slug =
+          baseSlug === existing.slug
+            ? existing.slug
+            : await uniqueOrganizerSlug(pool, baseSlug, organizerId);
+        updates.push("slug = ?");
+        params.push(slug);
+      }
+      if (req.body?.legal_name != null) {
+        updates.push("legal_name = ?");
+        params.push(String(req.body.legal_name).trim().slice(0, 255) || null);
+      }
+      if (req.body?.billing_email != null) {
+        updates.push("billing_email = ?");
+        params.push(
+          String(req.body.billing_email).trim().toLowerCase().slice(0, 255) ||
+            null,
+        );
+      }
+      if (req.body?.rfc != null) {
+        updates.push("rfc = ?");
+        params.push(
+          String(req.body.rfc).trim().slice(0, 13).toUpperCase() || null,
+        );
+      }
+      if (req.body?.tax_regime != null) {
+        updates.push("tax_regime = ?");
+        params.push(String(req.body.tax_regime).trim().slice(0, 10) || null);
+      }
+      if (req.body?.service_fee_percent != null) {
+        const fee = Number(req.body.service_fee_percent);
+        if (!Number.isFinite(fee) || fee < 0 || fee > 100) {
+          return res
+            .status(400)
+            .json({ error: "Invalid service_fee_percent (0–100)" });
+        }
+        updates.push("service_fee_percent = ?");
+        params.push(fee);
+      }
+      if (req.body?.fee_presentation != null) {
+        if (!isValidFeePresentation(req.body.fee_presentation)) {
+          return res.status(400).json({ error: "Invalid fee_presentation" });
+        }
+        updates.push("fee_presentation = ?");
+        params.push(String(req.body.fee_presentation));
+      }
+
+      if (updates.length === 0) {
+        return res.status(400).json({ error: "No fields to update" });
+      }
+
+      params.push(organizerId);
+      await pool.query<ResultSetHeader>(
+        `UPDATE organizers SET ${updates.join(", ")} WHERE id = ?`,
+        params,
+      );
+
+      const [[organizer]] = await pool.query<RowDataPacket[]>(
+        `SELECT o.id, o.name, o.slug, o.email, o.city, o.country, o.status, o.logo_url,
+              o.phone, o.website_url, o.description, o.legal_name, o.billing_email, o.created_at,
+              o.service_fee_percent, o.fee_presentation,
+              (SELECT COUNT(*) FROM events e WHERE e.organizer_id = o.id AND e.deleted_at IS NULL) AS event_count,
+              (SELECT COUNT(*) FROM organizer_members om WHERE om.organizer_id = o.id AND om.deleted_at IS NULL) AS member_count
+       FROM organizers o WHERE o.id = ? LIMIT 1`,
+        [organizerId],
+      );
+      res.json({ organizer });
+    },
+  );
+
+  app.post(
+    "/api/admin/organizers/:organizerId/members",
+    requireAdmin,
+    async (req: AuthedRequest, res) => {
+      const organizerId = Number(req.params.organizerId);
+      if (!Number.isFinite(organizerId)) {
+        return res.status(400).json({ error: "Invalid organizer id" });
+      }
+      const [[orgRow]] = await pool.query<RowDataPacket[]>(
+        "SELECT id, name FROM organizers WHERE id = ? AND deleted_at IS NULL LIMIT 1",
+        [organizerId],
+      );
+      if (!orgRow) {
+        return res.status(404).json({ error: "Organizer not found" });
+      }
+
+      const email = String(req.body?.email ?? "")
+        .trim()
+        .toLowerCase();
+      const first_name = String(req.body?.first_name ?? "").trim();
+      const last_name = String(req.body?.last_name ?? "").trim();
+      const role = String(req.body?.role ?? "organizer");
+      const validRoles = new Set([
+        "organizer",
+        "marketing",
+        "finance",
+        "timing",
+        "operations",
+        "sponsor",
+        "seller",
+      ]);
+      if (!email || !first_name || !last_name) {
+        return res
+          .status(400)
+          .json({ error: "email, first_name, last_name required" });
+      }
+      if (!validRoles.has(role)) {
+        return res.status(400).json({ error: "invalid role" });
+      }
+
+      // Sellers default to per-event access; other roles default to org-wide.
+      const defaultScope = role === "seller" ? "events" : "organization";
+      const scopeRaw =
+        req.body?.event_access_scope === "events" ||
+        req.body?.event_access_scope === "organization"
+          ? req.body.event_access_scope
+          : defaultScope;
+
+      const [existing] = await pool.query<RowDataPacket[]>(
+        "SELECT id FROM organizer_members WHERE organizer_id = ? AND email = ? AND deleted_at IS NULL LIMIT 1",
+        [organizerId, email],
+      );
+      if (existing.length > 0) {
+        return res.status(409).json({ error: "Member already exists" });
+      }
+
+      const [insertResult] = await pool.query<ResultSetHeader>(
+        `INSERT INTO organizer_members (
+           public_uuid, organizer_id, email, first_name, last_name, phone, role,
+           event_access_scope, status, invited_at
+         ) VALUES (?,?,?,?,?,?,?,?,'active',NOW())`,
+        [
+          newPublicUuid(),
+          organizerId,
+          email,
+          first_name.slice(0, 100),
+          last_name.slice(0, 100),
+          req.body?.phone ? String(req.body.phone).slice(0, 20) : null,
+          role,
+          ORG_WIDE_EVENT_ROLES.has(role) ? "organization" : scopeRaw,
+        ],
+      );
+      const newMemberId = Number(insertResult.insertId);
+
+      if (!ORG_WIDE_EVENT_ROLES.has(role)) {
+        const access = await applyMemberEventAccess(
+          pool,
+          organizerId,
+          newMemberId,
+          role,
+          scopeRaw,
+          req.body?.event_ids,
+        );
+        if (access.ok === false) {
+          await pool.query<ResultSetHeader>(
+            "DELETE FROM organizer_members WHERE id = ? AND organizer_id = ?",
+            [newMemberId, organizerId],
+          );
+          return res.status(access.status).json({ error: access.error });
+        }
+      }
+
+      sendStaffWelcomeEmail({
+        to: email,
+        firstName: first_name,
+        audience: "organizer",
+        preferredLanguage: req.body?.preferred_language,
+      });
+
+      const members = await listOrganizerMembersWithAccess(pool, organizerId);
+      res.status(201).json({ members });
+    },
+  );
+
+  app.patch(
+    "/api/admin/organizers/:organizerId/members/:memberId",
+    requireAdmin,
+    async (req, res) => {
+      const organizerId = Number(req.params.organizerId);
+      const memberId = Number(req.params.memberId);
+      if (!Number.isFinite(organizerId) || !Number.isFinite(memberId)) {
+        return res.status(400).json({ error: "Invalid id" });
+      }
+      const [target] = await pool.query<RowDataPacket[]>(
+        "SELECT id, role FROM organizer_members WHERE id = ? AND organizer_id = ? AND deleted_at IS NULL LIMIT 1",
+        [memberId, organizerId],
+      );
+      if (target.length === 0) {
+        return res.status(404).json({ error: "Member not found" });
+      }
+      if (target[0].role === "owner") {
+        return res.status(403).json({ error: "Cannot modify owner" });
+      }
+
+      const status = req.body?.status != null ? String(req.body.status) : null;
+      if (
+        status &&
+        !["invited", "active", "inactive", "suspended"].includes(status)
+      ) {
+        return res.status(400).json({ error: "Invalid status" });
+      }
+      if (!status) {
+        return res.status(400).json({ error: "status required" });
+      }
+
+      await pool.query<ResultSetHeader>(
+        "UPDATE organizer_members SET status = ? WHERE id = ? AND organizer_id = ?",
+        [status, memberId, organizerId],
+      );
+
+      const [members] = await pool.query<RowDataPacket[]>(
+        `SELECT id, email, first_name, last_name, phone, role, status, invited_at, last_login_at, created_at
+         FROM organizer_members WHERE organizer_id = ? AND deleted_at IS NULL
+         ORDER BY FIELD(role,'owner','organizer','operations','marketing','finance','timing','sponsor','seller'), created_at ASC`,
+        [organizerId],
+      );
+      res.json({ members });
+    },
+  );
+
+  app.get("/api/admin/admins", requireAdmin, async (req, res) => {
+    const q = String(req.query.q ?? "").trim();
+    const result = await listAdminStaff(pool, {
+      q: q || undefined,
+      page: req.query.page,
+      limit: req.query.limit,
+      sortBy: req.query.sortBy,
+      sortDir: req.query.sortDir,
+    });
+    res.json(result);
+  });
+
+  app.post(
+    "/api/admin/admins",
+    requireAdmin,
+    async (req: AuthedRequest, res) => {
+      const actorRole = await getAdminRole(pool, req.auth!.id);
+      if (!actorRole) {
+        return res.status(403).json({ error: "Admin account not found" });
+      }
+
+      const email = String(req.body?.email ?? "")
+        .trim()
+        .toLowerCase();
+      const first_name = String(req.body?.first_name ?? "").trim();
+      const last_name = String(req.body?.last_name ?? "").trim();
+      const role = String(req.body?.role ?? "admin");
+      const phone = req.body?.phone
+        ? String(req.body.phone).trim().slice(0, 20)
+        : null;
+
+      if (!email || !first_name || !last_name) {
+        return res
+          .status(400)
+          .json({ error: "email, first_name, last_name required" });
+      }
+      if (!["admin", "super_admin"].includes(role)) {
+        return res.status(400).json({ error: "invalid role" });
+      }
+      if (role === "super_admin" && !isSuperAdminRole(actorRole)) {
+        return res
+          .status(403)
+          .json({ error: "Only super admins can create super admin accounts" });
+      }
+
+      const [existing] = await pool.query<RowDataPacket[]>(
+        "SELECT id FROM admins WHERE LOWER(TRIM(email)) = ? AND deleted_at IS NULL LIMIT 1",
+        [email],
+      );
+      if (existing.length > 0) {
+        return res.status(409).json({ error: "Admin already exists" });
+      }
+
+      const [result] = await pool.query<ResultSetHeader>(
+        `INSERT INTO admins (public_uuid, email, first_name, last_name, phone, role, status)
+       VALUES (?,?,?,?,?,?,'active')`,
+        [
+          newPublicUuid(),
+          email,
+          first_name.slice(0, 100),
+          last_name.slice(0, 100),
+          phone,
+          role,
+        ],
+      );
+
+      sendStaffWelcomeEmail({
+        to: email,
+        firstName: first_name,
+        audience: "admin",
+        preferredLanguage: req.body?.preferred_language,
+      });
+
+      void sendStaffLoginOtp({
+        adminId: result.insertId,
+        to: email,
+        firstName: first_name,
+        preferredLanguage: req.body?.preferred_language,
+      }).catch((err) => console.error("[email:admin-invite-otp]", err));
+
+      const [[admin]] = await pool.query<RowDataPacket[]>(
+        `SELECT id, email, first_name, last_name, phone, role, status, last_login_at, created_at
+       FROM admins WHERE id = ? LIMIT 1`,
+        [result.insertId],
+      );
+      res.status(201).json({ admin });
+    },
+  );
+
+  app.patch(
+    "/api/admin/admins/:adminId",
+    requireAdmin,
+    async (req: AuthedRequest, res) => {
+      const actorRole = await getAdminRole(pool, req.auth!.id);
+      if (!actorRole) {
+        return res.status(403).json({ error: "Admin account not found" });
+      }
+
+      const adminId = Number(req.params.adminId);
+      if (!Number.isFinite(adminId)) {
+        return res.status(400).json({ error: "Invalid admin id" });
+      }
+      if (adminId === req.auth!.id && req.body?.status === "suspended") {
+        return res
+          .status(403)
+          .json({ error: "Cannot suspend your own account" });
+      }
+
+      const [[existing]] = await pool.query<RowDataPacket[]>(
+        "SELECT id, role FROM admins WHERE id = ? AND deleted_at IS NULL LIMIT 1",
+        [adminId],
+      );
+      if (!existing) {
+        return res.status(404).json({ error: "Admin not found" });
+      }
+      if (
+        !isSuperAdminRole(actorRole) &&
+        isSuperAdminRole(String(existing.role))
+      ) {
+        return res
+          .status(403)
+          .json({ error: "Only super admins can modify super admin accounts" });
+      }
+
+      const updates: string[] = [];
+      const params: (string | number)[] = [];
+
+      if (req.body?.status != null) {
+        const status = String(req.body.status);
+        if (!["active", "inactive", "suspended"].includes(status)) {
+          return res.status(400).json({ error: "Invalid status" });
+        }
+        updates.push("status = ?");
+        params.push(status);
+      }
+      if (req.body?.role != null) {
+        if (!isSuperAdminRole(actorRole)) {
+          return res
+            .status(403)
+            .json({ error: "Only super admins can change admin roles" });
+        }
+        const role = String(req.body.role);
+        if (!["admin", "super_admin"].includes(role)) {
+          return res.status(400).json({ error: "Invalid role" });
+        }
+        if (adminId === req.auth!.id && role !== "super_admin") {
+          return res.status(403).json({ error: "Cannot demote your own role" });
+        }
+        updates.push("role = ?");
+        params.push(role);
+      }
+
+      if (updates.length === 0) {
+        return res.status(400).json({ error: "No fields to update" });
+      }
+
+      params.push(adminId);
+      await pool.query<ResultSetHeader>(
+        `UPDATE admins SET ${updates.join(", ")} WHERE id = ?`,
+        params,
+      );
+
+      const [[admin]] = await pool.query<RowDataPacket[]>(
+        `SELECT id, email, first_name, last_name, phone, role, status, last_login_at, created_at
+       FROM admins WHERE id = ? LIMIT 1`,
+        [adminId],
+      );
+      res.json({ admin });
+    },
+  );
+
+  app.get("/api/admin/payments", requireAdmin, async (req, res) => {
+    const q = String(req.query.q ?? "").trim();
+    const status = String(req.query.status ?? "").trim();
+    const organizerIdRaw = req.query.organizerId;
+    const eventIdRaw = req.query.eventId;
+    const organizerId =
+      organizerIdRaw != null && String(organizerIdRaw).trim() !== ""
+        ? Number(organizerIdRaw)
+        : undefined;
+    const eventId =
+      eventIdRaw != null && String(eventIdRaw).trim() !== ""
+        ? Number(eventIdRaw)
+        : undefined;
+    const result = await listAdminPayments(pool, {
+      q: q || undefined,
+      status: status || undefined,
+      organizerId: Number.isFinite(organizerId!) ? organizerId : undefined,
+      eventId: Number.isFinite(eventId!) ? eventId : undefined,
+      page: req.query.page,
+      limit: req.query.limit,
+      sortBy: req.query.sortBy,
+      sortDir: req.query.sortDir,
+    });
+    res.json(result);
+  });
+
+  app.get("/api/admin/payments/:paymentId", requireAdmin, async (req, res) => {
+    const paymentId = Number(req.params.paymentId);
+    if (!Number.isFinite(paymentId)) {
+      return res.status(400).json({ error: "Invalid payment id" });
+    }
+    const payment = await fetchAdminPaymentDetail(pool, paymentId);
+    if (!payment) {
+      return res.status(404).json({ error: "Payment not found" });
+    }
+    res.json({ payment });
+  });
+
+  app.post(
+    "/api/admin/payments/:paymentId/refund",
+    requireAdmin,
+    async (req: AuthedRequest, res) => {
+      const paymentId = Number(req.params.paymentId);
+      if (!Number.isFinite(paymentId)) {
+        return res.status(400).json({ error: "Invalid payment id" });
+      }
+      if (!processPaymentRefund) {
+        return res.status(503).json({ error: "Refunds are not configured" });
+      }
+      const reason = req.body?.reason
+        ? String(req.body.reason).slice(0, 500)
+        : undefined;
+      try {
+        await processPaymentRefund({
+          paymentId,
+          requestedByType: "admin",
+          requestedById: req.auth!.id,
+          reason,
+        });
+        const [[payment]] = await pool.query<RowDataPacket[]>(
+          `SELECT p.id, p.public_uuid, p.registration_id, p.amount_cents, p.currency, p.status,
+                  p.stripe_payment_intent_id, p.paid_at, p.created_at,
+                  r.registration_number, r.status AS registration_status
+           FROM payments p
+           LEFT JOIN registrations r ON r.id = p.registration_id
+           WHERE p.id = ? LIMIT 1`,
+          [paymentId],
+        );
+        res.json({ ok: true, payment });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Refund failed";
+        res.status(400).json({ error: message });
+      }
+    },
+  );
+
+  async function fetchSponsorAnalytics(eventId: number) {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT es.id AS sponsor_id, es.name, es.tier,
+              SUM(CASE WHEN sa.event_type = 'impression' THEN 1 ELSE 0 END) AS impressions,
+              SUM(CASE WHEN sa.event_type = 'click' THEN 1 ELSE 0 END) AS clicks
+       FROM event_sponsors es
+       LEFT JOIN sponsor_analytics_events sa ON sa.event_sponsor_id = es.id
+       WHERE es.event_id = ? AND es.is_active = 1
+       GROUP BY es.id, es.name, es.tier
+       ORDER BY es.sort_order ASC, es.id ASC`,
+      [eventId],
+    );
+    const sponsors = rows.map((r) => {
+      const impressions = Number(r.impressions ?? 0);
+      const clicks = Number(r.clicks ?? 0);
+      const ctr =
+        impressions > 0 ? Math.round((clicks / impressions) * 1000) / 10 : 0;
+      return {
+        sponsor_id: r.sponsor_id,
+        name: r.name,
+        tier: r.tier,
+        impressions,
+        clicks,
+        ctr,
+      };
+    });
+    const totals = sponsors.reduce(
+      (acc, s) => ({
+        impressions: acc.impressions + s.impressions,
+        clicks: acc.clicks + s.clicks,
+        ctr: 0,
+      }),
+      { impressions: 0, clicks: 0, ctr: 0 },
+    );
+    totals.ctr =
+      totals.impressions > 0
+        ? Math.round((totals.clicks / totals.impressions) * 1000) / 10
+        : 0;
+    return { sponsors, totals };
+  }
+
+  app.get(
+    "/api/organizer/events/:eventId/sponsor-analytics",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json({ error: "Organizer context missing" });
+      }
+      const eventId = Number(req.params.eventId);
+      if (
+        !(await assertMemberCanAccessEvent(
+          pool,
+          req.auth!.id,
+          organizerId,
+          eventId,
+        ))
+      ) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      res.json(await fetchSponsorAnalytics(eventId));
+    },
+  );
+
+  app.get(
+    "/api/admin/events/:eventId/sponsor-analytics",
+    requireAdmin,
+    async (req, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!(await adminEventExists(eventId))) {
+        return res.status(404).json({ error: "Event not found" });
+      }
+      res.json(await fetchSponsorAnalytics(eventId));
+    },
+  );
+
+  if (getStripeClient) {
+    registerStripeConnectRoutes(app, {
+      pool,
+      requireAdmin,
+      requireOrganizer,
+      getStripeClient,
+      appUrl,
+      getOrganizerMemberRole,
+    });
+  }
+}

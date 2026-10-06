@@ -1,0 +1,11338 @@
+import dotenv from "dotenv";
+import type { VercelRequest, VercelResponse } from "@vercel/node";
+import express, {
+  type Request,
+  type Response,
+  type NextFunction,
+} from "express";
+import cors from "cors";
+import mysql, {
+  type Pool,
+  type PoolConnection,
+  type ResultSetHeader,
+  type RowDataPacket,
+} from "mysql2/promise";
+import jwt from "jsonwebtoken";
+import crypto from "crypto";
+import { Resend } from "resend";
+import twilio from "twilio";
+import Stripe from "stripe";
+import { createClerkClient, verifyToken } from "@clerk/backend";
+import {
+  registerStaffPortalRoutes,
+  listAdminAthletes,
+  listStaffRegistrations,
+  listOrganizerMemberEventsPaginated,
+  assertMemberCanAccessEvent,
+  getOrganizerMemberRole,
+} from "../server/staffPortal.js";
+import { registerOrganizerSiteRoutes } from "../server/organizerSites.js";
+import {
+  listStaffEvents,
+  parseSimulationListFilter,
+} from "../server/staffEventsList.js";
+import { canOrganizerEditEvents } from "../shared/staffRoles.js";
+import {
+  getRegistrationWindowError,
+} from "../shared/eventLifecycle.js";
+import {
+  MARKETPLACE_AUTO_DEACTIVATE_SQL,
+  maybeAutoDeactivateEvent,
+} from "../server/eventLifecycle.js";
+import {
+  assertSimulationRegQuota,
+  bumpSimulationActivity,
+} from "../server/simulation.js";
+import { simulationEmailSubjectPrefix } from "../shared/simulation.js";
+import { registerSimulationPublicRoutes } from "../server/simulationHttp.js";
+import { registerSimulationStaffRoutes } from "../server/simulationStaffHttp.js";
+import {
+  applyDiscountToCheckout,
+  breakdownToSnapshot,
+  computeCheckoutBreakdown,
+  computeCheckoutWithExtras,
+  resolveFeePresentation,
+  resolveServiceFeePercent,
+  validateCheckoutBreakdown,
+  type FeePresentation,
+} from "../shared/checkoutBreakdown.js";
+import {
+  applyConnectToPaymentIntent,
+  assertOrganizerPayoutReadyForPaidEvent,
+  attachEventPaymentAvailability,
+  handleStripeAccountUpdatedWebhook,
+  handleStripeConnectDeauthorized,
+  enrichStaffEventsWithPaymentAvailability,
+  resolveCheckoutConnectMode,
+  resolveOrganizerCheckoutDestination,
+} from "../server/stripeConnect.js";
+import {
+  applyMpPaymentWebhookStatus,
+  handleMpConnectWebhook,
+  isMercadoPagoConfigured,
+  mpWebhookSecret,
+  claimMpWebhookEvent,
+  markMpWebhookProcessed,
+  refundMercadoPagoPayment,
+  validateMpWebhookSignature,
+} from "../server/mercadoPago.js";
+import { resolveServiceFeePercentForRail } from "../shared/payoutRail.js";
+import {
+  athleteTotalQualifiesForMsi,
+  computeCheckoutBreakdownForMsiPlan,
+  isMsiPlanMonths,
+  MSI_ALLOWED_PLAN_MONTHS,
+  type MsiPlanMonths,
+} from "../shared/msi.js";
+import { buildStripeRefundParams } from "../server/stripeRefunds.js";
+import {
+  resolvePaymentRefundProvider,
+  skipsExternalRefund,
+} from "../server/paymentRefunds.js";
+import { ensurePendingSpeiSettlement } from "../server/speiSettlements.js";
+import {
+  claimStripeWebhookEvent,
+  markStripeWebhookEventFailed,
+  markStripeWebhookEventProcessed,
+} from "../server/stripeWebhook.js";
+import { registerPhase2Routes } from "../server/phase2.js";
+import { registerEventBroadcastRoutes } from "../server/eventBroadcasts.js";
+import {
+  fetchSitePublicProfile,
+  fetchResendEventUpdatesTopicSetting,
+  normalizeResendEventUpdatesTopicSetting,
+  normalizeSitePublicProfile,
+  saveResendEventUpdatesTopicSetting,
+  saveSitePublicProfile,
+} from "../server/platformSettings.js";
+import { cdnAwareJsonBodyParser } from "../server/cdnUploadJsonBody.js";
+import {
+  isStaffProxyableImageUrl,
+  normalizeEventMediaUrl,
+} from "../shared/cdnUrl.js";
+import {
+  CATEGORY_SOLD_COUNT_UNALIASED_SQL,
+  DISCOUNT_USED_COUNT_SQL,
+  EVENT_REGISTRATION_COUNT_SQL,
+  WAVE_REGISTERED_COUNT_SQL,
+} from "../server/registrationCounts.js";
+import {
+  likePatternsForTokens,
+  rankByFuzzy,
+  searchTokens,
+} from "../server/searchFuzzy.js";
+import {
+  fetchActiveEventWaiversPublic,
+  fetchApplicableWaiversForRegistration,
+  getRegistrationWaiverStatus,
+  insertRegistrationWaiverSignatures,
+  parseWaiverSignatures,
+  resignRegistrationWaivers,
+  validateWaiverSignaturesForEvent,
+  type WaiverSignatureInput,
+} from "../server/eventWaivers.js";
+import { stampRegistrationWaiverAcceptancePdfs } from "../server/stampWaiverAcceptancePdfs.js";
+import {
+  parseCheckoutPaymentMetadata,
+  isGroupCheckoutMetadata,
+  type CheckoutPaymentMetadata,
+} from "../server/checkoutMetadata.js";
+import {
+  claimGuestRegistration,
+  finalizeGroupRegistrationOrder,
+  newPublicUuid as newGroupPublicUuid,
+  validateAndPriceGroupCheckout,
+  type GroupCheckoutApiResponse,
+} from "../server/groupRegistration.js";
+import {
+  fetchEventExtras,
+  fetchRegistrationPurchasedExtras,
+  incrementExtrasSoldCount,
+  insertRegistrationExtras,
+  resolveSelectedExtras,
+  sumExtrasSubtotalCents,
+  validateExtraFieldAnswersForCheckout,
+  type ExtraFieldAnswersInput,
+} from "../server/eventExtras.js";
+import {
+  fetchActiveRegistrationFieldsForEvent,
+  fetchRegistrationFieldsForCategory,
+  mapPublicRegistrationField,
+} from "../server/registrationFields.js";
+import {
+  allocateRegistrationNumber,
+  isFolioBlockFullError,
+  type RegistrationFolioContext,
+} from "../server/folioSegments.js";
+import {
+  fetchEventBibMode,
+  resolveRegistrationBibNumber,
+} from "../server/bibMode.js";
+import {
+  clerkAuthorizedParties,
+  clerkRequestOriginsFromHeaders,
+  getClerkConfigDiagnostics,
+  mergeClerkAuthorizedParties,
+  resolvePublicAppUrl,
+} from "../server/clerkConfig.js";
+import { checkoutTrace, checkoutTraceError } from "../server/checkoutTrace.js";
+import { parseEventDateRange } from "../server/eventsMarketplaceFilters.js";
+import {
+  appendMarketplaceListFilters,
+  listMarketplaceEventsWithFuzzySearch,
+  MARKETPLACE_MIN_PRICE_JOIN_SQL,
+  type MarketplaceListFilters,
+} from "../server/eventsMarketplaceSearch.js";
+import { eventMatchesGeoCitySql, resolveGeoCityById } from "../server/geo.js";
+import {
+  hashAthletePassword,
+  verifyAthletePassword,
+} from "../server/password.js";
+import { validateAthletePassword } from "../shared/passwordPolicy.js";
+import { evaluateCategoryEligibility } from "../shared/categoryEligibility.js";
+import {
+  normalizeApiDateOnly,
+  type RegistrationCheckoutResponse,
+} from "../shared/api.js";
+// Shared modules imported transitively by server/* — referenced here for Vercel bundle.
+import { validateCoursePayload } from "../shared/courseValidation.js";
+import {
+  buildRouteGeoJson,
+  getRouteImportSource,
+  parseRouteGeoJson,
+} from "../shared/courseGeoJson.js";
+import { normalizeEventCourse } from "../shared/courseNormalize.js";
+import {
+  evaluateCheckInWindow,
+  eventEndWallTime,
+  normalizeWallDateTimeFromDb,
+  parseIncomingEventDateTime,
+} from "../shared/checkInWindow.js";
+import { WAIVER_ACCEPTANCE_SIGNATURE } from "../shared/waiverConstants.js";
+import { type AuthErrorCode } from "../shared/authMessages.js";
+import {
+  apiErrorMessage,
+  apiSuccessMessage,
+  API_ERROR_I18N_KEYS,
+  type ApiErrorCode,
+  type ApiSuccessCode,
+} from "../shared/apiMessages.js";
+import { normalizeTheme, type AppTheme } from "../shared/theme.js";
+import { formatExtraFieldAnswerDisplay } from "../shared/extraFields.js";
+import {
+  normalizeEventSubdomain,
+  validateEventSubdomainFormat,
+} from "../shared/eventSubdomain.js";
+import {
+  buildStripePayoutChecklist,
+  buildPlatformPayoutChecklist,
+  deriveStripeConnectStatusFromCapabilities,
+  isOrganizerPayoutReady,
+  isPlatformPayoutProfileComplete,
+} from "../shared/stripeConnect.js";
+import { handleStaffImageProxy } from "../server/staffImageProxy.js";
+import {
+  checkAthleteAuthRateLimit,
+  type AthleteAuthRateLimitScope,
+} from "../server/authRateLimit.js";
+
+/** Keeps transitive server/shared modules in the Vercel lambda bundle (see vercel.json). */
+const __vercelServerBundle = {
+  validateCoursePayload,
+  buildRouteGeoJson,
+  getRouteImportSource,
+  parseRouteGeoJson,
+  evaluateCheckInWindow,
+  eventEndWallTime,
+  normalizeWallDateTimeFromDb,
+  parseIncomingEventDateTime,
+  WAIVER_ACCEPTANCE_SIGNATURE,
+  buildStripePayoutChecklist,
+  buildPlatformPayoutChecklist,
+  deriveStripeConnectStatusFromCapabilities,
+  isOrganizerPayoutReady,
+  isPlatformPayoutProfileComplete,
+  isStaffProxyableImageUrl,
+  handleStaffImageProxy,
+};
+void __vercelServerBundle;
+import {
+  getTestAuthBypass,
+  getTestClerkProfileResolver,
+  getTestPoolOverride,
+  getTestResetCodeGenerator,
+  getTestStripeClientOverride,
+  isTestMode,
+  pushCapturedTestEmail,
+} from "./testHooks.js";
+
+const IS_VERCEL = process.env.VERCEL === "1";
+const IS_PROD = process.env.NODE_ENV === "production";
+
+if (!IS_VERCEL) {
+  dotenv.config();
+}
+
+function logDev(message: string, level: "log" | "warn" = "log") {
+  //if (!IS_PROD) {
+  console[level](message);
+  //}
+}
+
+// ============================================================================
+// LOCALE UTILITIES (inlined for Vercel serverless bundle)
+// ============================================================================
+
+type AppLocale = "es" | "en";
+
+const DEFAULT_LOCALE: AppLocale = "es";
+const SUPPORTED_LOCALES: AppLocale[] = ["es", "en"];
+
+function normalizeLocale(input?: string | null): AppLocale {
+  if (!input) return DEFAULT_LOCALE;
+  const tag = input.trim().toLowerCase();
+  if (tag.startsWith("en")) return "en";
+  if (tag.startsWith("es")) return "es";
+  return DEFAULT_LOCALE;
+}
+
+function localeFromAcceptLanguage(header?: string | null): AppLocale | null {
+  if (!header) return null;
+  const parts = header
+    .split(",")
+    .map((p) => p.split(";")[0]?.trim())
+    .filter(Boolean);
+  for (const part of parts) {
+    const tag = part.toLowerCase();
+    if (tag.startsWith("en")) return "en";
+    if (tag.startsWith("es")) return "es";
+  }
+  return null;
+}
+
+function resolveLocale(
+  ...candidates: (string | null | undefined)[]
+): AppLocale {
+  for (const c of candidates) {
+    if (c != null && String(c).trim() !== "") return normalizeLocale(c);
+  }
+  return DEFAULT_LOCALE;
+}
+
+// ============================================================================
+// EMAIL TEMPLATES (inlined for Vercel serverless bundle)
+// ============================================================================
+
+const EMAIL_BRAND = {
+  black: "#18231F",
+  bgDark: "#0F1613",
+  surfaceDark: "#1A2E26",
+  orange: "#D7ED70",
+  red: "#214B3A",
+  accent: "#D7ED70",
+  success: "#D7ED70",
+  textPrimary: "#FFFFFF",
+  textMuted: "#A8B5AF",
+  textDim: "#7A8A83",
+  border: "#2A3D35",
+  fontFamily:
+    "'Archivo', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif",
+} as const;
+
+type EmailTemplateKind =
+  | "otp"
+  | "passwordReset"
+  | "welcomeAthlete"
+  | "welcomeStaff"
+  | "registrationConfirmed"
+  | "waiverAcceptanceUpdated"
+  | "groupOrderSummary"
+  | "eventSubmittedForApproval"
+  | "eventApproved"
+  | "eventRejected"
+  | "organizerPayoutSetup";
+
+type EmailAudience = "athlete" | "admin" | "organizer";
+
+function emailLogoBlock(height = 36): string {
+  const fontSize = Math.max(18, Math.round(height * 0.72));
+  return `<span style="display:inline-block;font-size:${fontSize}px;font-weight:800;letter-spacing:-0.02em;color:${EMAIL_BRAND.textPrimary};line-height:1;">atleita<span style="color:${EMAIL_BRAND.orange};">.</span></span>`;
+}
+
+function emailCheckIcon(size = 16, stroke = EMAIL_BRAND.success): string {
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="${stroke}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="vertical-align:middle;display:inline-block;"><path d="M20 6 9 17l-5-5"/></svg>`;
+}
+
+type EmailStrings = {
+  subjects: Record<EmailTemplateKind, string>;
+  otp: {
+    preheader: string;
+    title: string;
+    greeting: string;
+    intro: string;
+    expiry: string;
+    security: string;
+    ignore: string;
+  };
+  welcomeAthlete: {
+    preheader: string;
+    title: string;
+    greeting: string;
+    intro: string;
+    cta: string;
+    features: [string, string, string];
+  };
+  welcomeStaff: {
+    preheader: string;
+    preheaderOrganizer: string;
+    title: string;
+    titleOrganizer: string;
+    greeting: string;
+    introAdmin: string;
+    introOrganizer: string;
+    platformLine: string;
+    featuresHeading: string;
+    features: [string, string, string, string, string, string];
+    stepsHeading: string;
+    steps: [string, string, string, string];
+    footnote: string;
+    cta: string;
+    subjectOrganizer: string;
+  };
+  registrationConfirmed: {
+    preheader: string;
+    title: string;
+    greeting: string;
+    intro: string;
+    eventLabel: string;
+    categoryLabel: string;
+    folioLabel: string;
+    extrasHeading: string;
+    cta: string;
+    guestClaimIntro: string;
+    guestClaimCta: string;
+  };
+  waiverAcceptanceUpdated: {
+    preheader: string;
+    title: string;
+    greeting: string;
+    intro: string;
+    eventLabel: string;
+    categoryLabel: string;
+    folioLabel: string;
+    attachNote: string;
+    cta: string;
+  };
+  groupOrderSummary: {
+    preheader: string;
+    title: string;
+    greeting: string;
+    intro: string;
+    eventLabel: string;
+    totalLabel: string;
+    participantsHeading: string;
+    cta: string;
+    walletHint: string;
+    walletCta: string;
+  };
+  footer: {
+    tagline: string;
+    help: string;
+    copyright: string;
+  };
+  sms: {
+    otp: string;
+  };
+  passwordReset: {
+    preheader: string;
+    title: string;
+    greeting: string;
+    intro: string;
+    expiry: string;
+    security: string;
+    cta: string;
+  };
+  eventSubmittedForApproval: {
+    preheader: string;
+    title: string;
+    greeting: string;
+    intro: string;
+    eventLabel: string;
+    cta: string;
+  };
+  eventApproved: {
+    preheader: string;
+    title: string;
+    greeting: string;
+    intro: string;
+    eventLabel: string;
+    cta: string;
+  };
+  eventRejected: {
+    preheader: string;
+    title: string;
+    greeting: string;
+    intro: string;
+    eventLabel: string;
+    reasonLabel: string;
+    noReason: string;
+    cta: string;
+  };
+  organizerPayoutSetup: {
+    preheader: string;
+    title: string;
+    greeting: string;
+    intro: string;
+    eventLabel: string;
+    steps: [string, string, string];
+    stepsHeading: string;
+    footnote: string;
+    cta: string;
+  };
+};
+
+const EMAIL_STRINGS_ES: EmailStrings = {
+  subjects: {
+    otp: "{{code}} es tu código de verificación — Atleita",
+    passwordReset: "{{code}} — restablece tu contraseña Atleita",
+    welcomeAthlete: "¡Bienvenido a Atleita!",
+    welcomeStaff: "Bienvenido al Staff Console — Atleita",
+    registrationConfirmed: "¡Inscripción confirmada! — Atleita",
+    waiverAcceptanceUpdated: "Responsiva actualizada — Atleita",
+    groupOrderSummary: "Resumen de tu pedido grupal — Atleita",
+    eventSubmittedForApproval: "Evento pendiente de aprobación — Atleita",
+    eventApproved: "¡Evento publicado! — Atleita",
+    eventRejected: "Evento devuelto a borrador — Atleita",
+    organizerPayoutSetup: "Activa cobros en línea — Atleita",
+  },
+  otp: {
+    preheader: "Tu código de acceso expira en 10 minutos",
+    title: "Código de verificación",
+    greeting: "Hola {{name}},",
+    intro: "Usa este código para acceder a tu cuenta de Atleita:",
+    expiry: "Expira en {{minutes}} minutos. No lo compartas con nadie.",
+    security:
+      "Si no solicitaste este código, puedes ignorar este correo de forma segura.",
+    ignore: "¿No fuiste tú? Ignora este mensaje.",
+  },
+  welcomeAthlete: {
+    preheader: "Tu portal de atleta está listo",
+    title: "¡Bienvenido al equipo!",
+    greeting: "Hola {{name}},",
+    intro:
+      "Tu cuenta está activa. Desde tu portal puedes inscribirte a eventos, ver tus QR y consultar resultados.",
+    cta: "Ir a mi portal",
+    features: [
+      "Inscripciones en segundos",
+      "QR y folio al instante",
+      "Resultados y rankings",
+    ],
+  },
+  welcomeStaff: {
+    preheader: "Acceso al panel de operaciones",
+    preheaderOrganizer: "Eventos, inscripciones y pagos en un solo lugar",
+    title: "Bienvenido al Staff Console",
+    titleOrganizer: "Tu hub de organizador está listo",
+    greeting: "Hola {{name}},",
+    introAdmin:
+      "Tienes acceso al panel de administración de Atleita. Inicia sesión en la consola de staff con tu correo; recibirás un código de verificación para entrar.",
+    introOrganizer:
+      "Atleita es la plataforma all-in-one para organizar competencias: publica eventos, cobra en línea, entrega QR a atletas y gestiona tu equipo — sin hojas de cálculo ni herramientas dispersas.",
+    platformLine: "Todo en una plataforma",
+    featuresHeading: "Qué puedes hacer",
+    features: [
+      "Publica eventos con categorías, precios y media",
+      "Inscripciones online con QR y folio al instante",
+      "Cobros seguros con Stripe Connect",
+      "Roles de equipo (ops, marketing, timing, finanzas)",
+      "Portal del atleta, resultados y rankings",
+      "Aprobación Atleita antes de salir al marketplace",
+    ],
+    stepsHeading: "Próximos pasos",
+    steps: [
+      "Entra con tu correo — te enviamos un código (sin contraseña)",
+      "Completa el onboarding y crea tu primer evento en borrador",
+      "Activa cobros cuando estés listo para vender",
+      "Envía el evento a revisión; Atleita lo publica al marketplace",
+    ],
+    footnote:
+      "¿Dudas? Escríbenos a soporte@atleita.com — estamos para ayudarte.",
+    cta: "Abrir consola",
+    subjectOrganizer:
+      "Bienvenido a Atleita — tu plataforma de eventos",
+  },
+  registrationConfirmed: {
+    preheader: "Tu lugar en la competencia está asegurado",
+    title: "¡Inscripción confirmada!",
+    greeting: "Hola {{name}},",
+    intro:
+      "Tu registro fue procesado correctamente. Guarda este correo como comprobante.",
+    eventLabel: "Evento",
+    categoryLabel: "Categoría",
+    folioLabel: "Folio",
+    extrasHeading: "Complementos",
+    cta: "Ver mi inscripción",
+    guestClaimIntro:
+      "Esta inscripción fue comprada para ti. Crea tu cuenta Atleita o inicia sesión con este correo para ver tu QR en el portal.",
+    guestClaimCta: "Reclamar mi inscripción",
+  },
+  waiverAcceptanceUpdated: {
+    preheader: "Tu comprobante de responsiva actualizado",
+    title: "Responsiva actualizada",
+    greeting: "Hola {{name}},",
+    intro:
+      "Firmaste de nuevo las responsivas de este evento. Adjuntamos el comprobante de aceptación actualizado.",
+    eventLabel: "Evento",
+    categoryLabel: "Categoría",
+    folioLabel: "Folio",
+    attachNote: "Se adjunta un PDF de comprobante de aceptación para tu registro.",
+    cta: "Ver mi inscripción",
+  },
+  groupOrderSummary: {
+    preheader: "Tu pedido grupal fue confirmado",
+    title: "Pedido grupal confirmado",
+    greeting: "Hola {{name}},",
+    intro:
+      "Procesamos tu pedido grupal. Guarda tus pases en el portal — ahí tienes los QR de niños e invitados sin reclamar.",
+    eventLabel: "Evento",
+    totalLabel: "Total pagado",
+    participantsHeading: "Participantes",
+    cta: "Ver mis inscripciones",
+    walletHint:
+      "Tu billetera de pases guarda los QR que tú presentas en el acceso (menores y huéspedes pendientes de reclamar).",
+    walletCta: "Abrir mi billetera de pases",
+  },
+  footer: {
+    tagline: "La plataforma de eventos deportivos de México",
+    help: "¿Necesitas ayuda? Responde a este correo o visita nuestro centro de soporte.",
+    copyright: "© {{year}} Atleita. Todos los derechos reservados.",
+  },
+  sms: {
+    otp: "Atleita: tu código es {{code}}. Expira en {{minutes}} min.",
+  },
+  passwordReset: {
+    preheader: "Enlace para restablecer tu contraseña",
+    title: "Restablecer contraseña",
+    greeting: "Hola {{name}},",
+    intro:
+      "Usa este código para restablecer la contraseña de tu cuenta. También puedes usar el botón de abajo:",
+    expiry: "Este enlace expira en {{minutes}} minutos.",
+    security:
+      "Si no solicitaste este cambio, ignora este correo. Tu contraseña actual seguirá funcionando.",
+    cta: "Restablecer contraseña",
+  },
+  eventSubmittedForApproval: {
+    preheader: "Un organizador envió un evento para revisión",
+    title: "Evento pendiente de aprobación",
+    greeting: "Hola {{name}},",
+    intro:
+      "Un organizador envió un evento para tu revisión. Apruébalo o devuélvelo a borrador desde la consola de staff.",
+    eventLabel: "Evento",
+    cta: "Revisar en consola",
+  },
+  eventApproved: {
+    preheader: "Tu evento ya está publicado",
+    title: "¡Evento aprobado!",
+    greeting: "Hola {{name}},",
+    intro:
+      "Tu evento fue aprobado y ya está publicado. Los atletas pueden verlo e inscribirse.",
+    eventLabel: "Evento",
+    cta: "Ver evento en consola",
+  },
+  eventRejected: {
+    preheader: "Tu evento necesita cambios antes de publicarse",
+    title: "Evento devuelto a borrador",
+    greeting: "Hola {{name}},",
+    intro:
+      "Un administrador devolvió tu evento a borrador. Revisa los comentarios, ajusta lo necesario y vuelve a enviarlo.",
+    eventLabel: "Evento",
+    reasonLabel: "Motivo",
+    noReason: "No se indicó un motivo específico.",
+    cta: "Editar evento",
+  },
+  organizerPayoutSetup: {
+    preheader: "Configura pagos para vender inscripciones de pago",
+    title: "Activa tus cobros en línea",
+    greeting: "Hola {{name}},",
+    intro:
+      "Tu evento ya está publicado. Para vender categorías de pago y recibir el dinero en tu cuenta, completa la configuración de pagos en unos minutos — todo dentro de Atleita.",
+    eventLabel: "Evento",
+    steps: [
+      "Completa tu perfil fiscal y de facturación",
+      "Acepta los términos de pagos y comisiones",
+      "Conecta tu banco o envía tu Cuenta de Pago (CLABE) para revisión",
+    ],
+    stepsHeading: "En 3 pasos",
+    footnote:
+      "Mientras tanto, las categorías gratuitas siguen disponibles para inscripción.",
+    cta: "Configurar pagos",
+  },
+};
+
+const EMAIL_STRINGS_EN: EmailStrings = {
+  subjects: {
+    otp: "{{code}} is your Atleita verification code",
+    passwordReset: "{{code}} — reset your Atleita password",
+    welcomeAthlete: "Welcome to Atleita!",
+    welcomeStaff: "Welcome to Staff Console — Atleita",
+    registrationConfirmed: "Registration confirmed! — Atleita",
+    waiverAcceptanceUpdated: "Waiver acceptance updated — Atleita",
+    groupOrderSummary: "Your group order summary — Atleita",
+    eventSubmittedForApproval: "Event pending approval — Atleita",
+    eventApproved: "Event published! — Atleita",
+    eventRejected: "Event returned to draft — Atleita",
+    organizerPayoutSetup: "Activate online payouts — Atleita",
+  },
+  otp: {
+    preheader: "Your access code expires in 10 minutes",
+    title: "Verification code",
+    greeting: "Hi {{name}},",
+    intro: "Use this code to sign in to your Atleita account:",
+    expiry: "Expires in {{minutes}} minutes. Never share this code.",
+    security:
+      "If you didn't request this code, you can safely ignore this email.",
+    ignore: "Wasn't you? Ignore this message.",
+  },
+  welcomeAthlete: {
+    preheader: "Your athlete portal is ready",
+    title: "Welcome to the team!",
+    greeting: "Hi {{name}},",
+    intro:
+      "Your account is active. From your portal you can register for events, view QR codes, and check results.",
+    cta: "Go to my portal",
+    features: [
+      "Register in seconds",
+      "Instant QR & bib number",
+      "Results & rankings",
+    ],
+  },
+  welcomeStaff: {
+    preheader: "Operations panel access",
+    preheaderOrganizer: "Events, registrations, and payments in one place",
+    title: "Welcome to Staff Console",
+    titleOrganizer: "Your organizer hub is ready",
+    greeting: "Hi {{name}},",
+    introAdmin:
+      "You have access to the Atleita admin panel. Sign in at the staff console with your email; we'll send you a verification code to get in.",
+    introOrganizer:
+      "Atleita is the all-in-one platform for running competitions: publish events, collect payments online, deliver athlete QRs, and manage your team — no spreadsheets or scattered tools.",
+    platformLine: "Everything in one platform",
+    featuresHeading: "What you can do",
+    features: [
+      "Publish events with categories, pricing, and media",
+      "Online registrations with instant QR and bib numbers",
+      "Secure payouts with Stripe Connect",
+      "Team roles (ops, marketing, timing, finance)",
+      "Athlete portal, results, and rankings",
+      "Atleita approval before you go live on the marketplace",
+    ],
+    stepsHeading: "Next steps",
+    steps: [
+      "Sign in with your email — we send a code (no password)",
+      "Finish onboarding and create your first event as a draft",
+      "Enable payouts when you're ready to sell",
+      "Submit for review; Atleita publishes it to the marketplace",
+    ],
+    footnote:
+      "Questions? Email us at soporte@atleita.com — we're here to help.",
+    cta: "Open console",
+    subjectOrganizer: "Welcome to Atleita — your event platform",
+  },
+  registrationConfirmed: {
+    preheader: "Your spot in the race is secured",
+    title: "Registration confirmed!",
+    greeting: "Hi {{name}},",
+    intro:
+      "Your registration was processed successfully. Keep this email as proof.",
+    eventLabel: "Event",
+    categoryLabel: "Category",
+    folioLabel: "Registration #",
+    extrasHeading: "Add-ons",
+    cta: "View my registration",
+    guestClaimIntro:
+      "This registration was purchased for you. Create your Atleita account or sign in with this email to access your QR in the portal.",
+    guestClaimCta: "Claim my registration",
+  },
+  waiverAcceptanceUpdated: {
+    preheader: "Your updated waiver acceptance certificate",
+    title: "Waiver acceptance updated",
+    greeting: "Hi {{name}},",
+    intro:
+      "You re-signed the waivers for this event. An updated acceptance certificate is attached.",
+    eventLabel: "Event",
+    categoryLabel: "Category",
+    folioLabel: "Registration #",
+    attachNote: "A stamped acceptance PDF is attached to this email for your records.",
+    cta: "View my registration",
+  },
+  groupOrderSummary: {
+    preheader: "Your group order is confirmed",
+    title: "Group order confirmed",
+    greeting: "Hi {{name}},",
+    intro:
+      "Your group order was processed. Keep your passes in the portal — you hold QRs for kids and unclaimed guests.",
+    eventLabel: "Event",
+    totalLabel: "Total paid",
+    participantsHeading: "Participants",
+    cta: "View my registrations",
+    walletHint:
+      "Your pass wallet keeps the QRs you show at the gate (minors and guests still waiting to claim).",
+    walletCta: "Open my pass wallet",
+  },
+  footer: {
+    tagline: "Mexico's sports events platform",
+    help: "Need help? Reply to this email or visit our support center.",
+    copyright: "© {{year}} Atleita. All rights reserved.",
+  },
+  sms: {
+    otp: "Atleita: your code is {{code}}. Expires in {{minutes}} min.",
+  },
+  passwordReset: {
+    preheader: "Link to reset your password",
+    title: "Reset password",
+    greeting: "Hi {{name}},",
+    intro:
+      "Use this code to reset your account password. You can also tap the button below:",
+    expiry: "This link expires in {{minutes}} minutes.",
+    security:
+      "If you didn't request this change, ignore this email. Your current password will still work.",
+    cta: "Reset password",
+  },
+  eventSubmittedForApproval: {
+    preheader: "An organizer submitted an event for review",
+    title: "Event pending approval",
+    greeting: "Hi {{name}},",
+    intro:
+      "An organizer submitted an event for your review. Approve it or return it to draft from the staff console.",
+    eventLabel: "Event",
+    cta: "Review in console",
+  },
+  eventApproved: {
+    preheader: "Your event is now live",
+    title: "Event approved!",
+    greeting: "Hi {{name}},",
+    intro:
+      "Your event was approved and is now published. Athletes can view it and register.",
+    eventLabel: "Event",
+    cta: "View event in console",
+  },
+  eventRejected: {
+    preheader: "Your event needs changes before it can go live",
+    title: "Event returned to draft",
+    greeting: "Hi {{name}},",
+    intro:
+      "An admin returned your event to draft. Review the feedback, make updates, and submit again.",
+    eventLabel: "Event",
+    reasonLabel: "Reason",
+    noReason: "No specific reason was provided.",
+    cta: "Edit event",
+  },
+  organizerPayoutSetup: {
+    preheader: "Set up payouts to sell paid entries",
+    title: "Activate your online payouts",
+    greeting: "Hi {{name}},",
+    intro:
+      "Your event is now live. To sell paid categories and receive funds in your bank account, complete payout setup in just a few minutes — all inside Atleita.",
+    eventLabel: "Event",
+    steps: [
+      "Complete your billing and tax profile",
+      "Accept payout terms and platform fees",
+      "Connect your bank or submit your Cuenta de Pago (CLABE) for review",
+    ],
+    stepsHeading: "3 quick steps",
+    footnote: "Free categories remain open for registration in the meantime.",
+    cta: "Set up payouts",
+  },
+};
+
+const EMAIL_STRINGS: Record<AppLocale, EmailStrings> = {
+  es: EMAIL_STRINGS_ES,
+  en: EMAIL_STRINGS_EN,
+};
+
+function emailStrings(locale: AppLocale): EmailStrings {
+  return EMAIL_STRINGS[locale] ?? EMAIL_STRINGS.es;
+}
+
+function interpolateEmail(
+  template: string,
+  vars: Record<string, string | number>,
+): string {
+  return template.replace(/\{\{(\w+)\}\}/g, (_, key) =>
+    String(vars[key] ?? ""),
+  );
+}
+
+function smsOtpMessage(
+  locale: AppLocale,
+  code: string,
+  minutes: number,
+): string {
+  return interpolateEmail(emailStrings(locale).sms.otp, { code, minutes });
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+interface OrgEmailChrome {
+  organizerName: string;
+  logoUrl?: string | null;
+  primaryColor?: string | null;
+  accentColor?: string | null;
+}
+
+interface BaseEmailOptions {
+  locale: AppLocale;
+  preheader: string;
+  title: string;
+  bodyHtml: string;
+  cta?: { label: string; url: string };
+  appUrl: string;
+  /** 17C-i: optional organizer chrome on platform-owned OTP emails */
+  orgChrome?: OrgEmailChrome | null;
+  poweredByAtleita?: boolean;
+}
+
+function emailShell(opts: BaseEmailOptions): string {
+  const {
+    locale,
+    preheader,
+    title,
+    bodyHtml,
+    cta,
+    appUrl,
+    orgChrome,
+    poweredByAtleita = true,
+  } = opts;
+  const s = emailStrings(locale);
+  const year = new Date().getFullYear();
+  const accent = orgChrome?.primaryColor || EMAIL_BRAND.orange;
+  const ctaBg = orgChrome?.accentColor || EMAIL_BRAND.orange;
+  const ctaBlock = cta
+    ? `<tr><td align="center" style="padding:0 32px 28px;">
+        <table role="presentation" cellspacing="0" cellpadding="0" border="0">
+          <tr><td align="center" bgcolor="${escapeHtml(ctaBg)}" style="border-radius:12px;background:${escapeHtml(ctaBg)};">
+            <a href="${escapeHtml(cta.url)}" target="_blank" style="display:inline-block;padding:14px 32px;color:${EMAIL_BRAND.textPrimary};font-weight:700;font-size:15px;text-decoration:none;border-radius:12px;">${escapeHtml(cta.label)}</a>
+          </td></tr>
+        </table>
+      </td></tr>`
+    : "";
+
+  const headerBrand = orgChrome
+    ? `<table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%">
+        <tr>
+          <td valign="middle">
+            ${
+              orgChrome.logoUrl
+                ? `<img src="${escapeHtml(orgChrome.logoUrl)}" alt="${escapeHtml(orgChrome.organizerName)}" width="140" style="display:block;max-width:140px;height:auto;border:0;" />`
+                : `<span style="font-size:18px;font-weight:800;color:${EMAIL_BRAND.textPrimary};">${escapeHtml(orgChrome.organizerName)}</span>`
+            }
+          </td>
+        </tr>
+      </table>`
+    : emailLogoBlock();
+
+  const poweredLine = poweredByAtleita
+    ? `<p style="margin:16px 0 0;font-size:11px;color:${EMAIL_BRAND.textDim};">Powered by <a href="${escapeHtml(appUrl)}" style="color:${escapeHtml(accent)};text-decoration:none;font-weight:600;">Atleita</a></p>`
+    : "";
+
+  return `<!DOCTYPE html>
+<html lang="${locale === "es" ? "es-MX" : "en"}">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <meta name="color-scheme" content="dark"/>
+  <meta name="supported-color-schemes" content="dark"/>
+  <title>${escapeHtml(title)}</title>
+  <!--[if mso]><style>table{border-collapse:collapse;}td{font-family:Arial,sans-serif;}</style><![endif]-->
+  <style type="text/css">
+    body, table, td { margin: 0; padding: 0; }
+    table { border-collapse: collapse; mso-table-lspace: 0pt; mso-table-rspace: 0pt; }
+    @media only screen and (max-width: 620px) {
+      .email-container { width: 100% !important; max-width: 100% !important; }
+      .email-content, .email-header, .email-footer { padding-left: 20px !important; padding-right: 20px !important; }
+    }
+  </style>
+</head>
+<body style="margin:0;padding:0;background-color:${EMAIL_BRAND.bgDark};font-family:${EMAIL_BRAND.fontFamily};-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;">
+  <div style="display:none;max-height:0;overflow:hidden;mso-hide:all;">${escapeHtml(preheader)}&#847;&zwnj;&nbsp;</div>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" bgcolor="${EMAIL_BRAND.bgDark}">
+    <tr>
+      <td align="center" valign="top" style="padding:32px 16px;">
+        <table role="presentation" class="email-container" width="560" cellspacing="0" cellpadding="0" border="0" bgcolor="${EMAIL_BRAND.surfaceDark}" style="width:560px;max-width:560px;border-radius:16px;border:1px solid ${EMAIL_BRAND.border};">
+          <tr>
+            <td class="email-header" bgcolor="${EMAIL_BRAND.black}" style="padding:28px 32px 20px;border-bottom:2px solid ${escapeHtml(accent)};">
+              ${headerBrand}
+              <h1 style="margin:16px 0 0;font-size:24px;font-weight:800;color:${EMAIL_BRAND.textPrimary};line-height:1.3;">${escapeHtml(title)}</h1>
+            </td>
+          </tr>
+          <tr>
+            <td class="email-content" style="padding:28px 32px;color:${EMAIL_BRAND.textPrimary};font-size:16px;line-height:1.65;">
+              ${bodyHtml}
+            </td>
+          </tr>
+          ${ctaBlock}
+          <tr>
+            <td class="email-footer" bgcolor="${EMAIL_BRAND.black}" style="padding:24px 32px 28px;border-top:1px solid ${EMAIL_BRAND.border};">
+              <p style="margin:0 0 8px;font-size:13px;color:${escapeHtml(accent)};font-weight:600;">${escapeHtml(s.footer.tagline)}</p>
+              <p style="margin:0 0 16px;font-size:12px;color:${EMAIL_BRAND.textDim};line-height:1.5;">${escapeHtml(s.footer.help)}</p>
+              <p style="margin:0;font-size:11px;color:${EMAIL_BRAND.textMuted};">${escapeHtml(interpolateEmail(s.footer.copyright, { year }))}</p>
+              <p style="margin:12px 0 0;font-size:11px;"><a href="${escapeHtml(appUrl)}" style="color:${escapeHtml(accent)};text-decoration:none;">${escapeHtml(appUrl.replace(/^https?:\/\//, ""))}</a></p>
+              ${poweredLine}
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+}
+
+function otpCodeBlock(code: string): string {
+  return `<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+    <tr>
+      <td align="center" style="padding:24px 0 0;">
+        <table role="presentation" cellspacing="0" cellpadding="0" border="0" bgcolor="${EMAIL_BRAND.black}" style="border:2px solid ${EMAIL_BRAND.orange};border-radius:12px;">
+          <tr>
+            <td align="center" style="padding:18px 28px;font-size:32px;font-weight:800;font-family:ui-monospace,'SF Mono',Consolas,monospace;color:${EMAIL_BRAND.orange};line-height:1.2;letter-spacing:0.08em;">${escapeHtml(code)}</td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>`;
+}
+
+function buildOtpEmail(params: {
+  locale: AppLocale;
+  firstName: string;
+  code: string;
+  minutes?: number;
+  appUrl: string;
+  orgChrome?: OrgEmailChrome | null;
+}): { subject: string; html: string; text: string } {
+  const { locale, firstName, code, minutes = 10, appUrl, orgChrome } = params;
+  const s = emailStrings(locale);
+  const bodyHtml = `
+    <p style="margin:0 0 12px;color:${EMAIL_BRAND.textPrimary};font-size:17px;">${escapeHtml(interpolateEmail(s.otp.greeting, { name: firstName }))}</p>
+    <p style="margin:0 0 8px;color:${EMAIL_BRAND.textMuted};">${escapeHtml(s.otp.intro)}</p>
+    ${otpCodeBlock(code)}
+    <p style="margin:16px 0 0;text-align:center;font-size:13px;color:${EMAIL_BRAND.textDim};">${interpolateEmail(escapeHtml(s.otp.expiry), { minutes })}</p>
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="margin-top:20px;">
+      <tr>
+        <td style="padding:16px;background-color:${EMAIL_BRAND.black};border-radius:10px;border-left:3px solid ${EMAIL_BRAND.orange};font-size:13px;color:${EMAIL_BRAND.textMuted};line-height:1.5;">${escapeHtml(s.otp.security)}</td>
+      </tr>
+    </table>`;
+
+  const subject = interpolateEmail(s.subjects.otp, { code });
+  const html = emailShell({
+    locale,
+    preheader: s.otp.preheader,
+    title: s.otp.title,
+    bodyHtml,
+    appUrl,
+    orgChrome: orgChrome ?? null,
+    poweredByAtleita: true,
+  });
+  const text = `${interpolateEmail(s.otp.greeting, { name: firstName })}\n\n${s.otp.intro}\n\n${code}\n\n${interpolateEmail(s.otp.expiry, { minutes })}\n\nPowered by Atleita`;
+
+  return { subject, html, text };
+}
+
+function buildWelcomeAthleteEmail(params: {
+  locale: AppLocale;
+  firstName: string;
+  appUrl: string;
+}): { subject: string; html: string; text: string } {
+  const { locale, firstName, appUrl } = params;
+  const s = emailStrings(locale);
+  const features = s.welcomeAthlete.features
+    .map(
+      (f, i) =>
+        `<tr><td style="padding:12px 16px;${i < s.welcomeAthlete.features.length - 1 ? `border-bottom:1px solid ${EMAIL_BRAND.border};` : ""}">
+          <table role="presentation" cellspacing="0" cellpadding="0" border="0">
+            <tr>
+              <td valign="top" width="24" style="width:24px;padding-right:10px;padding-top:2px;">${emailCheckIcon()}</td>
+              <td valign="top" style="color:${EMAIL_BRAND.textMuted};font-size:15px;line-height:1.5;">${escapeHtml(f)}</td>
+            </tr>
+          </table>
+        </td></tr>`,
+    )
+    .join("");
+
+  const bodyHtml = `
+    <p style="margin:0 0 12px;font-size:17px;">${escapeHtml(interpolateEmail(s.welcomeAthlete.greeting, { name: firstName }))}</p>
+    <p style="margin:0 0 20px;color:${EMAIL_BRAND.textMuted};">${escapeHtml(s.welcomeAthlete.intro)}</p>
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" bgcolor="${EMAIL_BRAND.black}" style="border-radius:12px;border:1px solid ${EMAIL_BRAND.border};">${features}</table>`;
+
+  const portalUrl = `${appUrl.replace(/\/$/, "")}/portal`;
+  return {
+    subject: s.subjects.welcomeAthlete,
+    html: emailShell({
+      locale,
+      preheader: s.welcomeAthlete.preheader,
+      title: s.welcomeAthlete.title,
+      bodyHtml,
+      cta: { label: s.welcomeAthlete.cta, url: portalUrl },
+      appUrl,
+    }),
+    text: `${interpolateEmail(s.welcomeAthlete.greeting, { name: firstName })}\n\n${s.welcomeAthlete.intro}\n\n${portalUrl}`,
+  };
+}
+
+function buildPasswordResetEmail(params: {
+  locale: AppLocale;
+  firstName: string;
+  code: string;
+  resetUrl: string;
+  minutes?: number;
+  appUrl: string;
+}): { subject: string; html: string; text: string } {
+  const {
+    locale,
+    firstName,
+    code,
+    resetUrl,
+    minutes = OTP_TTL_MIN,
+    appUrl,
+  } = params;
+  const s = emailStrings(locale);
+  const bodyHtml = `
+    <p style="margin:0 0 12px;color:${EMAIL_BRAND.textPrimary};font-size:17px;">${escapeHtml(interpolateEmail(s.passwordReset.greeting, { name: firstName }))}</p>
+    <p style="margin:0 0 8px;color:${EMAIL_BRAND.textMuted};">${escapeHtml(s.passwordReset.intro)}</p>
+    ${otpCodeBlock(code)}
+    <p style="margin:16px 0 0;text-align:center;font-size:13px;color:${EMAIL_BRAND.textDim};">${interpolateEmail(escapeHtml(s.passwordReset.expiry), { minutes })}</p>
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="margin-top:20px;">
+      <tr>
+        <td style="padding:16px;background-color:${EMAIL_BRAND.black};border-radius:10px;border-left:3px solid ${EMAIL_BRAND.orange};font-size:13px;color:${EMAIL_BRAND.textMuted};line-height:1.5;">${escapeHtml(s.passwordReset.security)}</td>
+      </tr>
+    </table>`;
+
+  return {
+    subject: interpolateEmail(s.subjects.passwordReset, { code }),
+    html: emailShell({
+      locale,
+      preheader: s.passwordReset.preheader,
+      title: s.passwordReset.title,
+      bodyHtml,
+      cta: { label: s.passwordReset.cta, url: resetUrl },
+      appUrl,
+    }),
+    text: `${interpolateEmail(s.passwordReset.greeting, { name: firstName })}\n\n${s.passwordReset.intro}\n\n${code}\n\n${resetUrl}\n\n${interpolateEmail(s.passwordReset.expiry, { minutes })}`,
+  };
+}
+
+export function buildWelcomeStaffEmail(params: {
+  locale: AppLocale;
+  firstName: string;
+  audience: EmailAudience;
+  appUrl: string;
+}): { subject: string; html: string; text: string } {
+  const { locale, firstName, audience, appUrl } = params;
+  const s = emailStrings(locale);
+  const staffUrl = `${appUrl.replace(/\/$/, "")}/staff`;
+  const greeting = interpolateEmail(s.welcomeStaff.greeting, { name: firstName });
+
+  if (audience !== "organizer") {
+    const bodyHtml = `
+    <p style="margin:0 0 12px;font-size:17px;">${escapeHtml(greeting)}</p>
+    <p style="margin:0;color:${EMAIL_BRAND.textMuted};">${escapeHtml(s.welcomeStaff.introAdmin)}</p>`;
+    return {
+      subject: s.subjects.welcomeStaff,
+      html: emailShell({
+        locale,
+        preheader: s.welcomeStaff.preheader,
+        title: s.welcomeStaff.title,
+        bodyHtml,
+        cta: { label: s.welcomeStaff.cta, url: staffUrl },
+        appUrl,
+      }),
+      text: `${greeting}\n\n${s.welcomeStaff.introAdmin}\n\n${staffUrl}`,
+    };
+  }
+
+  const features = s.welcomeStaff.features
+    .map(
+      (f, i) =>
+        `<tr><td style="padding:12px 16px;${i < s.welcomeStaff.features.length - 1 ? `border-bottom:1px solid ${EMAIL_BRAND.border};` : ""}">
+          <table role="presentation" cellspacing="0" cellpadding="0" border="0">
+            <tr>
+              <td valign="top" width="24" style="width:24px;padding-right:10px;padding-top:2px;">${emailCheckIcon()}</td>
+              <td valign="top" style="color:${EMAIL_BRAND.textMuted};font-size:15px;line-height:1.5;">${escapeHtml(f)}</td>
+            </tr>
+          </table>
+        </td></tr>`,
+    )
+    .join("");
+
+  const bodyHtml = `
+    <p style="margin:0 0 12px;font-size:17px;">${escapeHtml(greeting)}</p>
+    <p style="margin:0 0 16px;color:${EMAIL_BRAND.textMuted};line-height:1.55;">${escapeHtml(s.welcomeStaff.introOrganizer)}</p>
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="margin-bottom:20px;">
+      <tr>
+        <td align="center" style="padding:12px 16px;border-radius:12px;background:linear-gradient(135deg,${EMAIL_BRAND.orange}22 0%,${EMAIL_BRAND.red}18 100%);border:1px solid ${EMAIL_BRAND.orange}55;">
+          <span style="display:block;font-size:13px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;color:${EMAIL_BRAND.orange};">${escapeHtml(s.welcomeStaff.platformLine)}</span>
+        </td>
+      </tr>
+    </table>
+    <p style="margin:0 0 10px;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;color:${EMAIL_BRAND.textDim};">${escapeHtml(s.welcomeStaff.featuresHeading)}</p>
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" bgcolor="${EMAIL_BRAND.black}" style="border-radius:12px;border:1px solid ${EMAIL_BRAND.border};margin-bottom:20px;">${features}</table>
+    <p style="margin:0 0 10px;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;color:${EMAIL_BRAND.textDim};">${escapeHtml(s.welcomeStaff.stepsHeading)}</p>
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" bgcolor="${EMAIL_BRAND.black}" style="border-radius:12px;border:1px solid ${EMAIL_BRAND.border};margin-bottom:16px;">${emailNumberedSteps(s.welcomeStaff.steps)}</table>
+    <p style="margin:0;font-size:13px;color:${EMAIL_BRAND.textDim};line-height:1.5;">${escapeHtml(s.welcomeStaff.footnote)}</p>`;
+
+  const featuresText = s.welcomeStaff.features.map((f) => `• ${f}`).join("\n");
+  const stepsText = s.welcomeStaff.steps
+    .map((step, i) => `${i + 1}. ${step}`)
+    .join("\n");
+
+  return {
+    subject: s.welcomeStaff.subjectOrganizer,
+    html: emailShell({
+      locale,
+      preheader: s.welcomeStaff.preheaderOrganizer,
+      title: s.welcomeStaff.titleOrganizer,
+      bodyHtml,
+      cta: { label: s.welcomeStaff.cta, url: staffUrl },
+      appUrl,
+    }),
+    text: `${greeting}\n\n${s.welcomeStaff.introOrganizer}\n\n${s.welcomeStaff.platformLine}\n\n${s.welcomeStaff.featuresHeading}\n${featuresText}\n\n${s.welcomeStaff.stepsHeading}\n${stepsText}\n\n${s.welcomeStaff.footnote}\n\n${staffUrl}`,
+  };
+}
+
+function buildEventSubmittedForApprovalEmail(params: {
+  locale: AppLocale;
+  firstName: string;
+  eventTitle: string;
+  appUrl: string;
+}): { subject: string; html: string; text: string } {
+  const { locale, firstName, eventTitle, appUrl } = params;
+  const s = emailStrings(locale);
+  const staffUrl = `${appUrl.replace(/\/$/, "")}/staff/admin/events`;
+  const bodyHtml = `
+    <p style="margin:0 0 12px;font-size:17px;">${escapeHtml(interpolateEmail(s.eventSubmittedForApproval.greeting, { name: firstName }))}</p>
+    <p style="margin:0 0 16px;color:${EMAIL_BRAND.textMuted};">${escapeHtml(s.eventSubmittedForApproval.intro)}</p>
+    <p style="margin:0;font-size:15px;"><span style="color:${EMAIL_BRAND.textDim};">${escapeHtml(s.eventSubmittedForApproval.eventLabel)}:</span> <strong>${escapeHtml(eventTitle)}</strong></p>`;
+  return {
+    subject: s.subjects.eventSubmittedForApproval,
+    html: emailShell({
+      locale,
+      preheader: s.eventSubmittedForApproval.preheader,
+      title: s.eventSubmittedForApproval.title,
+      bodyHtml,
+      cta: { label: s.eventSubmittedForApproval.cta, url: staffUrl },
+      appUrl,
+    }),
+    text: `${interpolateEmail(s.eventSubmittedForApproval.greeting, { name: firstName })}\n\n${s.eventSubmittedForApproval.intro}\n\n${s.eventSubmittedForApproval.eventLabel}: ${eventTitle}\n\n${staffUrl}`,
+  };
+}
+
+function buildEventApprovedEmail(params: {
+  locale: AppLocale;
+  firstName: string;
+  eventTitle: string;
+  appUrl: string;
+  eventId: number;
+}): { subject: string; html: string; text: string } {
+  const { locale, firstName, eventTitle, appUrl, eventId } = params;
+  const s = emailStrings(locale);
+  const eventUrl = `${appUrl.replace(/\/$/, "")}/staff/organizer/events/${eventId}`;
+  const bodyHtml = `
+    <p style="margin:0 0 12px;font-size:17px;">${escapeHtml(interpolateEmail(s.eventApproved.greeting, { name: firstName }))}</p>
+    <p style="margin:0 0 16px;color:${EMAIL_BRAND.textMuted};">${escapeHtml(s.eventApproved.intro)}</p>
+    <p style="margin:0;font-size:15px;"><span style="color:${EMAIL_BRAND.textDim};">${escapeHtml(s.eventApproved.eventLabel)}:</span> <strong>${escapeHtml(eventTitle)}</strong></p>`;
+  return {
+    subject: s.subjects.eventApproved,
+    html: emailShell({
+      locale,
+      preheader: s.eventApproved.preheader,
+      title: s.eventApproved.title,
+      bodyHtml,
+      cta: { label: s.eventApproved.cta, url: eventUrl },
+      appUrl,
+    }),
+    text: `${interpolateEmail(s.eventApproved.greeting, { name: firstName })}\n\n${s.eventApproved.intro}\n\n${s.eventApproved.eventLabel}: ${eventTitle}\n\n${eventUrl}`,
+  };
+}
+
+function buildEventRejectedEmail(params: {
+  locale: AppLocale;
+  firstName: string;
+  eventTitle: string;
+  reason: string | null;
+  appUrl: string;
+  eventId: number;
+}): { subject: string; html: string; text: string } {
+  const { locale, firstName, eventTitle, reason, appUrl, eventId } = params;
+  const s = emailStrings(locale);
+  const eventUrl = `${appUrl.replace(/\/$/, "")}/staff/organizer/events/${eventId}`;
+  const reasonText = reason?.trim() ? reason.trim() : s.eventRejected.noReason;
+  const bodyHtml = `
+    <p style="margin:0 0 12px;font-size:17px;">${escapeHtml(interpolateEmail(s.eventRejected.greeting, { name: firstName }))}</p>
+    <p style="margin:0 0 16px;color:${EMAIL_BRAND.textMuted};">${escapeHtml(s.eventRejected.intro)}</p>
+    <p style="margin:0 0 8px;font-size:15px;"><span style="color:${EMAIL_BRAND.textDim};">${escapeHtml(s.eventRejected.eventLabel)}:</span> <strong>${escapeHtml(eventTitle)}</strong></p>
+    <p style="margin:0;font-size:15px;"><span style="color:${EMAIL_BRAND.textDim};">${escapeHtml(s.eventRejected.reasonLabel)}:</span> ${escapeHtml(reasonText)}</p>`;
+  return {
+    subject: s.subjects.eventRejected,
+    html: emailShell({
+      locale,
+      preheader: s.eventRejected.preheader,
+      title: s.eventRejected.title,
+      bodyHtml,
+      cta: { label: s.eventRejected.cta, url: eventUrl },
+      appUrl,
+    }),
+    text: `${interpolateEmail(s.eventRejected.greeting, { name: firstName })}\n\n${s.eventRejected.intro}\n\n${s.eventRejected.eventLabel}: ${eventTitle}\n${s.eventRejected.reasonLabel}: ${reasonText}\n\n${eventUrl}`,
+  };
+}
+
+function emailNumberedSteps(steps: readonly string[]): string {
+  return steps
+    .map(
+      (step, i) =>
+        `<tr><td style="padding:14px 16px;${i < steps.length - 1 ? `border-bottom:1px solid ${EMAIL_BRAND.border};` : ""}">
+          <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%">
+            <tr>
+              <td valign="top" width="36" style="width:36px;padding-right:12px;">
+                <div style="width:28px;height:28px;border-radius:9999px;background:linear-gradient(135deg,${EMAIL_BRAND.orange} 0%,${EMAIL_BRAND.red} 100%);color:${EMAIL_BRAND.textPrimary};font-weight:800;font-size:13px;line-height:28px;text-align:center;">${i + 1}</div>
+              </td>
+              <td valign="top" style="color:${EMAIL_BRAND.textMuted};font-size:15px;line-height:1.55;">${escapeHtml(step)}</td>
+            </tr>
+          </table>
+        </td></tr>`,
+    )
+    .join("");
+}
+
+export function buildOrganizerPayoutSetupEmail(params: {
+  locale: AppLocale;
+  firstName: string;
+  eventTitle: string;
+  appUrl: string;
+}): { subject: string; html: string; text: string } {
+  const { locale, firstName, eventTitle, appUrl } = params;
+  const s = emailStrings(locale);
+  const payoutsUrl = `${appUrl.replace(/\/$/, "")}/staff/payments?tab=setup`;
+  const bodyHtml = `
+    <p style="margin:0 0 12px;font-size:17px;">${escapeHtml(interpolateEmail(s.organizerPayoutSetup.greeting, { name: firstName }))}</p>
+    <p style="margin:0 0 16px;color:${EMAIL_BRAND.textMuted};">${escapeHtml(s.organizerPayoutSetup.intro)}</p>
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" bgcolor="${EMAIL_BRAND.black}" style="border-radius:12px;border:1px solid ${EMAIL_BRAND.orange};margin-bottom:20px;">
+      <tr>
+        <td style="padding:14px 20px;">
+          <span style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:0.06em;color:${EMAIL_BRAND.orange};font-weight:700;">${escapeHtml(s.organizerPayoutSetup.eventLabel)}</span>
+          <span style="display:block;margin-top:6px;font-size:17px;font-weight:700;color:${EMAIL_BRAND.textPrimary};">${escapeHtml(eventTitle)}</span>
+        </td>
+      </tr>
+    </table>
+    <p style="margin:0 0 12px;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;color:${EMAIL_BRAND.textDim};">${escapeHtml(s.organizerPayoutSetup.stepsHeading)}</p>
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" bgcolor="${EMAIL_BRAND.black}" style="border-radius:12px;border:1px solid ${EMAIL_BRAND.border};margin-bottom:16px;">${emailNumberedSteps(s.organizerPayoutSetup.steps)}</table>
+    <p style="margin:0;font-size:13px;color:${EMAIL_BRAND.textDim};line-height:1.5;">${escapeHtml(s.organizerPayoutSetup.footnote)}</p>`;
+  const stepsText = s.organizerPayoutSetup.steps
+    .map((step, i) => `${i + 1}. ${step}`)
+    .join("\n");
+  return {
+    subject: s.subjects.organizerPayoutSetup,
+    html: emailShell({
+      locale,
+      preheader: s.organizerPayoutSetup.preheader,
+      title: s.organizerPayoutSetup.title,
+      bodyHtml,
+      cta: { label: s.organizerPayoutSetup.cta, url: payoutsUrl },
+      appUrl,
+    }),
+    text: `${interpolateEmail(s.organizerPayoutSetup.greeting, { name: firstName })}\n\n${s.organizerPayoutSetup.intro}\n\n${s.organizerPayoutSetup.eventLabel}: ${eventTitle}\n\n${stepsText}\n\n${s.organizerPayoutSetup.footnote}\n\n${payoutsUrl}`,
+  };
+}
+
+export function buildRegistrationConfirmedEmail(params: {
+  locale: AppLocale;
+  firstName: string;
+  eventTitle: string;
+  categoryName: string;
+  registrationNumber: string;
+  appUrl: string;
+  purchasedExtras?: Array<{
+    name: string;
+    quantity: number;
+    total_cents: number;
+    field_answers?: Array<{
+      field_key: string;
+      label: string;
+      value_text?: string | null;
+      value_json?: Record<string, unknown> | null;
+      field_kind?: "standard" | "mx_shipping_block";
+      field_type?: string;
+    }>;
+  }>;
+  guestClaimUrl?: string | null;
+  isSimulation?: boolean;
+  /** Titles of responsivas accepted at checkout */
+  acceptedWaiverTitles?: string[];
+  /** True only when stamped acceptance PDF bytes were produced for attach */
+  waiverAcceptanceAttached?: boolean;
+  organizerName?: string | null;
+}): { subject: string; html: string; text: string } {
+  const {
+    locale,
+    firstName,
+    eventTitle,
+    categoryName,
+    registrationNumber,
+    appUrl,
+    purchasedExtras = [],
+    guestClaimUrl,
+    isSimulation = false,
+    acceptedWaiverTitles = [],
+    waiverAcceptanceAttached = false,
+    organizerName = null,
+  } = params;
+  const s = emailStrings(locale);
+  const simPrefix = isSimulation ? simulationEmailSubjectPrefix(locale) : "";
+  const simBanner = isSimulation
+    ? `<p style="margin:0 0 16px;padding:12px 14px;border-radius:10px;border:1px solid ${EMAIL_BRAND.border};background:${EMAIL_BRAND.black};font-size:13px;color:${EMAIL_BRAND.textMuted};">${escapeHtml(
+        locale === "en"
+          ? "This is a SIMULATION test registration. No real charges were made."
+          : "Esta es una inscripción de SIMULACIÓN de prueba. No se realizó ningún cargo real.",
+      )}</p>`
+    : "";
+
+  const detailRow = (label: string, value: string) =>
+    `<tr><td style="padding:12px 20px;border-bottom:1px solid ${EMAIL_BRAND.border};"><span style="display:block;font-size:12px;text-transform:uppercase;letter-spacing:0.05em;color:${EMAIL_BRAND.textDim};">${escapeHtml(label)}</span><span style="display:block;margin-top:4px;font-size:16px;font-weight:600;color:${EMAIL_BRAND.textPrimary};">${escapeHtml(value)}</span></td></tr>`;
+
+  const extrasHtml =
+    purchasedExtras.length > 0
+      ? `<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" bgcolor="${EMAIL_BRAND.black}" style="border-radius:12px;border:1px solid ${EMAIL_BRAND.border};margin-top:16px;">
+      <tr><td style="padding:12px 20px;border-bottom:1px solid ${EMAIL_BRAND.border};"><span style="display:block;font-size:12px;text-transform:uppercase;letter-spacing:0.05em;color:${EMAIL_BRAND.textDim};">${escapeHtml(s.registrationConfirmed.extrasHeading)}</span></td></tr>
+      ${purchasedExtras
+        .map((extra, index) => {
+          const qtyLabel = extra.quantity > 1 ? ` × ${extra.quantity}` : "";
+          const isLast = index === purchasedExtras.length - 1;
+          const answersHtml =
+            (extra.field_answers?.length ?? 0) > 0
+              ? `<div style="margin-top:8px;padding-left:12px;border-left:2px solid ${EMAIL_BRAND.border};">
+              ${extra
+                .field_answers!.map((answer) => {
+                  const display = formatExtraFieldAnswerDisplay(
+                    {
+                      field_kind: answer.field_kind ?? "standard",
+                      field_type: (answer.field_type as "text") ?? "text",
+                    },
+                    answer.value_text ?? null,
+                    answer.value_json ?? null,
+                  );
+                  return `<p style="margin:4px 0 0;font-size:13px;color:${EMAIL_BRAND.textMuted};"><span style="color:${EMAIL_BRAND.textPrimary};">${escapeHtml(answer.label)}:</span> ${escapeHtml(display)}</p>`;
+                })
+                .join("")}
+            </div>`
+              : "";
+          return `<tr><td style="padding:12px 20px;${isLast ? "" : `border-bottom:1px solid ${EMAIL_BRAND.border};`}">
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+              <tr>
+                <td style="font-size:15px;color:${EMAIL_BRAND.textPrimary};">${escapeHtml(extra.name)}${escapeHtml(qtyLabel)}</td>
+                <td align="right" style="font-size:15px;color:${EMAIL_BRAND.textMuted};white-space:nowrap;">${escapeHtml(formatMxn(extra.total_cents))}</td>
+              </tr>
+            </table>${answersHtml}
+          </td></tr>`;
+        })
+        .join("")}
+    </table>`
+      : "";
+
+  const waiverAcceptedLabel =
+    locale === "en" ? "Waivers accepted at checkout" : "Responsivas aceptadas al inscribirte";
+  const waiverAttachNote =
+    locale === "en"
+      ? "A stamped acceptance PDF is attached to this email for your records."
+      : "Se adjunta un PDF de comprobante de aceptación para tu registro.";
+  const organizerLabel = organizerName?.trim()
+    ? organizerName.trim()
+    : locale === "en"
+      ? "the event organizer"
+      : "el organizador del evento";
+  const platformDisclaimer =
+    locale === "en"
+      ? `Atleita is only the registration technology platform. Atleita does not organize the event and assumes no civil, sporting, or safety liability. All responsibility rests with ${organizerLabel}.`
+      : `Atleita es únicamente la plataforma tecnológica de inscripción. Atleita no organiza el evento y no asume responsabilidad civil, deportiva ni de seguridad. Toda la responsabilidad corresponde a ${organizerLabel}.`;
+
+  const waiverAttachHtml = waiverAcceptanceAttached
+    ? `<tr><td style="padding:10px 20px;font-size:12px;color:${EMAIL_BRAND.textMuted};">${escapeHtml(waiverAttachNote)}</td></tr>`
+    : "";
+
+  const waiverHtml =
+    acceptedWaiverTitles.length > 0
+      ? `<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" bgcolor="${EMAIL_BRAND.black}" style="border-radius:12px;border:1px solid ${EMAIL_BRAND.border};margin-top:16px;">
+      <tr><td style="padding:12px 20px;border-bottom:1px solid ${EMAIL_BRAND.border};"><span style="display:block;font-size:12px;text-transform:uppercase;letter-spacing:0.05em;color:${EMAIL_BRAND.textDim};">${escapeHtml(waiverAcceptedLabel)}</span></td></tr>
+      ${acceptedWaiverTitles
+        .map(
+          (title, index) =>
+            `<tr><td style="padding:10px 20px;${index === acceptedWaiverTitles.length - 1 && !waiverAcceptanceAttached ? "" : `border-bottom:1px solid ${EMAIL_BRAND.border};`}font-size:14px;color:${EMAIL_BRAND.textPrimary};">${escapeHtml(title)}</td></tr>`,
+        )
+        .join("")}
+      ${waiverAttachHtml}
+    </table>
+    <p style="margin:16px 0 0;padding:12px 14px;border-radius:10px;border:1px solid ${EMAIL_BRAND.border};background:${EMAIL_BRAND.black};font-size:12px;line-height:1.45;color:${EMAIL_BRAND.textMuted};">${escapeHtml(platformDisclaimer)}</p>`
+      : `<p style="margin:16px 0 0;padding:12px 14px;border-radius:10px;border:1px solid ${EMAIL_BRAND.border};background:${EMAIL_BRAND.black};font-size:12px;line-height:1.45;color:${EMAIL_BRAND.textMuted};">${escapeHtml(platformDisclaimer)}</p>`;
+
+  const bodyHtml = `
+    ${simBanner}
+    <p style="margin:0 0 12px;font-size:17px;">${escapeHtml(interpolateEmail(s.registrationConfirmed.greeting, { name: firstName }))}</p>
+    <p style="margin:0 0 20px;color:${EMAIL_BRAND.textMuted};">${escapeHtml(s.registrationConfirmed.intro)}</p>
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" bgcolor="${EMAIL_BRAND.black}" style="border-radius:12px;border:1px solid ${EMAIL_BRAND.orange};">
+      ${detailRow(s.registrationConfirmed.eventLabel, eventTitle)}
+      ${detailRow(s.registrationConfirmed.categoryLabel, categoryName)}
+      ${detailRow(s.registrationConfirmed.folioLabel, registrationNumber)}
+    </table>${extrasHtml}${waiverHtml}`;
+
+  const guestClaimHtml = guestClaimUrl
+    ? `<p style="margin:20px 0 0;color:${EMAIL_BRAND.textMuted};font-size:14px;line-height:1.5;">${escapeHtml(s.registrationConfirmed.guestClaimIntro)}</p>`
+    : "";
+
+  const regUrl = `${appUrl.replace(/\/$/, "")}/portal/registrations`;
+  const extrasText =
+    purchasedExtras.length > 0
+      ? `\n\n${s.registrationConfirmed.extrasHeading}:\n${purchasedExtras
+          .map((extra) => {
+            const qtyLabel = extra.quantity > 1 ? ` × ${extra.quantity}` : "";
+            const answersText =
+              (extra.field_answers?.length ?? 0) > 0
+                ? `\n${extra
+                    .field_answers!.map((answer) => {
+                      const display = formatExtraFieldAnswerDisplay(
+                        {
+                          field_kind: answer.field_kind ?? "standard",
+                          field_type: (answer.field_type as "text") ?? "text",
+                        },
+                        answer.value_text ?? null,
+                        answer.value_json ?? null,
+                      );
+                      return `    ${answer.label}: ${display}`;
+                    })
+                    .join("\n")}`
+                : "";
+            return `- ${extra.name}${qtyLabel} — ${formatMxn(extra.total_cents)}${answersText}`;
+          })
+          .join("\n")}`
+      : "";
+
+  const waiverText =
+    acceptedWaiverTitles.length > 0
+      ? `\n\n${waiverAcceptedLabel}:\n${acceptedWaiverTitles.map((t) => `- ${t}`).join("\n")}${
+          waiverAcceptanceAttached ? `\n${waiverAttachNote}` : ""
+        }`
+      : "";
+
+  return {
+    subject: `${simPrefix}${s.subjects.registrationConfirmed}`,
+    html: emailShell({
+      locale,
+      preheader: s.registrationConfirmed.preheader,
+      title: s.registrationConfirmed.title,
+      bodyHtml: bodyHtml + guestClaimHtml,
+      cta: guestClaimUrl
+        ? { label: s.registrationConfirmed.guestClaimCta, url: guestClaimUrl }
+        : { label: s.registrationConfirmed.cta, url: regUrl },
+      appUrl,
+    }),
+    text: `${isSimulation ? (locale === "en" ? "[SIM TEST] " : "[SIM PRUEBA] ") : ""}${interpolateEmail(s.registrationConfirmed.greeting, { name: firstName })}\n\n${eventTitle} — ${categoryName}\n${registrationNumber}${extrasText}${waiverText}\n\n${platformDisclaimer}${guestClaimUrl ? `\n\n${s.registrationConfirmed.guestClaimIntro}\n${guestClaimUrl}` : ""}`,
+  };
+}
+
+export function buildWaiverAcceptanceUpdatedEmail(params: {
+  locale: AppLocale;
+  firstName: string;
+  eventTitle: string;
+  categoryName: string;
+  registrationNumber: string;
+  appUrl: string;
+  acceptedWaiverTitles?: string[];
+  waiverAcceptanceAttached?: boolean;
+  organizerName?: string | null;
+}): { subject: string; html: string; text: string } {
+  const {
+    locale,
+    firstName,
+    eventTitle,
+    categoryName,
+    registrationNumber,
+    appUrl,
+    acceptedWaiverTitles = [],
+    waiverAcceptanceAttached = false,
+    organizerName = null,
+  } = params;
+  const s = emailStrings(locale);
+  const regUrl = `${appUrl.replace(/\/$/, "")}/portal/registrations`;
+  const organizerLabel = organizerName?.trim()
+    ? organizerName.trim()
+    : locale === "en"
+      ? "the event organizer"
+      : "el organizador del evento";
+  const platformDisclaimer =
+    locale === "en"
+      ? `Atleita is only the registration technology platform. Atleita does not organize the event and assumes no civil, sporting, or safety liability. All responsibility rests with ${organizerLabel}.`
+      : `Atleita es únicamente la plataforma tecnológica de inscripción. Atleita no organiza el evento y no asume responsabilidad civil, deportiva ni de seguridad. Toda la responsabilidad corresponde a ${organizerLabel}.`;
+
+  const detailRow = (label: string, value: string) =>
+    `<tr><td style="padding:12px 20px;border-bottom:1px solid ${EMAIL_BRAND.border};"><span style="display:block;font-size:12px;text-transform:uppercase;letter-spacing:0.05em;color:${EMAIL_BRAND.textDim};">${escapeHtml(label)}</span><span style="display:block;margin-top:4px;font-size:16px;font-weight:600;color:${EMAIL_BRAND.textPrimary};">${escapeHtml(value)}</span></td></tr>`;
+
+  const titlesHtml =
+    acceptedWaiverTitles.length > 0
+      ? `<ul style="margin:12px 0 0;padding-left:18px;color:${EMAIL_BRAND.textMuted};font-size:14px;">${acceptedWaiverTitles
+          .map((t) => `<li style="margin:0 0 4px;">${escapeHtml(t)}</li>`)
+          .join("")}</ul>`
+      : "";
+  const attachHtml = waiverAcceptanceAttached
+    ? `<p style="margin:12px 0 0;font-size:12px;color:${EMAIL_BRAND.textMuted};">${escapeHtml(s.waiverAcceptanceUpdated.attachNote)}</p>`
+    : "";
+
+  const bodyHtml = `
+    <p style="margin:0 0 12px;font-size:17px;">${escapeHtml(interpolateEmail(s.waiverAcceptanceUpdated.greeting, { name: firstName }))}</p>
+    <p style="margin:0 0 20px;color:${EMAIL_BRAND.textMuted};">${escapeHtml(s.waiverAcceptanceUpdated.intro)}</p>
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" bgcolor="${EMAIL_BRAND.black}" style="border-radius:12px;border:1px solid ${EMAIL_BRAND.orange};">
+      ${detailRow(s.waiverAcceptanceUpdated.eventLabel, eventTitle)}
+      ${detailRow(s.waiverAcceptanceUpdated.categoryLabel, categoryName)}
+      ${detailRow(s.waiverAcceptanceUpdated.folioLabel, registrationNumber)}
+    </table>
+    ${titlesHtml}
+    ${attachHtml}
+    <p style="margin:16px 0 0;padding:12px 14px;border-radius:10px;border:1px solid ${EMAIL_BRAND.border};background:${EMAIL_BRAND.black};font-size:12px;line-height:1.45;color:${EMAIL_BRAND.textMuted};">${escapeHtml(platformDisclaimer)}</p>`;
+
+  return {
+    subject: s.subjects.waiverAcceptanceUpdated,
+    html: emailShell({
+      locale,
+      preheader: s.waiverAcceptanceUpdated.preheader,
+      title: s.waiverAcceptanceUpdated.title,
+      bodyHtml,
+      cta: { label: s.waiverAcceptanceUpdated.cta, url: regUrl },
+      appUrl,
+    }),
+    text: `${interpolateEmail(s.waiverAcceptanceUpdated.greeting, { name: firstName })}\n\n${s.waiverAcceptanceUpdated.intro}\n\n${eventTitle} — ${categoryName}\n${registrationNumber}${
+      acceptedWaiverTitles.length
+        ? `\n\n${acceptedWaiverTitles.map((t) => `- ${t}`).join("\n")}`
+        : ""
+    }${waiverAcceptanceAttached ? `\n${s.waiverAcceptanceUpdated.attachNote}` : ""}\n\n${platformDisclaimer}`,
+  };
+}
+
+export function buildGroupOrderSummaryEmail(params: {
+  locale: AppLocale;
+  firstName: string;
+  eventTitle: string;
+  totalCents: number;
+  itemCount: number;
+  participants: Array<{
+    label: string;
+    categoryName: string;
+    registrationNumber: string;
+    totalCents: number;
+  }>;
+  appUrl: string;
+  /** Passes the purchaser should hold at the gate */
+  walletHeldCount?: number;
+  isSimulation?: boolean;
+}): { subject: string; html: string; text: string } {
+  const {
+    locale,
+    firstName,
+    eventTitle,
+    totalCents,
+    itemCount,
+    participants,
+    appUrl,
+    walletHeldCount = 0,
+    isSimulation = false,
+  } = params;
+  const s = emailStrings(locale);
+  const simPrefix = isSimulation ? simulationEmailSubjectPrefix(locale) : "";
+  const portalUrl = `${appUrl.replace(/\/$/, "")}/portal/registrations${
+    walletHeldCount > 0 ? "?wallet=1" : ""
+  }`;
+
+  const detailRow = (label: string, value: string) =>
+    `<tr><td style="padding:12px 20px;border-bottom:1px solid ${EMAIL_BRAND.border};"><span style="display:block;font-size:12px;text-transform:uppercase;letter-spacing:0.05em;color:${EMAIL_BRAND.textDim};">${escapeHtml(label)}</span><span style="display:block;margin-top:4px;font-size:16px;font-weight:600;color:${EMAIL_BRAND.textPrimary};">${escapeHtml(value)}</span></td></tr>`;
+
+  const participantsHtml = `<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" bgcolor="${EMAIL_BRAND.black}" style="border-radius:12px;border:1px solid ${EMAIL_BRAND.border};margin-top:16px;">
+    <tr><td style="padding:12px 20px;border-bottom:1px solid ${EMAIL_BRAND.border};"><span style="display:block;font-size:12px;text-transform:uppercase;letter-spacing:0.05em;color:${EMAIL_BRAND.textDim};">${escapeHtml(s.groupOrderSummary.participantsHeading)} (${itemCount})</span></td></tr>
+    ${participants
+      .map((p, index) => {
+        const isLast = index === participants.length - 1;
+        return `<tr><td style="padding:12px 20px;${isLast ? "" : `border-bottom:1px solid ${EMAIL_BRAND.border};`}">
+          <p style="margin:0;font-size:15px;font-weight:600;color:${EMAIL_BRAND.textPrimary};">${escapeHtml(p.label)}</p>
+          <p style="margin:4px 0 0;font-size:13px;color:${EMAIL_BRAND.textMuted};">${escapeHtml(p.categoryName)} · #${escapeHtml(p.registrationNumber)}</p>
+          <p style="margin:4px 0 0;font-size:13px;color:${EMAIL_BRAND.textMuted};">${escapeHtml(formatMxn(p.totalCents))}</p>
+        </td></tr>`;
+      })
+      .join("")}
+  </table>`;
+
+  const walletHtml =
+    walletHeldCount > 0
+      ? `<p style="margin:20px 0 0;padding:14px 16px;border-radius:12px;border:1px solid ${EMAIL_BRAND.border};background:${EMAIL_BRAND.black};font-size:14px;color:${EMAIL_BRAND.textMuted};">${escapeHtml(s.groupOrderSummary.walletHint)}</p>`
+      : "";
+
+  const bodyHtml = `
+    <p style="margin:0 0 12px;font-size:17px;">${escapeHtml(interpolateEmail(s.groupOrderSummary.greeting, { name: firstName }))}</p>
+    <p style="margin:0 0 20px;color:${EMAIL_BRAND.textMuted};">${escapeHtml(s.groupOrderSummary.intro)}</p>
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" bgcolor="${EMAIL_BRAND.black}" style="border-radius:12px;border:1px solid ${EMAIL_BRAND.border};">
+      ${detailRow(s.groupOrderSummary.eventLabel, eventTitle)}
+      ${detailRow(s.groupOrderSummary.totalLabel, formatMxn(totalCents))}
+    </table>
+    ${participantsHtml}
+    ${walletHtml}
+  `;
+
+  const participantsText = participants
+    .map(
+      (p) =>
+        `- ${p.label} — ${p.categoryName} (#${p.registrationNumber}) — ${formatMxn(p.totalCents)}`,
+    )
+    .join("\n");
+
+  return {
+    subject: `${simPrefix}${s.subjects.groupOrderSummary}`,
+    html: emailShell({
+      locale,
+      preheader: s.groupOrderSummary.preheader,
+      title: s.groupOrderSummary.title,
+      bodyHtml,
+      cta: {
+        label:
+          walletHeldCount > 0
+            ? s.groupOrderSummary.walletCta
+            : s.groupOrderSummary.cta,
+        url: portalUrl,
+      },
+      appUrl,
+    }),
+    text: `${simPrefix}${interpolateEmail(s.groupOrderSummary.greeting, { name: firstName })}\n\n${eventTitle}\n${s.groupOrderSummary.totalLabel}: ${formatMxn(totalCents)}\n\n${s.groupOrderSummary.participantsHeading}:\n${participantsText}${
+      walletHeldCount > 0
+        ? `\n\n${s.groupOrderSummary.walletHint}\n${portalUrl}`
+        : ""
+    }`,
+  };
+}
+
+// ============================================================================
+// ENV VALIDATION
+// ============================================================================
+
+const MISSING_DB_VARS = ["DB_HOST", "DB_USER", "DB_PASSWORD", "DB_NAME"].filter(
+  (k) => !process.env[k],
+);
+if (MISSING_DB_VARS.length > 0) {
+  console.error(
+    `Missing required env vars: ${MISSING_DB_VARS.join(", ")}. All API routes will return 503.`,
+  );
+}
+
+const JWT_SECRET =
+  process.env.JWT_SECRET ||
+  (() => {
+    console.warn(
+      "WARNING: Using default JWT_SECRET. Set JWT_SECRET in .env for production!",
+    );
+    return "default-jwt-secret-CHANGE-THIS-IN-PRODUCTION";
+  })();
+
+const APP_URL = resolvePublicAppUrl();
+const CLERK_SECRET_KEY = process.env.CLERK_SECRET_KEY || "";
+if (CLERK_SECRET_KEY) {
+  logDev("[ok] Clerk configured");
+  const clerkDiag = getClerkConfigDiagnostics();
+  logDev(`[info] PUBLIC_APP_URL=${clerkDiag.publicAppUrl}`);
+  for (const warning of clerkDiag.warnings) {
+    logDev(`[warn] Clerk: ${warning}`, "warn");
+  }
+} else {
+  logDev("[warn] CLERK_SECRET_KEY not set — Google/Apple SSO disabled", "warn");
+}
+const SESSION_TTL_DAYS = 30;
+const OTP_TTL_MIN = 10;
+
+interface ClerkAthleteProfile {
+  clerkUserId: string;
+  email: string;
+  firstName: string;
+  lastName: string;
+  googleId: string | null;
+  appleId: string | null;
+  facebookId: string | null;
+  avatarUrl: string | null;
+}
+
+async function resolveClerkAthleteProfile(
+  sessionToken: string,
+  requestOrigins: string[] = [],
+): Promise<{ profile: ClerkAthleteProfile } | { error: string }> {
+  if (!sessionToken) {
+    return { error: "Clerk is not configured" };
+  }
+  if (isTestMode()) {
+    const testResolver = getTestClerkProfileResolver();
+    if (testResolver) {
+      return (await testResolver(sessionToken)) as
+        | { profile: ClerkAthleteProfile }
+        | { error: string };
+    }
+  }
+  if (!CLERK_SECRET_KEY) {
+    return { error: "Clerk is not configured" };
+  }
+  try {
+    const clerk = createClerkClient({ secretKey: CLERK_SECRET_KEY });
+    const authorizedParties = mergeClerkAuthorizedParties(
+      clerkAuthorizedParties({ isProd: IS_PROD }),
+      requestOrigins,
+    );
+    const verified = await verifyToken(sessionToken, {
+      secretKey: CLERK_SECRET_KEY,
+      authorizedParties,
+    });
+    const userId = verified.sub;
+    if (!userId) return { error: "Invalid Clerk session" };
+
+    const user = await clerk.users.getUser(userId);
+    const email =
+      user.primaryEmailAddress?.emailAddress ||
+      user.emailAddresses.find((a) => a.verification?.status === "verified")
+        ?.emailAddress ||
+      user.emailAddresses[0]?.emailAddress;
+    if (!email) {
+      return {
+        error:
+          "Your social account has no email. Add an email in your provider settings or sign in with email.",
+      };
+    }
+
+    const googleAccount = user.externalAccounts?.find(
+      (account) =>
+        account.provider === "oauth_google" || account.provider === "google",
+    );
+    const appleAccount = user.externalAccounts?.find(
+      (account) =>
+        account.provider === "oauth_apple" || account.provider === "apple",
+    );
+    const facebookAccount = user.externalAccounts?.find(
+      (account) =>
+        account.provider === "oauth_facebook" ||
+        account.provider === "facebook",
+    );
+
+    const firstName = user.firstName?.trim() || "Atleta";
+    const lastName = user.lastName?.trim() || "Athlete";
+
+    return {
+      profile: {
+        clerkUserId: userId,
+        email: email.trim().toLowerCase(),
+        firstName,
+        lastName,
+        googleId:
+          googleAccount?.externalId ?? googleAccount?.providerUserId ?? null,
+        appleId:
+          appleAccount?.externalId ?? appleAccount?.providerUserId ?? null,
+        facebookId:
+          facebookAccount?.externalId ??
+          facebookAccount?.providerUserId ??
+          null,
+        avatarUrl: user.imageUrl || null,
+      },
+    };
+  } catch (err) {
+    console.error("[clerk] token verification failed:", err);
+    return { error: "Invalid or expired social session. Please try again." };
+  }
+}
+
+async function findOrCreateAthleteFromClerk(
+  profile: ClerkAthleteProfile,
+  locale: AppLocale,
+  theme: AppTheme = "system",
+): Promise<{ athlete: RowDataPacket; isNew: boolean }> {
+  const conditions: string[] = ["clerk_user_id = ?", "email = ?"];
+  const params: (string | null)[] = [profile.clerkUserId, profile.email];
+
+  if (profile.googleId) {
+    conditions.push("google_id = ?");
+    params.push(profile.googleId);
+  }
+  if (profile.appleId) {
+    conditions.push("apple_id = ?");
+    params.push(profile.appleId);
+  }
+  if (profile.facebookId) {
+    conditions.push("facebook_id = ?");
+    params.push(profile.facebookId);
+  }
+
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT id, email, first_name, last_name, date_of_birth, gender, avatar_url,
+            google_id, apple_id, facebook_id, preferred_language, preferred_theme, last_login_at, password_hash
+     FROM athletes
+     WHERE status = 'active' AND deleted_at IS NULL
+       AND (${conditions.join(" OR ")})
+     LIMIT 1`,
+    params,
+  );
+
+  if (rows.length > 0) {
+    const athlete = rows[0];
+    await pool.query<ResultSetHeader>(
+      `UPDATE athletes SET
+         email = ?,
+         first_name = CASE WHEN first_name = '' OR first_name IS NULL THEN ? ELSE first_name END,
+         last_name = CASE WHEN last_name = '' OR last_name IS NULL THEN ? ELSE last_name END,
+         avatar_url = COALESCE(?, avatar_url),
+         google_id = COALESCE(?, google_id),
+         apple_id = COALESCE(?, apple_id),
+         facebook_id = COALESCE(?, facebook_id),
+         clerk_user_id = COALESCE(clerk_user_id, ?),
+         email_verified_at = COALESCE(email_verified_at, NOW()),
+         last_login_at = NOW()
+       WHERE id = ?`,
+      [
+        profile.email,
+        profile.firstName,
+        profile.lastName,
+        profile.avatarUrl,
+        profile.googleId,
+        profile.appleId,
+        profile.facebookId,
+        profile.clerkUserId,
+        athlete.id,
+      ],
+    );
+    const [updated] = await pool.query<RowDataPacket[]>(
+      `SELECT id, email, first_name, last_name, date_of_birth, gender, avatar_url,
+              preferred_language, preferred_theme, last_login_at
+       FROM athletes WHERE id = ? LIMIT 1`,
+      [athlete.id],
+    );
+    return { athlete: updated[0] ?? athlete, isNew: false };
+  }
+
+  const [ins] = await pool.query<ResultSetHeader>(
+    `INSERT INTO athletes (
+       public_uuid, email, email_verified_at, first_name, last_name, avatar_url,
+       google_id, apple_id, facebook_id, clerk_user_id, preferred_language, preferred_theme
+     ) VALUES (?, ?, NOW(), ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      newPublicUuid(),
+      profile.email,
+      profile.firstName,
+      profile.lastName,
+      profile.avatarUrl,
+      profile.googleId,
+      profile.appleId,
+      profile.facebookId,
+      profile.clerkUserId,
+      locale,
+      theme,
+    ],
+  );
+
+  const [created] = await pool.query<RowDataPacket[]>(
+    `SELECT id, email, first_name, last_name, date_of_birth, gender, avatar_url,
+            preferred_language, preferred_theme, last_login_at
+     FROM athletes WHERE id = ? LIMIT 1`,
+    [ins.insertId],
+  );
+
+  return { athlete: created[0], isNew: true };
+}
+
+function athleteAuthPayload(athlete: RowDataPacket) {
+  return {
+    id: athlete.id,
+    email: athlete.email,
+    firstName: athlete.first_name,
+    lastName: athlete.last_name,
+    dateOfBirth: normalizeApiDateOnly(athlete.date_of_birth),
+    gender: (athlete.gender as string | null) ?? null,
+    avatarUrl: athlete.avatar_url ?? undefined,
+    preferredLanguage: normalizeLocale(
+      athlete.preferred_language as string | undefined,
+    ),
+    preferredTheme: normalizeTheme(
+      athlete.preferred_theme as string | undefined,
+    ),
+  };
+}
+
+/** Login email on the athlete record — registration confirmations always go here */
+async function athleteLoginEmail(
+  athleteId: number,
+): Promise<string | undefined> {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT email FROM athletes WHERE id = ? AND deleted_at IS NULL LIMIT 1`,
+    [athleteId],
+  );
+  const email = rows[0]?.email;
+  return email ? String(email).trim() : undefined;
+}
+
+async function loadAthleteEligibilityProfile(athleteId: number) {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT date_of_birth, gender FROM athletes
+     WHERE id = ? AND status = 'active' AND deleted_at IS NULL LIMIT 1`,
+    [athleteId],
+  );
+  return rows[0] ?? null;
+}
+
+function categoryEligibilityResponse(
+  req: Request,
+  category: RowDataPacket,
+  athlete: RowDataPacket,
+  eventStartDate: string | Date,
+) {
+  const result = evaluateCategoryEligibility(
+    {
+      min_age: category.min_age as number | null,
+      max_age: category.max_age as number | null,
+      gender_restriction: category.gender_restriction as string | null,
+    },
+    {
+      date_of_birth: athlete.date_of_birth as string | Date | null,
+      gender: athlete.gender as string | null,
+    },
+    eventStartDate,
+  );
+  if (result.eligible === false) {
+    if (result.reason === "missing_profile") {
+      return {
+        status: 409 as const,
+        body: apiErrorJson(req, "profile_incomplete"),
+      };
+    }
+    if (result.reason === "gender") {
+      return {
+        status: 403 as const,
+        body: {
+          error: apiErrorMessage(
+            resolveRequestLocale(req),
+            "gender_requirement_not_met",
+          ),
+          code: "category_gender_ineligible",
+        },
+      };
+    }
+    return {
+      status: 403 as const,
+      body: {
+        error: apiErrorMessage(
+          resolveRequestLocale(req),
+          "age_requirement_not_met",
+        ),
+        code: "category_age_ineligible",
+      },
+    };
+  }
+  return null;
+}
+
+async function issueAthleteSession(
+  athlete: RowDataPacket,
+  req: Request,
+  opts?: { welcomeIfFirst?: boolean; locale?: AppLocale },
+) {
+  const isFirstLogin = !athlete.last_login_at;
+  await pool.query<ResultSetHeader>(
+    "UPDATE athletes SET last_login_at = NOW() WHERE id = ?",
+    [athlete.id],
+  );
+
+  if (opts?.welcomeIfFirst && isFirstLogin && athlete.email) {
+    const athleteLocale = normalizeLocale(
+      (athlete.preferred_language as string | undefined) ?? opts.locale,
+    );
+    const welcome = buildWelcomeAthleteEmail({
+      locale: athleteLocale,
+      firstName: athlete.first_name as string,
+      appUrl: APP_URL,
+    });
+    void sendEmail({
+      to: athlete.email as string,
+      subject: welcome.subject,
+      html: welcome.html,
+      text: welcome.text,
+    }).catch((err) => console.error("[email:welcome-athlete]", err));
+  }
+
+  const token = await createSession(
+    "athlete",
+    athlete.id as number,
+    (athlete.email as string) || "",
+    req.ip,
+    req.headers["user-agent"],
+  );
+
+  return {
+    token,
+    athlete: athleteAuthPayload(athlete),
+  };
+}
+
+async function queueAthletePasswordReset(
+  athlete: RowDataPacket,
+  req: Request,
+  locale: AppLocale,
+): Promise<void> {
+  const testGen = isTestMode() ? getTestResetCodeGenerator() : null;
+  const code = testGen ? testGen() : generateOtpCode();
+  const tokenHash = sha256(code);
+  await pool.query<ResultSetHeader>(
+    `UPDATE athlete_password_resets SET consumed_at = NOW()
+     WHERE athlete_id = ? AND consumed_at IS NULL`,
+    [athlete.id],
+  );
+  await pool.query<ResultSetHeader>(
+    `INSERT INTO athlete_password_resets (athlete_id, token_hash, expires_at, ip_address)
+     VALUES (?, ?, DATE_ADD(NOW(), INTERVAL ? MINUTE), ?)`,
+    [athlete.id, tokenHash, OTP_TTL_MIN, req.ip?.slice(0, 45) ?? null],
+  );
+  const email = String(athlete.email || "")
+    .trim()
+    .toLowerCase();
+  const resetUrl = `${APP_URL.replace(/\/$/, "")}/login/reset?email=${encodeURIComponent(email)}`;
+  const mail = buildPasswordResetEmail({
+    locale,
+    firstName: String(athlete.first_name || "Atleta"),
+    code,
+    resetUrl,
+    appUrl: APP_URL,
+  });
+  await sendEmail({
+    to: email,
+    subject: mail.subject,
+    html: mail.html,
+    text: mail.text,
+  });
+}
+
+// ============================================================================
+// DATABASE POOL
+// ============================================================================
+
+let prodPool: Pool | null = null;
+
+function initProdPool(): Pool {
+  if (prodPool) return prodPool;
+  prodPool = mysql.createPool({
+    host: process.env.DB_HOST,
+    port: Number(process.env.DB_PORT) || 4000,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
+    ssl: { rejectUnauthorized: true },
+    waitForConnections: true,
+    connectionLimit: IS_VERCEL ? 2 : 10,
+    queueLimit: 0,
+    timezone: "+00:00",
+    enableKeepAlive: true,
+    keepAliveInitialDelay: 10000,
+    connectTimeout: IS_VERCEL ? 15000 : 60000,
+  });
+
+  prodPool.on("connection", (conn) => {
+    conn.on("error", (err) => logPoolError("connection", err));
+  });
+
+  return prodPool;
+}
+
+function resolvePool(): Pool {
+  const override = getTestPoolOverride();
+  if (override) return override;
+  if (isTestMode()) {
+    throw new Error(
+      "Test pool not configured — call setTestPool() before hitting API routes in tests",
+    );
+  }
+  return initProdPool();
+}
+
+const pool: Pool = new Proxy({} as Pool, {
+  get(_target, prop) {
+    const active = resolvePool();
+    const value = (active as unknown as Record<string | symbol, unknown>)[prop];
+    if (typeof value === "function") {
+      return (value as (...args: unknown[]) => unknown).bind(active);
+    }
+    return value;
+  },
+});
+
+export {
+  setTestPool,
+  setTestAuthBypass,
+  resetTestEnvironment,
+  setTestClerkProfileResolver,
+  setTestStripeClient,
+} from "./testHooks.js";
+
+const TRANSIENT_DB_CODES = [
+  "ECONNRESET",
+  "PROTOCOL_CONNECTION_LOST",
+  "ETIMEDOUT",
+  "ECONNREFUSED",
+];
+
+function logPoolError(scope: string, err: unknown) {
+  const code =
+    err && typeof err === "object" && "code" in err
+      ? String((err as NodeJS.ErrnoException).code)
+      : "";
+  if (TRANSIENT_DB_CODES.includes(code)) {
+    console.warn(`[db pool ${scope}] transient:`, err);
+    return;
+  }
+  console.error(`[db pool ${scope}]`, err);
+}
+
+if (!isTestMode()) {
+  const dbPool = initProdPool() as Pool & Pick<NodeJS.EventEmitter, "on">;
+  dbPool.on("error", (err: unknown) => logPoolError("pool", err));
+}
+
+// ============================================================================
+// EXTERNAL CLIENTS (Resend / Twilio) — graceful fallback
+// ============================================================================
+
+const FROM_EMAIL =
+  process.env.SMTP_FROM || "Atleita <no-reply@disruptinglabs.com>";
+let resendClient: Resend | null = null;
+if (process.env.RESEND_API_KEY) {
+  resendClient = new Resend(process.env.RESEND_API_KEY);
+  logDev("[ok] Resend initialized");
+} else {
+  logDev(
+    "[warn] RESEND_API_KEY not set — emails will be logged, not sent",
+    "warn",
+  );
+}
+
+let twilioClient: ReturnType<typeof twilio> | null = null;
+if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+  try {
+    twilioClient = twilio(
+      process.env.TWILIO_ACCOUNT_SID,
+      process.env.TWILIO_AUTH_TOKEN,
+    );
+    logDev("[ok] Twilio initialized");
+  } catch (err) {
+    logDev(`[warn] Twilio init failed: ${err}`, "warn");
+  }
+} else {
+  logDev("[warn] Twilio not configured — SMS will be logged only", "warn");
+}
+const TWILIO_FROM = process.env.TWILIO_PHONE_NUMBER;
+
+function getStripePublishableKey(): string {
+  return (
+    process.env.STRIPE_PUBLISHABLE_KEY?.trim() ||
+    process.env.VITE_STRIPE_PUBLISHABLE_KEY?.trim() ||
+    ""
+  );
+}
+
+function isStripeConfigured(): boolean {
+  if (isTestMode()) {
+    const override = getTestStripeClientOverride();
+    if (override !== undefined) {
+      return override !== null;
+    }
+  }
+  return !!(process.env.STRIPE_SECRET_KEY?.trim() && getStripePublishableKey());
+}
+
+let stripeClient: Stripe | null = null;
+function getStripeClient(): Stripe | null {
+  if (isTestMode()) {
+    const override = getTestStripeClientOverride();
+    if (override !== undefined) {
+      return override;
+    }
+  }
+  const secret = process.env.STRIPE_SECRET_KEY?.trim();
+  if (!secret || !getStripePublishableKey()) return null;
+  if (!stripeClient) {
+    stripeClient = new Stripe(secret);
+  }
+  return stripeClient;
+}
+
+let stripeTestClient: Stripe | null = null;
+function getStripeTestPublishableKey(): string {
+  return (
+    process.env.STRIPE_TEST_PUBLISHABLE_KEY?.trim() ||
+    process.env.VITE_STRIPE_TEST_PUBLISHABLE_KEY?.trim() ||
+    ""
+  );
+}
+
+function isStripeTestConfigured(): boolean {
+  return !!(
+    process.env.STRIPE_TEST_SECRET_KEY?.trim() && getStripeTestPublishableKey()
+  );
+}
+
+/** Platform Stripe test-kit client for simulation events (no Connect). */
+function getStripeTestClient(): Stripe | null {
+  if (isTestMode()) {
+    const override = getTestStripeClientOverride();
+    if (override !== undefined) {
+      return override;
+    }
+  }
+  const secret = process.env.STRIPE_TEST_SECRET_KEY?.trim();
+  if (!secret || !getStripeTestPublishableKey()) return null;
+  if (!stripeTestClient) {
+    stripeTestClient = new Stripe(secret);
+  }
+  return stripeTestClient;
+}
+
+function stripeClientForSimulation(isSimulation: boolean): Stripe | null {
+  return isSimulation ? getStripeTestClient() : getStripeClient();
+}
+
+function isStripeReadyForSimulation(isSimulation: boolean): boolean {
+  return isSimulation ? isStripeTestConfigured() : isStripeConfigured();
+}
+
+/** Load event for checkout: published live OR simulation with matching access token. */
+async function loadEventRowForCheckout(
+  slug: string,
+  simulationToken?: string | null,
+): Promise<{ row: RowDataPacket; isSimulation: boolean } | null> {
+  const token = String(simulationToken ?? "").trim();
+  if (token) {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT e.id, e.title, e.slug, e.status, e.organizer_id, e.service_fee_percent,
+              e.fee_presentation, e.msi_enabled, e.start_date, e.end_date, e.requires_waiver, e.registration_opens_at,
+              e.registration_closes_at, e.max_registrations_per_order, e.is_simulation,
+              e.simulation_access_token, e.simulation_expires_at, e.bib_mode,
+              o.stripe_account_id, o.stripe_onboarding_complete, o.stripe_connect_status,
+              o.stripe_charges_enabled, o.stripe_payouts_enabled,
+              o.service_fee_percent AS org_fee_percent,
+              o.fee_presentation AS org_fee_presentation
+       FROM events e
+       JOIN organizers o ON o.id = e.organizer_id
+       WHERE e.slug = ? AND e.is_simulation = 1 AND e.simulation_access_token = ?
+         AND e.deleted_at IS NULL
+         AND (e.simulation_expires_at IS NULL OR e.simulation_expires_at > NOW())
+       LIMIT 1`,
+      [slug, token],
+    );
+    if (rows.length === 0) return null;
+    return { row: rows[0], isSimulation: true };
+  }
+
+  const [eventRows] = await pool.query<RowDataPacket[]>(
+    `SELECT e.id, e.title, e.slug, e.status, e.organizer_id, e.service_fee_percent,
+            e.fee_presentation, e.msi_enabled, e.start_date, e.end_date, e.requires_waiver, e.registration_opens_at,
+            e.registration_closes_at, e.max_registrations_per_order, e.is_simulation,
+            e.simulation_access_token, e.simulation_expires_at, e.bib_mode,
+            o.stripe_account_id, o.stripe_onboarding_complete, o.stripe_connect_status,
+            o.stripe_charges_enabled, o.stripe_payouts_enabled,
+            o.service_fee_percent AS org_fee_percent,
+            o.fee_presentation AS org_fee_presentation
+     FROM events e
+     JOIN organizers o ON o.id = e.organizer_id
+     WHERE e.slug = ? AND e.status = 'published' AND COALESCE(e.is_simulation, 0) = 0
+       AND e.deleted_at IS NULL
+     LIMIT 1`,
+    [slug],
+  );
+  if (eventRows.length === 0) return null;
+  return { row: eventRows[0], isSimulation: false };
+}
+
+const STRIPE_CHECKOUT_BUSINESS_NAME =
+  process.env.STRIPE_CHECKOUT_BUSINESS_NAME?.trim() || "Atleita";
+
+function serializeAthleteRow(row: RowDataPacket): RowDataPacket {
+  return {
+    ...row,
+    date_of_birth: normalizeApiDateOnly(row.date_of_birth),
+  };
+}
+
+function buildRegistrationPaymentIntentParams(opts: {
+  amount: number;
+  currency: string;
+  metadata: Stripe.MetadataParam;
+  eventTitle?: string;
+  customerId?: string | null;
+  /** When set, force a fixed MSI plan on the PaymentIntent (custom Atleita selector). */
+  msiPlanMonths?: 3 | 6 | 9 | null;
+}): Stripe.PaymentIntentCreateParams {
+  const params: Stripe.PaymentIntentCreateParams = {
+    amount: opts.amount,
+    currency: opts.currency.toLowerCase(),
+    metadata: opts.metadata,
+    // Card + wallet only: server-side confirm (saved PM) has no browser redirect.
+    automatic_payment_methods: { enabled: true, allow_redirects: "never" },
+    setup_future_usage: "off_session",
+    description: opts.eventTitle
+      ? `${opts.eventTitle} — ${STRIPE_CHECKOUT_BUSINESS_NAME}`
+      : STRIPE_CHECKOUT_BUSINESS_NAME,
+    statement_descriptor_suffix: "ATLEITA",
+  };
+  if (opts.customerId) {
+    params.customer = opts.customerId;
+  }
+  if (opts.msiPlanMonths === 3 || opts.msiPlanMonths === 6 || opts.msiPlanMonths === 9) {
+    params.payment_method_options = {
+      card: {
+        installments: {
+          enabled: true,
+          plan: {
+            count: opts.msiPlanMonths,
+            interval: "month",
+            type: "fixed_count",
+          },
+        },
+      },
+    };
+  } else if (opts.msiPlanMonths === null) {
+    // Explicit one-shot while event allows MSI — do not offer Element plans.
+    params.payment_method_options = {
+      card: {
+        installments: { enabled: false },
+      },
+    };
+  }
+  return params;
+}
+
+function eventRowMsiEnabled(event: RowDataPacket): boolean {
+  return Number(event.msi_enabled) === 1;
+}
+
+function resolveCheckoutMsiAvailable(opts: {
+  eventMsiEnabled: boolean;
+  provider: string;
+  baseAthleteTotalCents: number;
+  isGroup?: boolean;
+}): boolean {
+  if (opts.isGroup) return false;
+  if (!opts.eventMsiEnabled) return false;
+  if (opts.provider !== "stripe") return false;
+  return athleteTotalQualifiesForMsi(opts.baseAthleteTotalCents);
+}
+
+function msiFieldsForCheckoutResponse(opts: {
+  msiAvailable: boolean;
+  planMonths: MsiPlanMonths | null;
+}): Pick<
+  import("../shared/api.js").RegistrationCheckoutResponse,
+  "msiAvailable" | "msiAllowedPlans" | "msiPlanMonths"
+> {
+  return {
+    msiAvailable: opts.msiAvailable,
+    msiAllowedPlans: opts.msiAvailable ? [...MSI_ALLOWED_PLAN_MONTHS] : [],
+    msiPlanMonths: opts.planMonths,
+  };
+}
+
+function stripeInstallmentUpdateParams(
+  planMonths: MsiPlanMonths | null,
+): Stripe.PaymentIntentUpdateParams["payment_method_options"] {
+  if (planMonths === 3 || planMonths === 6 || planMonths === 9) {
+    return {
+      card: {
+        installments: {
+          enabled: true,
+          plan: {
+            count: planMonths,
+            interval: "month",
+            type: "fixed_count",
+          },
+        },
+      },
+    };
+  }
+  return {
+    card: {
+      installments: {
+        enabled: false,
+        plan: null,
+      },
+    },
+  };
+}
+
+if (isStripeConfigured()) {
+  logDev("[ok] Stripe configured (direct payments)");
+} else {
+  logDev(
+    "[warn] STRIPE_SECRET_KEY / STRIPE_PUBLISHABLE_KEY (or VITE_STRIPE_PUBLISHABLE_KEY) not set — payments disabled",
+    "warn",
+  );
+}
+
+/** Stripe Connect (MX) for destination charges when organizer payout is ready. */
+
+// ============================================================================
+// AUTH HELPERS
+// ============================================================================
+
+type ActorType = "athlete" | "organizer" | "admin";
+interface JwtPayload {
+  actor: ActorType;
+  id: number;
+  email: string;
+  organizerId?: number;
+  jti: string;
+}
+interface AuthedRequest extends Request {
+  auth?: JwtPayload;
+}
+
+function sha256(input: string): string {
+  return crypto.createHash("sha256").update(input).digest("hex");
+}
+
+function generateOtpCode(): string {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+function signSessionToken(payload: Omit<JwtPayload, "jti">) {
+  const jti = crypto.randomBytes(16).toString("hex");
+  const token = jwt.sign({ ...payload, jti }, JWT_SECRET, {
+    expiresIn: `${SESSION_TTL_DAYS}d`,
+  });
+  return { token, jti };
+}
+
+function verifySessionToken(token: string): JwtPayload | null {
+  try {
+    return jwt.verify(token, JWT_SECRET) as JwtPayload;
+  } catch {
+    return null;
+  }
+}
+
+function actorSessionTable(actor: ActorType): {
+  table: string;
+  idCol: string;
+} {
+  switch (actor) {
+    case "admin":
+      return { table: "admin_sessions", idCol: "admin_id" };
+    case "organizer":
+      return { table: "organizer_sessions", idCol: "organizer_member_id" };
+    default:
+      return { table: "athlete_sessions", idCol: "athlete_id" };
+  }
+}
+
+function actorOtpTable(actor: ActorType): { table: string; idCol: string } {
+  switch (actor) {
+    case "admin":
+      return { table: "admin_otp_codes", idCol: "admin_id" };
+    case "organizer":
+      return { table: "organizer_otp_codes", idCol: "organizer_member_id" };
+    default:
+      return { table: "athlete_otp_codes", idCol: "athlete_id" };
+  }
+}
+
+async function createOtp(
+  actor: ActorType,
+  actorId: number,
+  purpose: string,
+  ip?: string,
+  channel: "email" | "sms" = "email",
+): Promise<string> {
+  const code = generateOtpCode();
+  const codeHash = sha256(code);
+  const expiresAt = new Date(Date.now() + OTP_TTL_MIN * 60 * 1000);
+  const { table, idCol } = actorOtpTable(actor);
+
+  if (actor === "athlete") {
+    await pool.query<ResultSetHeader>(
+      `INSERT INTO ${table} (${idCol}, code_hash, channel, purpose, expires_at, ip_address) VALUES (?,?,?,?,?,?)`,
+      [actorId, codeHash, channel, purpose, expiresAt, ip || null],
+    );
+  } else {
+    await pool.query<ResultSetHeader>(
+      `INSERT INTO ${table} (${idCol}, code_hash, purpose, expires_at, ip_address) VALUES (?,?,?,?,?)`,
+      [actorId, codeHash, purpose, expiresAt, ip || null],
+    );
+  }
+  return code;
+}
+
+async function consumeOtp(
+  actor: ActorType,
+  actorId: number,
+  code: string,
+  purpose: string,
+): Promise<boolean> {
+  const codeHash = sha256(code);
+  const { table, idCol } = actorOtpTable(actor);
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT id FROM ${table}
+     WHERE ${idCol} = ? AND code_hash = ? AND purpose = ?
+       AND consumed_at IS NULL AND expires_at > NOW()
+     ORDER BY id DESC LIMIT 1`,
+    [actorId, codeHash, purpose],
+  );
+  if (rows.length === 0) return false;
+  await pool.query<ResultSetHeader>(
+    `UPDATE ${table} SET consumed_at = NOW() WHERE id = ?`,
+    [rows[0].id],
+  );
+  return true;
+}
+
+async function createSession(
+  actor: ActorType,
+  actorId: number,
+  email: string,
+  ip?: string,
+  userAgent?: string,
+  organizerId?: number,
+): Promise<string> {
+  const { token, jti } = signSessionToken({
+    actor,
+    id: actorId,
+    email,
+    organizerId,
+  });
+  const expiresAt = new Date(
+    Date.now() + SESSION_TTL_DAYS * 24 * 60 * 60 * 1000,
+  );
+  const { table, idCol } = actorSessionTable(actor);
+  await pool.query<ResultSetHeader>(
+    `INSERT INTO ${table} (${idCol}, token_hash, ip_address, user_agent, expires_at) VALUES (?,?,?,?,?)`,
+    [actorId, sha256(jti), ip || null, userAgent || null, expiresAt],
+  );
+  return token;
+}
+
+async function revokeSession(token: string): Promise<void> {
+  const payload = verifySessionToken(token);
+  if (!payload) return;
+  const { table } = actorSessionTable(payload.actor);
+  await pool.query<ResultSetHeader>(
+    `UPDATE ${table} SET is_active = 0 WHERE token_hash = ?`,
+    [sha256(payload.jti)],
+  );
+}
+
+async function isSessionActive(payload: JwtPayload): Promise<boolean> {
+  const { table } = actorSessionTable(payload.actor);
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT id FROM ${table}
+     WHERE token_hash = ? AND is_active = 1 AND expires_at > NOW() LIMIT 1`,
+    [sha256(payload.jti)],
+  );
+  return rows.length > 0;
+}
+
+function extractToken(req: Request): string | null {
+  const header = req.headers.authorization;
+  if (header && header.startsWith("Bearer ")) return header.slice(7);
+  return null;
+}
+
+function requireAuth(actor: ActorType) {
+  return async (req: AuthedRequest, res: Response, next: NextFunction) => {
+    const bypass = getTestAuthBypass();
+    if (isTestMode() && bypass && bypass.actor === actor) {
+      req.auth = bypass;
+      return next();
+    }
+    const token = extractToken(req);
+    if (!token) return res.status(401).json(apiErrorJson(req, "unauthorized"));
+    const payload = verifySessionToken(token);
+    if (!payload || payload.actor !== actor) {
+      return res.status(401).json(apiErrorJson(req, "unauthorized"));
+    }
+    const ok = await isSessionActive(payload);
+    if (!ok) return res.status(401).json(apiErrorJson(req, "session_expired"));
+    req.auth = payload;
+    next();
+  };
+}
+
+const requireAthlete = requireAuth("athlete");
+const requireOrganizer = requireAuth("organizer");
+const requireAdmin = requireAuth("admin");
+
+function optionalAuth(actor: ActorType) {
+  return async (req: AuthedRequest, res: Response, next: NextFunction) => {
+    const token = extractToken(req);
+    if (!token) return next();
+    const payload = verifySessionToken(token);
+    if (!payload || payload.actor !== actor) return next();
+    const ok = await isSessionActive(payload);
+    if (ok) req.auth = payload;
+    next();
+  };
+}
+
+const optionalAthleteAuth = optionalAuth("athlete");
+
+function dbUnavailable(req: Request, res: Response, next: NextFunction) {
+  if (MISSING_DB_VARS.length > 0) {
+    return res.status(503).json({
+      ...apiErrorJson(req, "database_not_configured"),
+      missing: MISSING_DB_VARS,
+    });
+  }
+  next();
+}
+
+// ============================================================================
+// EMAIL / SMS HELPERS
+// ============================================================================
+
+async function sendEmail(opts: {
+  to: string;
+  subject: string;
+  html: string;
+  text?: string;
+  attachments?: Array<{
+    filename: string;
+    content: Buffer | Uint8Array;
+    contentType?: string;
+  }>;
+}) {
+  if (isTestMode()) {
+    pushCapturedTestEmail(opts);
+    return { id: "test-email" };
+  }
+  if (!resendClient) {
+    console.log("[email:dry-run]", opts.to, opts.subject, {
+      attachments: opts.attachments?.length ?? 0,
+    });
+    return { id: "dry-run" };
+  }
+  const { data, error } = await resendClient.emails.send({
+    from: FROM_EMAIL,
+    to: opts.to,
+    subject: opts.subject,
+    html: opts.html,
+    text: opts.text,
+    attachments: opts.attachments?.map((a) => ({
+      filename: a.filename,
+      content: Buffer.isBuffer(a.content) ? a.content : Buffer.from(a.content),
+      contentType: a.contentType ?? "application/pdf",
+    })),
+  });
+  if (error) throw new Error(error.message);
+  return { id: data?.id };
+}
+
+async function sendSms(opts: { to: string; body: string }) {
+  if (!twilioClient || !TWILIO_FROM) {
+    console.log("[sms:dry-run]", opts.to, opts.body);
+    return { sid: "dry-run", status: "dry-run" };
+  }
+  const msg = await twilioClient.messages.create({
+    from: TWILIO_FROM,
+    to: opts.to,
+    body: opts.body,
+  });
+  return { sid: msg.sid, status: msg.status };
+}
+
+function resolveRequestLocale(
+  req: Request,
+  dbLang?: string | null,
+  bodyLang?: string | null,
+): AppLocale {
+  const accept = localeFromAcceptLanguage(req.headers["accept-language"]);
+  // Existing account preference wins over transient UI locale (OTP / emails).
+  if (dbLang != null && String(dbLang).trim() !== "") {
+    return resolveLocale(dbLang, bodyLang, accept);
+  }
+  return resolveLocale(bodyLang, accept);
+}
+
+function apiErrorJson(
+  req: Request,
+  code: ApiErrorCode,
+  dbLang?: string | null,
+  bodyLang?: string | null,
+  extra?: Record<string, unknown>,
+) {
+  const locale = resolveRequestLocale(req, dbLang, bodyLang);
+  return {
+    error: apiErrorMessage(locale, code),
+    code,
+    ...extra,
+  };
+}
+
+/** @deprecated Prefer apiErrorJson — kept for auth-route call sites. */
+function authErrorJson(
+  req: Request,
+  code: AuthErrorCode,
+  dbLang?: string | null,
+  bodyLang?: string | null,
+  extra?: Record<string, unknown>,
+) {
+  return apiErrorJson(req, code, dbLang, bodyLang, extra);
+}
+
+function apiSuccessJson(
+  req: Request,
+  code: ApiSuccessCode,
+  dbLang?: string | null,
+  bodyLang?: string | null,
+  extra?: Record<string, unknown>,
+) {
+  const locale = resolveRequestLocale(req, dbLang, bodyLang);
+  return {
+    message: apiSuccessMessage(locale, code),
+    code,
+    ...extra,
+  };
+}
+
+function normalizeLookupEmail(email: string): string {
+  return email.trim().toLowerCase();
+}
+
+async function deliverOtpEmail(opts: {
+  to: string;
+  locale: AppLocale;
+  firstName: string;
+  code: string;
+  logTag: string;
+  orgChrome?: OrgEmailChrome | null;
+}): Promise<void> {
+  const otpMail = buildOtpEmail({
+    locale: opts.locale,
+    firstName: opts.firstName || "Staff",
+    code: opts.code,
+    appUrl: APP_URL,
+    orgChrome: opts.orgChrome ?? null,
+  });
+  try {
+    await sendEmail({
+      to: opts.to,
+      subject: otpMail.subject,
+      html: otpMail.html,
+      text: otpMail.text,
+    });
+  } catch (err) {
+    console.error(`[email:${opts.logTag}]`, opts.to, err);
+    throw err;
+  }
+}
+
+async function resolveOtpOrgChromeFromRequest(
+  req: Request,
+): Promise<OrgEmailChrome | null> {
+  try {
+    const host = String(req.headers.host || "");
+    const { parseEventSubdomainFromHost } = await import(
+      "../shared/eventSubdomain.js"
+    );
+    const { loadOrganizerSiteBySubdomain } = await import(
+      "../server/organizerSites.js"
+    );
+    const sub = parseEventSubdomainFromHost(host);
+    if (!sub) return null;
+    const site = await loadOrganizerSiteBySubdomain(pool, sub, {
+      publishedOnly: false,
+    });
+    if (!site) return null;
+    return {
+      organizerName: site.organizerName,
+      logoUrl: site.theme.logoUrl,
+      primaryColor: site.theme.primaryColor,
+      accentColor: site.theme.accentColor,
+    };
+  } catch {
+    return null;
+  }
+}
+
+type StaffAccount =
+  | {
+      role: "admin";
+      actorId: number;
+      email: string;
+      firstName: string;
+      preferredLanguage: string;
+    }
+  | {
+      role: "organizer";
+      actorId: number;
+      email: string;
+      firstName: string;
+      preferredLanguage: string;
+      organizerId: number;
+    };
+
+async function resolveStaffByEmail(
+  email: string,
+): Promise<StaffAccount | null> {
+  const normalized = normalizeLookupEmail(email);
+  const [admins] = await pool.query<RowDataPacket[]>(
+    `SELECT id, email, first_name, preferred_language FROM admins
+     WHERE LOWER(TRIM(email)) = ? AND status = 'active' AND deleted_at IS NULL LIMIT 1`,
+    [normalized],
+  );
+  if (admins.length > 0) {
+    return {
+      role: "admin",
+      actorId: admins[0].id as number,
+      email: admins[0].email as string,
+      firstName: admins[0].first_name as string,
+      preferredLanguage: admins[0].preferred_language as string,
+    };
+  }
+  const [members] = await pool.query<RowDataPacket[]>(
+    `SELECT om.id, om.email, om.first_name, om.preferred_language, om.organizer_id
+     FROM organizer_members om
+     WHERE LOWER(TRIM(om.email)) = ? AND om.status = 'active' LIMIT 1`,
+    [normalized],
+  );
+  if (members.length > 0) {
+    return {
+      role: "organizer",
+      actorId: members[0].id as number,
+      email: members[0].email as string,
+      firstName: members[0].first_name as string,
+      preferredLanguage: members[0].preferred_language as string,
+      organizerId: members[0].organizer_id as number,
+    };
+  }
+  return null;
+}
+
+// ============================================================================
+// PAYMENT HELPERS (direct Stripe payments; Connect disabled for now)
+// ============================================================================
+
+type DiscountCodeRow = {
+  id: number;
+  code: string;
+  discount_type: "percent" | "fixed_cents";
+  discount_value: number;
+  applies_to: "registration" | "service_fee" | "total";
+  min_purchase_cents: number | null;
+  max_uses: number | null;
+  used_count: number;
+};
+
+async function fetchValidDiscountCode(
+  code: string,
+  eventId: number,
+  organizerId: number,
+): Promise<{ discount: DiscountCodeRow } | { error: string }> {
+  const normalized = String(code ?? "").trim();
+  if (!normalized) {
+    return { error: "Discount code required" };
+  }
+
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT id, code, discount_type, discount_value, applies_to,
+            min_purchase_cents, max_uses,
+            ${DISCOUNT_USED_COUNT_SQL} AS used_count
+     FROM discount_codes
+     WHERE UPPER(code) = UPPER(?)
+       AND is_active = 1
+       AND (event_id = ? OR (event_id IS NULL AND organizer_id = ?))
+       AND (valid_from IS NULL OR valid_from <= NOW())
+       AND (valid_until IS NULL OR valid_until >= NOW())
+     LIMIT 1`,
+    [normalized, eventId, organizerId],
+  );
+
+  if (rows.length === 0) {
+    return { error: "Invalid or expired discount code" };
+  }
+
+  const discount = rows[0] as DiscountCodeRow;
+  if (
+    discount.max_uses != null &&
+    Number(discount.used_count) >= Number(discount.max_uses)
+  ) {
+    return { error: "Discount code has reached its usage limit" };
+  }
+
+  return { discount };
+}
+
+function formatMxn(cents: number): string {
+  return `$${(cents / 100).toLocaleString("es-MX", { minimumFractionDigits: 2 })} MXN`;
+}
+
+function mapCategoryWithCheckoutFees(
+  cat: RowDataPacket,
+  feePercent: number,
+  feePresentation: ReturnType<typeof resolveFeePresentation>,
+) {
+  const priceCents = Number(cat.price_cents);
+  const breakdown = computeCheckoutBreakdown({
+    listPriceCents: priceCents,
+    serviceFeePercent: feePercent,
+    feePresentation,
+  });
+  return {
+    ...cat,
+    service_fee_cents: breakdown.serviceFeeCents,
+    total_cents: breakdown.athleteTotalCents,
+    display_iva_cents: breakdown.displayIvaCents,
+    organizer_fiscal_net_cents: breakdown.organizerFiscalNetCents,
+    price_formatted: formatMxn(priceCents),
+    service_fee_formatted: formatMxn(breakdown.serviceFeeCents),
+    total_formatted: formatMxn(breakdown.athleteTotalCents),
+  };
+}
+
+function newPublicUuid(): string {
+  return crypto.randomUUID();
+}
+
+function newQrToken(): string {
+  return crypto.randomBytes(32).toString("hex");
+}
+
+async function nextRegistrationNumber(
+  ctx: RegistrationFolioContext,
+  conn?: PoolConnection,
+): Promise<{ registrationNumber: string; folioSegmentId: number | null }> {
+  if (conn) {
+    return allocateRegistrationNumber(conn, ctx);
+  }
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const result = await allocateRegistrationNumber(connection, ctx);
+    await connection.commit();
+    return result;
+  } catch (err) {
+    await connection.rollback();
+    throw err;
+  } finally {
+    connection.release();
+  }
+}
+
+async function processPaymentRefund(opts: {
+  paymentId: number;
+  requestedByType: "admin" | "organizer_member";
+  requestedById: number;
+  organizerId?: number;
+  reason?: string;
+}): Promise<void> {
+  const [[pay]] = await pool.query<RowDataPacket[]>(
+    `SELECT id, registration_id, organizer_id, amount_cents, currency, status, provider,
+            stripe_payment_intent_id, stripe_transfer_id, mercadopago_payment_id,
+            metadata_json, is_simulation
+     FROM payments WHERE id = ? LIMIT 1`,
+    [opts.paymentId],
+  );
+  if (!pay) {
+    throw new Error("Payment not found");
+  }
+  if (
+    opts.requestedByType === "organizer_member" &&
+    Number(pay.organizer_id) !== Number(opts.organizerId)
+  ) {
+    throw new Error("Payment not found");
+  }
+  if (pay.status === "refunded") {
+    throw new Error("Payment already refunded");
+  }
+  if (pay.status !== "succeeded") {
+    throw new Error("Only succeeded payments can be refunded");
+  }
+
+  const amountCents = Number(pay.amount_cents);
+  if (!Number.isFinite(amountCents) || amountCents <= 0) {
+    throw new Error("Nothing to refund — this registration was free ($0)");
+  }
+  let stripeRefundId: string | null = null;
+  let mpRefundId: string | null = null;
+  const isSimPay = Number(pay.is_simulation) === 1;
+  const refundStripe = stripeClientForSimulation(isSimPay);
+  const refundProvider = resolvePaymentRefundProvider({
+    provider: String(pay.provider ?? ""),
+    stripe_payment_intent_id: pay.stripe_payment_intent_id as string | null,
+  });
+
+  // Ledger-only for manual (cash) and mock — skip Stripe / Mercado Pago APIs.
+  if (!skipsExternalRefund(refundProvider)) {
+    if (refundProvider === "mercadopago") {
+      if (!pay.mercadopago_payment_id) {
+        throw new Error("Mercado Pago refund unavailable for this payment");
+      }
+      const refund = await refundMercadoPagoPayment({
+        pool,
+        organizerId: Number(pay.organizer_id),
+        mpPaymentId: String(pay.mercadopago_payment_id),
+      });
+      mpRefundId = refund.id;
+    } else if (pay.stripe_payment_intent_id && refundStripe) {
+      const refundParams = buildStripeRefundParams(
+        String(pay.stripe_payment_intent_id),
+        {
+          stripe_payment_intent_id: pay.stripe_payment_intent_id as string,
+          stripe_transfer_id: isSimPay
+            ? null
+            : (pay.stripe_transfer_id as string | null),
+          metadata_json: pay.metadata_json,
+        },
+      );
+      const refund = await refundStripe.refunds.create(refundParams);
+      stripeRefundId = refund.id;
+    } else {
+      throw new Error("Stripe refund unavailable for this payment");
+    }
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    await conn.query<ResultSetHeader>(
+      `INSERT INTO payment_refunds (
+         payment_id, amount_cents, currency, reason, status, provider, stripe_refund_id,
+         mercadopago_refund_id, requested_by_type, requested_by_id, processed_at
+       ) VALUES (?,?,?,?,'succeeded',?,?,?, ?, ?, NOW())`,
+      [
+        opts.paymentId,
+        amountCents,
+        pay.currency || "MXN",
+        opts.reason ?? null,
+        refundProvider,
+        stripeRefundId,
+        mpRefundId,
+        opts.requestedByType === "admin" ? "admin" : "organizer_member",
+        opts.requestedById,
+      ],
+    );
+
+    await conn.query<ResultSetHeader>(
+      "UPDATE payments SET status = 'refunded' WHERE id = ?",
+      [opts.paymentId],
+    );
+
+    if (pay.registration_id) {
+      const [[reg]] = await conn.query<RowDataPacket[]>(
+        `SELECT id, status, event_category_id, schedule_wave_id
+         FROM registrations WHERE id = ? AND deleted_at IS NULL LIMIT 1`,
+        [pay.registration_id],
+      );
+      if (reg) {
+        if (reg.status === "confirmed") {
+          await conn.query<ResultSetHeader>(
+            "UPDATE event_categories SET sold_count = GREATEST(0, sold_count - 1) WHERE id = ?",
+            [reg.event_category_id],
+          );
+          if (reg.schedule_wave_id) {
+            await conn.query<ResultSetHeader>(
+              `UPDATE event_schedule_waves
+               SET registered_count = GREATEST(0, registered_count - 1)
+               WHERE id = ?`,
+              [reg.schedule_wave_id],
+            );
+          }
+        }
+        await conn.query<ResultSetHeader>(
+          "UPDATE registrations SET status = 'refunded' WHERE id = ?",
+          [reg.id],
+        );
+        await conn.query<ResultSetHeader>(
+          `INSERT INTO registration_status_history (
+             registration_id, from_status, to_status, actor_type, actor_id, reason
+           ) VALUES (?,?,?,?,?,?)`,
+          [
+            reg.id,
+            reg.status,
+            "refunded",
+            opts.requestedByType === "admin" ? "admin" : "organizer_member",
+            opts.requestedById,
+            opts.reason ??
+              (opts.requestedByType === "admin"
+                ? "Payment refunded by admin"
+                : "Payment refunded by organizer"),
+          ],
+        );
+      }
+    } else {
+      // Group orders keep payments.registration_id NULL — reverse all order regs.
+      const [groupRegs] = await conn.query<RowDataPacket[]>(
+        `SELECT r.id, r.status, r.event_category_id, r.schedule_wave_id
+         FROM registrations r
+         JOIN registration_orders o ON o.id = r.order_id
+         WHERE o.payment_id = ? AND r.deleted_at IS NULL`,
+        [opts.paymentId],
+      );
+      for (const reg of groupRegs) {
+        if (reg.status === "confirmed") {
+          await conn.query<ResultSetHeader>(
+            "UPDATE event_categories SET sold_count = GREATEST(0, sold_count - 1) WHERE id = ?",
+            [reg.event_category_id],
+          );
+          if (reg.schedule_wave_id) {
+            await conn.query<ResultSetHeader>(
+              `UPDATE event_schedule_waves
+               SET registered_count = GREATEST(0, registered_count - 1)
+               WHERE id = ?`,
+              [reg.schedule_wave_id],
+            );
+          }
+        }
+        if (reg.status !== "refunded" && reg.status !== "cancelled") {
+          await conn.query<ResultSetHeader>(
+            "UPDATE registrations SET status = 'refunded' WHERE id = ?",
+            [reg.id],
+          );
+          await conn.query<ResultSetHeader>(
+            `INSERT INTO registration_status_history (
+               registration_id, from_status, to_status, actor_type, actor_id, reason
+             ) VALUES (?,?,?,?,?,?)`,
+            [
+              reg.id,
+              reg.status,
+              "refunded",
+              opts.requestedByType === "admin" ? "admin" : "organizer_member",
+              opts.requestedById,
+              opts.reason ?? "Group payment refunded",
+            ],
+          );
+        }
+      }
+      if (groupRegs.length > 0) {
+        await conn.query<ResultSetHeader>(
+          `UPDATE registration_orders SET status = 'refunded' WHERE payment_id = ?`,
+          [opts.paymentId],
+        );
+      }
+    }
+
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}
+
+/**
+ * Mark an already-succeeded MP payment as refunded/charged-back without calling MP again
+ * (webhook already observed the terminal status on Mercado Pago).
+ */
+async function applyExternalMpPaymentReversal(opts: {
+  paymentId: number;
+  reason: string;
+  mpStatus: string;
+}): Promise<void> {
+  const [[pay]] = await pool.query<RowDataPacket[]>(
+    `SELECT id, registration_id, status, amount_cents, currency, provider
+     FROM payments WHERE id = ? LIMIT 1`,
+    [opts.paymentId],
+  );
+  if (!pay) return;
+  if (pay.status === "refunded" || pay.status === "partially_refunded") return;
+  if (pay.provider !== "mercadopago") return;
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const paymentStatus =
+      opts.mpStatus === "charged_back" ? "refunded" : "refunded";
+    await conn.query<ResultSetHeader>(
+      `INSERT INTO payment_refunds (
+         payment_id, amount_cents, currency, reason, status, provider,
+         mercadopago_refund_id, requested_by_type, requested_by_id, processed_at
+       ) VALUES (?,?,?,?,'succeeded','mercadopago',?,'system',NULL,NOW())`,
+      [
+        opts.paymentId,
+        Number(pay.amount_cents) || 0,
+        pay.currency || "MXN",
+        `mp_webhook:${opts.mpStatus}:${opts.reason}`.slice(0, 500),
+        null,
+      ],
+    );
+    await conn.query<ResultSetHeader>(
+      "UPDATE payments SET status = ? WHERE id = ?",
+      [paymentStatus, opts.paymentId],
+    );
+
+    if (pay.registration_id) {
+      const [[reg]] = await conn.query<RowDataPacket[]>(
+        `SELECT id, status, event_category_id, schedule_wave_id
+         FROM registrations WHERE id = ? AND deleted_at IS NULL LIMIT 1`,
+        [pay.registration_id],
+      );
+      if (reg && reg.status === "confirmed") {
+        await conn.query<ResultSetHeader>(
+          "UPDATE event_categories SET sold_count = GREATEST(0, sold_count - 1) WHERE id = ?",
+          [reg.event_category_id],
+        );
+        if (reg.schedule_wave_id) {
+          await conn.query<ResultSetHeader>(
+            `UPDATE event_schedule_waves
+             SET registered_count = GREATEST(0, registered_count - 1)
+             WHERE id = ?`,
+            [reg.schedule_wave_id],
+          );
+        }
+        await conn.query<ResultSetHeader>(
+          "UPDATE registrations SET status = 'refunded' WHERE id = ?",
+          [reg.id],
+        );
+        await conn.query<ResultSetHeader>(
+          `INSERT INTO registration_status_history (
+             registration_id, from_status, to_status, actor_type, actor_id, reason
+           ) VALUES (?,?,?,'system',NULL,?)`,
+          [reg.id, reg.status, "refunded", `Mercado Pago ${opts.mpStatus}`],
+        );
+      }
+    } else {
+      const [groupRegs] = await conn.query<RowDataPacket[]>(
+        `SELECT r.id, r.status, r.event_category_id, r.schedule_wave_id
+         FROM registrations r
+         JOIN registration_orders o ON o.id = r.order_id
+         WHERE o.payment_id = ? AND r.deleted_at IS NULL`,
+        [opts.paymentId],
+      );
+      for (const reg of groupRegs) {
+        if (reg.status === "confirmed") {
+          await conn.query<ResultSetHeader>(
+            "UPDATE event_categories SET sold_count = GREATEST(0, sold_count - 1) WHERE id = ?",
+            [reg.event_category_id],
+          );
+          if (reg.schedule_wave_id) {
+            await conn.query<ResultSetHeader>(
+              `UPDATE event_schedule_waves
+               SET registered_count = GREATEST(0, registered_count - 1)
+               WHERE id = ?`,
+              [reg.schedule_wave_id],
+            );
+          }
+        }
+        if (reg.status !== "refunded" && reg.status !== "cancelled") {
+          await conn.query<ResultSetHeader>(
+            "UPDATE registrations SET status = 'refunded' WHERE id = ?",
+            [reg.id],
+          );
+          await conn.query<ResultSetHeader>(
+            `INSERT INTO registration_status_history (
+               registration_id, from_status, to_status, actor_type, actor_id, reason
+             ) VALUES (?,?,?,'system',NULL,?)`,
+            [reg.id, reg.status, "refunded", `Mercado Pago ${opts.mpStatus}`],
+          );
+        }
+      }
+      if (groupRegs.length > 0) {
+        await conn.query<ResultSetHeader>(
+          `UPDATE registration_orders SET status = 'refunded' WHERE payment_id = ?`,
+          [opts.paymentId],
+        );
+      }
+    }
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}
+
+function parseFieldOptions(raw: unknown): string[] {
+  if (Array.isArray(raw)) return raw.map(String);
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      return Array.isArray(parsed) ? parsed.map(String) : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+async function ensureStripeCustomer(athleteId: number): Promise<string | null> {
+  if (!getStripeClient()) return null;
+
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT id, public_uuid, email, first_name, last_name, stripe_customer_id
+     FROM athletes WHERE id = ? AND deleted_at IS NULL LIMIT 1`,
+    [athleteId],
+  );
+  if (rows.length === 0) return null;
+  const athlete = rows[0];
+
+  const existing = athlete.stripe_customer_id as string | null;
+  if (existing) {
+    try {
+      const customer = await getStripeClient()!.customers.retrieve(existing);
+      if (!("deleted" in customer && customer.deleted)) {
+        return existing;
+      }
+    } catch (err) {
+      const code =
+        err && typeof err === "object" && "code" in err
+          ? String((err as { code?: unknown }).code ?? "")
+          : "";
+      // Stale ID from a prior Stripe account / deleted customer — recreate.
+      if (code !== "resource_missing") {
+        console.error("[stripe] customer retrieve failed; recreating:", err);
+      }
+    }
+    await pool.query<ResultSetHeader>(
+      `UPDATE athletes SET stripe_customer_id = NULL WHERE id = ? AND stripe_customer_id = ?`,
+      [athleteId, existing],
+    );
+  }
+
+  const email =
+    (athlete.email as string | null) ||
+    `athlete+${athlete.public_uuid}@payments.athlete-hub.app`;
+  const name = `${athlete.first_name} ${athlete.last_name}`.trim();
+
+  const customer = await getStripeClient()!.customers.create({
+    email,
+    name: name || undefined,
+    metadata: {
+      athlete_id: String(athleteId),
+      public_uuid: String(athlete.public_uuid),
+    },
+  });
+
+  await pool.query<ResultSetHeader>(
+    `UPDATE athletes SET stripe_customer_id = ? WHERE id = ?`,
+    [customer.id, athleteId],
+  );
+
+  return customer.id;
+}
+
+async function getStripeDefaultPaymentMethodId(
+  customerId: string,
+): Promise<string | null> {
+  if (!getStripeClient()) return null;
+  const customer = await getStripeClient()!.customers.retrieve(customerId);
+  if ("deleted" in customer && customer.deleted) return null;
+  const activeCustomer = customer as Stripe.Customer;
+  const defaultPm = activeCustomer.invoice_settings?.default_payment_method;
+  return typeof defaultPm === "string" ? defaultPm : (defaultPm?.id ?? null);
+}
+
+async function listAthleteStripePaymentMethods(customerId: string) {
+  if (!getStripeClient()) {
+    return { paymentMethods: [], defaultPaymentMethodId: null };
+  }
+
+  const defaultPaymentMethodId =
+    await getStripeDefaultPaymentMethodId(customerId);
+  const listed = await getStripeClient()!.paymentMethods.list({
+    customer: customerId,
+    type: "card",
+  });
+
+  const paymentMethods = listed.data.map((pm) => ({
+    id: pm.id,
+    brand: pm.card?.brand ?? "card",
+    last4: pm.card?.last4 ?? "????",
+    expMonth: pm.card?.exp_month ?? 0,
+    expYear: pm.card?.exp_year ?? 0,
+    isDefault: pm.id === defaultPaymentMethodId,
+  }));
+
+  return { paymentMethods, defaultPaymentMethodId };
+}
+
+async function setAthleteDefaultPaymentMethod(
+  athleteId: number,
+  customerId: string,
+  paymentMethodId: string,
+): Promise<void> {
+  if (!getStripeClient()) {
+    throw new Error("Stripe not configured");
+  }
+
+  const pm = await getStripeClient()!.paymentMethods.retrieve(paymentMethodId);
+  if (pm.customer !== customerId) {
+    throw new Error("Payment method does not belong to this athlete");
+  }
+
+  await getStripeClient()!.customers.update(customerId, {
+    invoice_settings: { default_payment_method: paymentMethodId },
+  });
+}
+
+async function detachAthletePaymentMethod(
+  customerId: string,
+  paymentMethodId: string,
+): Promise<void> {
+  if (!getStripeClient()) {
+    throw new Error("Stripe not configured");
+  }
+
+  const pm = await getStripeClient()!.paymentMethods.retrieve(paymentMethodId);
+  if (pm.customer !== customerId) {
+    throw new Error("Payment method does not belong to this athlete");
+  }
+
+  await getStripeClient()!.paymentMethods.detach(paymentMethodId);
+
+  const defaultId = await getStripeDefaultPaymentMethodId(customerId);
+  if (defaultId === paymentMethodId || !defaultId) {
+    const listed = await getStripeClient()!.paymentMethods.list({
+      customer: customerId,
+      type: "card",
+    });
+    const next = listed.data[0]?.id;
+    await getStripeClient()!.customers.update(customerId, {
+      invoice_settings: {
+        default_payment_method: next ?? "",
+      },
+    });
+  }
+}
+
+async function ensureDefaultPaymentMethodAfterPay(
+  pi: Stripe.PaymentIntent,
+): Promise<void> {
+  if (!getStripeClient() || !pi.customer) return;
+
+  const customerId =
+    typeof pi.customer === "string" ? pi.customer : pi.customer.id;
+  const existingDefault = await getStripeDefaultPaymentMethodId(customerId);
+  if (existingDefault) return;
+
+  const pmId =
+    typeof pi.payment_method === "string"
+      ? pi.payment_method
+      : pi.payment_method?.id;
+  if (!pmId) return;
+
+  await getStripeClient()!.customers.update(customerId, {
+    invoice_settings: { default_payment_method: pmId },
+  });
+}
+
+type DbExecutor = Pool | PoolConnection;
+
+async function expireStaleWaitlistOffers(db: DbExecutor) {
+  await db.query<ResultSetHeader>(
+    `UPDATE waitlist_entries SET status = 'expired'
+     WHERE status = 'offered' AND offer_expires_at IS NOT NULL AND offer_expires_at < NOW()`,
+  );
+}
+
+async function getValidWaitlistOffer(
+  db: DbExecutor,
+  athleteId: number,
+  eventId: number,
+  categoryId: number,
+  waitlistEntryId: number,
+): Promise<RowDataPacket | null> {
+  await expireStaleWaitlistOffers(db);
+  const [rows] = await db.query<RowDataPacket[]>(
+    `SELECT id FROM waitlist_entries
+     WHERE id = ? AND athlete_id = ? AND event_id = ? AND event_category_id = ?
+       AND status = 'offered'
+       AND (offer_expires_at IS NULL OR offer_expires_at > NOW())
+     LIMIT 1`,
+    [waitlistEntryId, athleteId, eventId, categoryId],
+  );
+  return rows[0] ?? null;
+}
+
+function parseElevationProfile(
+  raw: unknown,
+): Array<{ km: number; elevation_m: number }> {
+  if (!raw) return [];
+  try {
+    const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((p) => ({
+        km: Number((p as { km?: number }).km),
+        elevation_m: Number((p as { elevation_m?: number }).elevation_m),
+      }))
+      .filter((p) => Number.isFinite(p.km) && Number.isFinite(p.elevation_m));
+  } catch {
+    return [];
+  }
+}
+
+function isMysqlDuplicateEntry(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const code = "code" in err ? String((err as { code?: unknown }).code ?? "") : "";
+  const errno = "errno" in err ? Number((err as { errno?: unknown }).errno) : NaN;
+  return code === "ER_DUP_ENTRY" || errno === 1062;
+}
+
+async function cancelStalePendingEventPayments(
+  athleteId: number,
+  eventId: number,
+  keepIdempotencyKey: string,
+): Promise<void> {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT id, stripe_payment_intent_id, provider, status, is_simulation
+     FROM payments
+     WHERE athlete_id = ? AND event_id = ? AND registration_id IS NULL
+       AND status IN ('pending', 'processing')
+       AND idempotency_key <> ?`,
+    [athleteId, eventId, keepIdempotencyKey],
+  );
+
+  for (const row of rows) {
+    const piId = row.stripe_payment_intent_id as string | null;
+    const isSim = Number(row.is_simulation) === 1;
+    const stripe = stripeClientForSimulation(isSim);
+    if (piId && stripe && row.provider === "stripe") {
+      try {
+        const pi = await stripe.paymentIntents.retrieve(piId);
+        if (pi.status !== "succeeded" && pi.status !== "canceled") {
+          await stripe.paymentIntents.cancel(piId);
+        }
+      } catch {
+        /* ignore cancel failures */
+      }
+    }
+    await pool.query<ResultSetHeader>(
+      `UPDATE payments SET status = 'failed', failure_code = 'superseded',
+       failure_message = 'Replaced by a newer checkout attempt'
+       WHERE id = ?`,
+      [row.id],
+    );
+  }
+}
+
+async function buildCheckoutResponseForPayment(
+  paymentPublicUuid: string,
+  athleteId: number,
+): Promise<RegistrationCheckoutResponse | null> {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT p.id, p.public_uuid, p.amount_cents, p.registration_amount_cents,
+            p.service_fee_cents, p.currency, p.metadata_json, p.stripe_payment_intent_id,
+            p.mercadopago_preference_id, p.provider, p.status, p.registration_id,
+            p.event_id, p.organizer_id, p.is_simulation,
+            e.title AS event_title, e.slug AS event_slug, e.msi_enabled
+     FROM payments p
+     JOIN events e ON e.id = p.event_id
+     WHERE p.public_uuid = ? AND p.athlete_id = ? LIMIT 1`,
+    [paymentPublicUuid, athleteId],
+  );
+  if (rows.length === 0) return null;
+  const pay = rows[0];
+  if (pay.registration_id) return null;
+
+  const meta = parseCheckoutPaymentMetadata(
+    typeof pay.metadata_json === "string"
+      ? JSON.parse(pay.metadata_json as string)
+      : pay.metadata_json,
+  );
+  if (!meta) return null;
+
+  const feePresentation: FeePresentation =
+    meta.feePresentation === "absorb_all" || meta.feePresentation === "pass_through"
+      ? meta.feePresentation
+      : meta.breakdown?.mode === "absorb_all"
+        ? "absorb_all"
+        : "pass_through";
+  const listPriceCents = Number(
+    meta.breakdown?.listPriceCents ??
+      meta.categoryListPriceCents ??
+      pay.registration_amount_cents ??
+      0,
+  );
+  const baseServiceFeePercent = Number(
+    meta.baseServiceFeePercent ?? meta.breakdown?.serviceFeePercent ?? 0,
+  );
+  const baseBreakdown = computeCheckoutBreakdown({
+    listPriceCents,
+    serviceFeePercent: baseServiceFeePercent,
+    feePresentation,
+  });
+  const selectedPlan = isMsiPlanMonths(meta.msiPlanMonths)
+    ? meta.msiPlanMonths
+    : null;
+  const providerForMsi = String(pay.provider || "stripe");
+  const msiAvailable = resolveCheckoutMsiAvailable({
+    eventMsiEnabled:
+      meta.msiEnabled === true || eventRowMsiEnabled(pay as RowDataPacket),
+    provider: providerForMsi === "mock" ? "stripe" : providerForMsi,
+    baseAthleteTotalCents: baseBreakdown.athleteTotalCents,
+    isGroup: Boolean(
+      (meta as { orderMode?: string }).orderMode === "group",
+    ),
+  });
+
+  const baseResponse = (): RegistrationCheckoutResponse => ({
+    paymentPublicUuid,
+    clientSecret: null,
+    amountCents: Number(pay.amount_cents),
+    registrationAmountCents: Number(pay.registration_amount_cents),
+    serviceFeeCents: Number(pay.service_fee_cents),
+    currency: (pay.currency as string) || "MXN",
+    categoryName: meta.categoryName,
+    eventTitle: pay.event_title as string,
+    fieldValues: meta.fieldValues,
+    feePresentation: meta.feePresentation ?? meta.breakdown?.mode,
+    listPriceCents: meta.breakdown?.listPriceCents,
+    displayIvaCents: meta.breakdown?.displayIvaCents,
+    organizerFiscalNetCents: meta.breakdown?.organizerFiscalNetCents,
+    extrasSubtotalCents: meta.extrasSubtotalCents,
+    extras: meta.selectedExtras?.map((line) => ({
+      extraId: line.extraId,
+      name: line.name,
+      quantity: line.quantity,
+      unitPriceCents: line.unitPriceCents,
+      totalCents: line.totalCents,
+    })),
+    ...(meta.discountCode
+      ? {
+          discountCode: meta.discountCode,
+          discountAmountCents: meta.discountAmountCents,
+        }
+      : {}),
+    ...msiFieldsForCheckoutResponse({
+      msiAvailable,
+      planMonths: selectedPlan,
+    }),
+  });
+
+  // $0 / mock: resume returns checkout so the athlete can explicitly confirm.
+  if (pay.provider === "mock") {
+    if (Number(pay.amount_cents) !== 0) return null;
+    if (!["pending", "processing", "succeeded"].includes(String(pay.status))) {
+      return null;
+    }
+    return { ...baseResponse(), provider: "mock" };
+  }
+
+  if (!["pending", "processing"].includes(pay.status as string)) return null;
+
+  // Mercado Pago checkout removed — do not resume MP sessions; force a new stripe/manual checkout.
+  if (pay.provider === "mercadopago") {
+    return null;
+  }
+
+  const isSim = Number(pay.is_simulation) === 1;
+  const stripe = stripeClientForSimulation(isSim);
+  if (!stripe) return null;
+
+  let clientSecret: string | null = null;
+  let piId = pay.stripe_payment_intent_id as string | null;
+
+  if (piId) {
+    const pi = await stripe.paymentIntents.retrieve(piId);
+    if (
+      pi.status !== "canceled" &&
+      pi.client_secret &&
+      [
+        "requires_payment_method",
+        "requires_confirmation",
+        "requires_action",
+        "processing",
+      ].includes(pi.status)
+    ) {
+      clientSecret = pi.client_secret;
+    } else {
+      piId = null;
+    }
+  }
+
+  if (!clientSecret) {
+    const stripeCustomerId = isSim
+      ? null
+      : await ensureStripeCustomer(athleteId);
+    let piParams = buildRegistrationPaymentIntentParams({
+      amount: Number(pay.amount_cents),
+      currency: (pay.currency as string) || "mxn",
+      metadata: {
+        payment_public_uuid: paymentPublicUuid,
+        event_slug: pay.event_slug as string,
+        athlete_id: String(athleteId),
+        category_id: String(meta.categoryId),
+        event_id: String(pay.event_id),
+        organizer_id: String(pay.organizer_id ?? ""),
+        is_simulation: isSim ? "1" : "0",
+      },
+      eventTitle: pay.event_title as string | undefined,
+      customerId: stripeCustomerId,
+    });
+    if (!isSim) {
+      const connectMode = await resolveCheckoutConnectMode(
+        pool,
+        Number(pay.organizer_id),
+        getStripeClient(),
+      );
+      if (connectMode.mode === "blocked") {
+        return null;
+      }
+      if (connectMode.mode === "destination") {
+        piParams = applyConnectToPaymentIntent(piParams, {
+          destinationAccountId: connectMode.stripeAccountId,
+          applicationFeeCents: Number(pay.service_fee_cents ?? 0),
+        });
+      }
+      // mode === "platform": charge Atleita platform (manual SPEI settlement)
+    }
+    const pi = await stripe.paymentIntents.create(piParams, {
+      idempotencyKey: `pi_${paymentPublicUuid}`,
+    });
+    clientSecret = pi.client_secret;
+    await pool.query<ResultSetHeader>(
+      `UPDATE payments SET stripe_payment_intent_id = ?, status = 'processing' WHERE id = ?`,
+      [pi.id, pay.id],
+    );
+  }
+
+  return {
+    ...baseResponse(),
+    provider: "stripe",
+    clientSecret,
+  };
+}
+
+function buildServerPaceSegments(
+  splits: RowDataPacket[],
+  totalDistanceKm: number,
+): Array<{
+  kmStart: number;
+  kmEnd: number;
+  pacePerKmMs: number;
+  intensity: number;
+}> {
+  if (splits.length === 0 || totalDistanceKm <= 0) return [];
+  const sorted = [...splits].sort(
+    (a, b) => Number(a.split_order) - Number(b.split_order),
+  );
+  const segments: Array<{
+    kmStart: number;
+    kmEnd: number;
+    pacePerKmMs: number;
+    intensity: number;
+  }> = [];
+  let prevKm = 0;
+  let prevMs = 0;
+  for (const split of sorted) {
+    const km = Number(split.distance_km ?? totalDistanceKm);
+    const segmentKm = Math.max(0.01, km - prevKm);
+    const segmentMs = Math.max(1, Number(split.elapsed_ms) - prevMs);
+    segments.push({
+      kmStart: prevKm,
+      kmEnd: km,
+      pacePerKmMs: Math.round(segmentMs / segmentKm),
+      intensity: 0,
+    });
+    prevKm = km;
+    prevMs = Number(split.elapsed_ms);
+  }
+  const paces = segments.map((s) => s.pacePerKmMs);
+  const minPace = Math.min(...paces);
+  const maxPace = Math.max(...paces);
+  const span = Math.max(1, maxPace - minPace);
+  return segments.map((s) => ({
+    ...s,
+    intensity: Math.round(((maxPace - s.pacePerKmMs) / span) * 100),
+  }));
+}
+
+async function refundOrphanSucceededPayment(
+  pay: RowDataPacket,
+  pi: Stripe.PaymentIntent,
+  reason: string,
+): Promise<void> {
+  if (pi.status !== "succeeded") return;
+  const paymentId = pay.id as number;
+  const amountCents = Number(pay.amount_cents);
+  if (amountCents <= 0 || pay.provider === "mock") {
+    await pool.query<ResultSetHeader>(
+      `UPDATE payments SET status = 'failed', failure_code = 'orphan_void',
+       failure_message = ?
+       WHERE id = ? AND registration_id IS NULL`,
+      [reason, paymentId],
+    );
+    return;
+  }
+  const piId = (pay.stripe_payment_intent_id as string | null) || pi.id;
+  try {
+    const isSim = Number(pay.is_simulation) === 1;
+    const stripe = stripeClientForSimulation(isSim);
+    if (piId && stripe) {
+      await stripe.refunds.create({ payment_intent: piId });
+      await pool.query<ResultSetHeader>(
+        "UPDATE payments SET status = 'refunded' WHERE id = ? AND registration_id IS NULL",
+        [paymentId],
+      );
+      console.error("[registration] auto-refunded orphan payment", {
+        paymentId,
+        reason,
+      });
+    }
+  } catch (err) {
+    console.error("[registration] orphan payment refund failed:", err, {
+      paymentId,
+      reason,
+    });
+  }
+}
+
+async function deliverRegistrationConfirmedEmail(
+  registrationId: number,
+  opts?: { force?: boolean },
+): Promise<{ sent: boolean; skipped?: boolean; error?: string }> {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT r.registration_number, r.status, r.guest_claim_token, r.is_simulation,
+            a.id AS athlete_id, a.email AS athlete_email, a.first_name AS athlete_first_name,
+            a.last_name AS athlete_last_name, a.preferred_language,
+            e.title AS event_title,
+            o.name AS organizer_name,
+            ec.name AS category_name
+     FROM registrations r
+     JOIN athletes a ON a.id = r.athlete_id AND a.deleted_at IS NULL
+     JOIN events e ON e.id = r.event_id
+     JOIN organizers o ON o.id = e.organizer_id
+     JOIN event_categories ec ON ec.id = r.event_category_id
+     WHERE r.id = ? AND r.deleted_at IS NULL
+     LIMIT 1`,
+    [registrationId],
+  );
+
+  if (rows.length === 0 || rows[0].status !== "confirmed") {
+    return { sent: false, error: "Registration not found or not confirmed" };
+  }
+
+  const reg = rows[0];
+  const athleteEmail = String(reg.athlete_email ?? "").trim();
+  if (!athleteEmail) {
+    console.error("[email:registration-confirmed] missing athlete email", {
+      registrationId,
+    });
+    return { sent: false, error: "Athlete email missing" };
+  }
+
+  if (!opts?.force) {
+    const [alreadySent] = await pool.query<RowDataPacket[]>(
+      `SELECT id FROM notification_queue
+       WHERE channel = 'email' AND status IN ('sent', 'pending')
+         AND JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.type')) = 'registration_confirmed'
+         AND JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.registration_id')) = ?
+       LIMIT 1`,
+      [String(registrationId)],
+    );
+    if (alreadySent.length > 0) {
+      return { sent: false, skipped: true };
+    }
+  }
+
+  const locale = resolveLocale(reg.preferred_language as string | undefined);
+  const purchasedExtras = await fetchRegistrationPurchasedExtras(
+    pool,
+    registrationId,
+  );
+  const guestClaimToken = reg.guest_claim_token
+    ? String(reg.guest_claim_token).trim()
+    : "";
+  const guestClaimUrl = guestClaimToken
+    ? `${APP_URL.replace(/\/$/, "")}/login?claimToken=${encodeURIComponent(guestClaimToken)}`
+    : null;
+
+  const [waiverTitleRows] = await pool.query<RowDataPacket[]>(
+    `SELECT ew.id, ew.title, rws.acceptance_pdf_url
+     FROM registration_waiver_signatures rws
+     JOIN event_waivers ew ON ew.id = rws.waiver_id
+     WHERE rws.registration_id = ?
+       AND (rws.signature_data IS NULL OR rws.signature_data NOT LIKE 'WAIVED_BY_STAFF%')
+     ORDER BY ew.sort_order ASC, ew.id ASC`,
+    [registrationId],
+  );
+
+  const athleteFullName = [reg.athlete_first_name, reg.athlete_last_name]
+    .map((p) => String(p ?? "").trim())
+    .filter(Boolean)
+    .join(" ");
+
+  const stamped = await stampRegistrationWaiverAcceptancePdfs(pool, registrationId, {
+    locale: locale === "en" ? "en" : "es",
+    athleteFullName: athleteFullName || String(reg.athlete_first_name || "Athlete"),
+    eventTitle: String(reg.event_title),
+    categoryName: String(reg.category_name),
+    registrationNumber: String(reg.registration_number),
+    organizerName: reg.organizer_name ? String(reg.organizer_name) : null,
+  });
+
+  const acceptedWaiverTitles = waiverTitleRows.map((w) => String(w.title));
+
+  const mail = buildRegistrationConfirmedEmail({
+    locale,
+    firstName: String(reg.athlete_first_name || "Atleta"),
+    eventTitle: String(reg.event_title),
+    categoryName: String(reg.category_name),
+    registrationNumber: String(reg.registration_number),
+    appUrl: APP_URL,
+    purchasedExtras,
+    guestClaimUrl,
+    isSimulation: Number(reg.is_simulation) === 1,
+    acceptedWaiverTitles,
+    waiverAcceptanceAttached: stamped.length > 0,
+    organizerName: reg.organizer_name ? String(reg.organizer_name) : null,
+  });
+
+  let queueId: number | null = null;
+  try {
+    const [ins] = await pool.query<ResultSetHeader>(
+      `INSERT INTO notification_queue (
+         recipient_type, recipient_id, channel, to_address, subject, body, status, payload_json
+       ) VALUES ('athlete', ?, 'email', ?, ?, ?, 'pending', ?)`,
+      [
+        reg.athlete_id,
+        athleteEmail,
+        mail.subject,
+        mail.text ?? mail.subject,
+        JSON.stringify({
+          type: "registration_confirmed",
+          registration_id: registrationId,
+          registration_number: reg.registration_number,
+        }),
+      ],
+    );
+    queueId = ins.insertId;
+
+    await sendEmail({
+      to: athleteEmail,
+      subject: mail.subject,
+      html: mail.html,
+      text: mail.text,
+      attachments: stamped.map((s) => ({
+        filename: s.filename,
+        content: s.bytes,
+        contentType: "application/pdf",
+      })),
+    });
+
+    await pool.query<ResultSetHeader>(
+      `UPDATE notification_queue SET status = 'sent', sent_at = NOW() WHERE id = ?`,
+      [queueId],
+    );
+
+    console.log("[email:registration-confirmed] sent", {
+      registrationId,
+      to: athleteEmail,
+    });
+    return { sent: true };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("[email:registration-confirmed] failed", {
+      registrationId,
+      to: athleteEmail,
+      error: message,
+    });
+    if (queueId != null) {
+      await pool.query<ResultSetHeader>(
+        `UPDATE notification_queue SET status = 'failed', error_message = ? WHERE id = ?`,
+        [message.slice(0, 2000), queueId],
+      );
+    }
+    return { sent: false, error: message };
+  }
+}
+
+function formatGroupOrderResponse(
+  orderPublicUuid: string,
+  registrations: RowDataPacket[],
+  eventTitle?: string,
+  eventSlug?: string,
+) {
+  return {
+    publicUuid: orderPublicUuid,
+    itemCount: registrations.length,
+    registrations: registrations.map((r) => ({
+      public_uuid: r.public_uuid,
+      registration_number: r.registration_number,
+      qr_code_token: r.qr_code_token,
+      bib_number: r.bib_number ?? null,
+      status: r.status,
+      total_cents: r.total_cents,
+      category_name: r.category_name,
+      participant_label: r.participant_label,
+      participant_email: r.participant_email,
+      guest_claim_token: r.guest_claim_token ?? null,
+      wallet_held_by_purchaser: Boolean(r.wallet_held_by_purchaser),
+      is_managed_participant: Boolean(r.is_managed_participant),
+      event_title: r.event_title ?? eventTitle,
+      event_slug: r.event_slug ?? eventSlug,
+    })),
+  };
+}
+
+async function deliverGroupOrderSummaryEmail(
+  orderId: number,
+  purchaserAthleteId: number,
+  opts?: { force?: boolean },
+): Promise<{ sent: boolean; skipped?: boolean; error?: string }> {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT ro.id, ro.public_uuid, ro.total_cents, ro.item_count, ro.is_simulation,
+            e.title AS event_title,
+            a.id AS athlete_id, a.email AS athlete_email, a.first_name AS athlete_first_name,
+            a.preferred_language
+     FROM registration_orders ro
+     JOIN events e ON e.id = ro.event_id
+     JOIN athletes a ON a.id = ro.purchaser_athlete_id AND a.deleted_at IS NULL
+     WHERE ro.id = ? AND ro.purchaser_athlete_id = ? AND ro.status = 'confirmed'
+     LIMIT 1`,
+    [orderId, purchaserAthleteId],
+  );
+  if (rows.length === 0) {
+    return { sent: false, error: "Order not found" };
+  }
+  const order = rows[0];
+  const purchaserEmail = String(order.athlete_email ?? "").trim();
+  if (!purchaserEmail) {
+    return { sent: false, error: "Purchaser email missing" };
+  }
+
+  if (!opts?.force) {
+    const [alreadySent] = await pool.query<RowDataPacket[]>(
+      `SELECT id FROM notification_queue
+       WHERE channel = 'email' AND status IN ('sent', 'pending')
+         AND JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.type')) = 'group_order_summary'
+         AND JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.order_id')) = ?
+       LIMIT 1`,
+      [String(orderId)],
+    );
+    if (alreadySent.length > 0) {
+      return { sent: false, skipped: true };
+    }
+  }
+
+  const [participants] = await pool.query<RowDataPacket[]>(
+    `SELECT r.registration_number, r.total_cents, r.guest_claim_token, r.purchaser_athlete_id, r.athlete_id,
+            ec.name AS category_name,
+            CONCAT(a.first_name, ' ', a.last_name) AS participant_label
+     FROM registrations r
+     JOIN event_categories ec ON ec.id = r.event_category_id
+     JOIN athletes a ON a.id = r.athlete_id
+     WHERE r.order_id = ? AND r.deleted_at IS NULL AND r.status = 'confirmed'
+     ORDER BY r.id ASC`,
+    [orderId],
+  );
+
+  const walletHeldCount = participants.filter((p) => {
+    const claimPending = Boolean(p.guest_claim_token);
+    const managed =
+      p.purchaser_athlete_id != null &&
+      Number(p.purchaser_athlete_id) !== Number(p.athlete_id) &&
+      !claimPending;
+    return claimPending || managed;
+  }).length;
+
+  const locale = resolveLocale(order.preferred_language as string | undefined);
+  const mail = buildGroupOrderSummaryEmail({
+    locale,
+    firstName: String(order.athlete_first_name || "Atleta"),
+    eventTitle: String(order.event_title),
+    totalCents: Number(order.total_cents),
+    itemCount: Number(order.item_count) || participants.length,
+    participants: participants.map((p) => ({
+      label: String(p.participant_label ?? "").trim() || "Participante",
+      categoryName: String(p.category_name),
+      registrationNumber: String(p.registration_number),
+      totalCents: Number(p.total_cents),
+    })),
+    appUrl: APP_URL,
+    walletHeldCount,
+    isSimulation: Number(order.is_simulation) === 1,
+  });
+
+  let queueId: number | null = null;
+  try {
+    const [ins] = await pool.query<ResultSetHeader>(
+      `INSERT INTO notification_queue (
+         recipient_type, recipient_id, channel, to_address, subject, body, status, payload_json
+       ) VALUES ('athlete', ?, 'email', ?, ?, ?, 'pending', ?)`,
+      [
+        order.athlete_id,
+        purchaserEmail,
+        mail.subject,
+        mail.text ?? mail.subject,
+        JSON.stringify({
+          type: "group_order_summary",
+          order_id: orderId,
+          order_public_uuid: order.public_uuid,
+        }),
+      ],
+    );
+    queueId = ins.insertId;
+
+    await sendEmail({
+      to: purchaserEmail,
+      subject: mail.subject,
+      html: mail.html,
+      text: mail.text,
+    });
+
+    await pool.query<ResultSetHeader>(
+      `UPDATE notification_queue SET status = 'sent', sent_at = NOW() WHERE id = ?`,
+      [queueId],
+    );
+
+    console.log("[email:group-order-summary] sent", {
+      orderId,
+      to: purchaserEmail,
+    });
+    return { sent: true };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("[email:group-order-summary] failed", {
+      orderId,
+      to: purchaserEmail,
+      error: message,
+    });
+    if (queueId != null) {
+      await pool.query<ResultSetHeader>(
+        `UPDATE notification_queue SET status = 'failed', error_message = ? WHERE id = ?`,
+        [message.slice(0, 2000), queueId],
+      );
+    }
+    return { sent: false, error: message };
+  }
+}
+
+async function resolveConnectPaymentIds(
+  pi: Stripe.PaymentIntent,
+): Promise<{ transferId: string | null; applicationFeeId: string | null }> {
+  const chargeId =
+    typeof pi.latest_charge === "string"
+      ? pi.latest_charge
+      : (pi.latest_charge?.id ?? null);
+  if (!chargeId) {
+    return { transferId: null, applicationFeeId: null };
+  }
+
+  const stripe = getStripeClient();
+  if (!stripe) {
+    return { transferId: null, applicationFeeId: null };
+  }
+
+  try {
+    const charge = await stripe.charges.retrieve(chargeId);
+    const transferId =
+      typeof charge.transfer === "string" ? charge.transfer : null;
+    const applicationFeeId =
+      typeof charge.application_fee === "string"
+        ? charge.application_fee
+        : null;
+    return { transferId, applicationFeeId };
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("[stripe:connect] charge lookup failed:", message);
+    return { transferId: null, applicationFeeId: null };
+  }
+}
+
+async function finalizeRegistrationAfterPayment(
+  paymentPublicUuid: string,
+  pi: Stripe.PaymentIntent,
+): Promise<{
+  success: boolean;
+  registration?: RowDataPacket;
+  order?: ReturnType<typeof formatGroupOrderResponse>;
+  error?: string;
+  code?: string;
+}> {
+  if (pi.status !== "succeeded") {
+    return {
+      success: false,
+      error: pi.last_payment_error?.message || `Payment status: ${pi.status}`,
+    };
+  }
+
+  const metadataPaymentUuid = pi.metadata?.payment_public_uuid;
+  if (metadataPaymentUuid && metadataPaymentUuid !== paymentPublicUuid) {
+    return { success: false, error: "Payment does not match checkout" };
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [payRows] = await conn.query<RowDataPacket[]>(
+      `SELECT p.*, e.slug AS event_slug, e.title AS event_title,
+              e.registration_opens_at, e.registration_closes_at,
+              a.email AS athlete_email, a.first_name AS athlete_first_name,
+              a.preferred_language AS athlete_preferred_language
+       FROM payments p
+       JOIN events e ON e.id = p.event_id
+       JOIN athletes a ON a.id = p.athlete_id
+       WHERE p.public_uuid = ?
+       LIMIT 1
+       FOR UPDATE`,
+      [paymentPublicUuid],
+    );
+
+    if (payRows.length === 0) {
+      await conn.rollback();
+      return { success: false, error: "Checkout not found", code: "checkout_not_found" };
+    }
+
+    const pay = payRows[0];
+
+    const failFinalize = async (error: string) => {
+      await conn.rollback();
+      if (pi.status === "succeeded" && !pay.registration_id) {
+        await refundOrphanSucceededPayment(pay, pi, error);
+      }
+      return { success: false as const, error };
+    };
+
+    if (pay.registration_id) {
+      const existingRegistrationId = Number(pay.registration_id);
+      const [existing] = await conn.query<RowDataPacket[]>(
+        `SELECT r.public_uuid, r.registration_number, r.qr_code_token, r.status, r.total_cents,
+                ec.name AS category_name, e.title AS event_title, e.slug AS event_slug
+         FROM registrations r
+         JOIN event_categories ec ON ec.id = r.event_category_id
+         JOIN events e ON e.id = r.event_id
+         WHERE r.id = ? AND r.deleted_at IS NULL`,
+        [existingRegistrationId],
+      );
+      await conn.commit();
+      if (existing.length > 0) {
+        await deliverRegistrationConfirmedEmail(existingRegistrationId);
+        return { success: true, registration: existing[0] };
+      }
+    }
+
+    if (Number(pi.amount) !== Number(pay.amount_cents)) {
+      return failFinalize("Payment amount mismatch");
+    }
+
+    const storedPiId = pay.stripe_payment_intent_id as string | null;
+    if (
+      pay.provider !== "mercadopago" &&
+      storedPiId &&
+      storedPiId !== pi.id
+    ) {
+      return failFinalize("Payment intent mismatch");
+    }
+
+    const meta = parseCheckoutPaymentMetadata(
+      typeof pay.metadata_json === "string"
+        ? JSON.parse(pay.metadata_json as string)
+        : pay.metadata_json,
+    );
+    if (!meta) {
+      return failFinalize("Invalid checkout data");
+    }
+
+    if (isGroupCheckoutMetadata(meta)) {
+      const [[groupEventWindow]] = await conn.query<RowDataPacket[]>(
+        `SELECT start_date, end_date, registration_opens_at, registration_closes_at
+         FROM events WHERE id = ? LIMIT 1`,
+        [pay.event_id],
+      );
+      const categoryIds = [
+        ...new Set(
+          (meta.lineItems ?? [])
+            .map((li) => Number(li.categoryId))
+            .filter((id) => Number.isFinite(id) && id > 0),
+        ),
+      ];
+      if (categoryIds.length === 0) {
+        return failFinalize("Invalid group checkout categories");
+      }
+      const placeholders = categoryIds.map(() => "?").join(", ");
+      const [categoryWindows] = await conn.query<RowDataPacket[]>(
+        `SELECT id, registration_opens_at, registration_closes_at
+         FROM event_categories
+         WHERE event_id = ? AND id IN (${placeholders})`,
+        [pay.event_id, ...categoryIds],
+      );
+      const byId = new Map(
+        categoryWindows.map((c) => [Number(c.id), c] as const),
+      );
+      for (const categoryId of categoryIds) {
+        const cat = byId.get(categoryId);
+        if (!cat) {
+          return failFinalize("Category not found for group checkout");
+        }
+        const groupWindowErr = getRegistrationWindowError(
+          {
+            registration_opens_at: (groupEventWindow?.registration_opens_at ??
+              null) as string | null,
+            registration_closes_at: (groupEventWindow?.registration_closes_at ??
+              null) as string | null,
+            start_date: (groupEventWindow?.start_date as string | null) ?? null,
+            end_date: (groupEventWindow?.end_date as string | null) ?? null,
+          },
+          {
+            registration_opens_at: (cat.registration_opens_at as string | null) ?? null,
+            registration_closes_at: (cat.registration_closes_at as string | null) ?? null,
+          },
+        );
+        if (groupWindowErr) {
+          return failFinalize(groupWindowErr.error);
+        }
+      }
+
+      const groupResult = await finalizeGroupRegistrationOrder(
+        conn,
+        pay,
+        meta,
+        pi,
+        {
+          deliverRegistrationConfirmedEmail,
+          deliverGroupOrderSummaryEmail,
+        },
+      );
+      if (!groupResult.success) {
+        return failFinalize(groupResult.error ?? "Group registration failed");
+      }
+      await conn.query<ResultSetHeader>(
+        `UPDATE payments SET status = 'succeeded', paid_at = NOW(), registration_id = NULL,
+         stripe_charge_id = ?, stripe_payment_intent_id = COALESCE(stripe_payment_intent_id, ?)
+         WHERE id = ?`,
+        [
+          typeof pi.latest_charge === "string" ? pi.latest_charge : null,
+          pi.id,
+          pay.id,
+        ],
+      );
+      try {
+        await ensurePendingSpeiSettlement(conn, Number(pay.id));
+      } catch (speiErr) {
+        console.error(
+          "[finalize] ensurePendingSpeiSettlement failed (non-fatal)",
+          speiErr,
+        );
+      }
+      await conn.commit();
+      const firstReg = groupResult.registrations?.[0];
+      const orderPublicUuid =
+        groupResult.orderPublicUuid ?? meta.orderPublicUuid;
+      return {
+        success: true,
+        registration: firstReg
+          ? {
+              ...firstReg,
+              event_title: pay.event_title,
+              event_slug: pay.event_slug,
+            }
+          : undefined,
+        order:
+          orderPublicUuid && groupResult.registrations?.length
+            ? formatGroupOrderResponse(
+                orderPublicUuid,
+                groupResult.registrations,
+                pay.event_title as string,
+                pay.event_slug as string,
+              )
+            : undefined,
+      };
+    }
+
+    const athleteId = pay.athlete_id as number;
+    const eventId = pay.event_id as number;
+
+    const [[eventWaiverRow]] = await conn.query<RowDataPacket[]>(
+      "SELECT requires_waiver FROM events WHERE id = ? LIMIT 1",
+      [eventId],
+    );
+
+    const waiverSignatures =
+      meta.waiverSignatures ??
+      (meta.waiverId && meta.waiverSignature
+        ? [{ waiverId: meta.waiverId, signature: meta.waiverSignature }]
+        : []);
+
+    if (Boolean(eventWaiverRow?.requires_waiver)) {
+      if (waiverSignatures.length === 0) {
+        return failFinalize("Waiver acceptance required");
+      }
+      const [[athleteDobRow]] = await conn.query<RowDataPacket[]>(
+        "SELECT date_of_birth FROM athletes WHERE id = ? LIMIT 1",
+        [athleteId],
+      );
+      const [[eventStartRow]] = await conn.query<RowDataPacket[]>(
+        "SELECT start_date FROM events WHERE id = ? LIMIT 1",
+        [eventId],
+      );
+      const waiverValidation = await validateWaiverSignaturesForEvent(
+        conn as unknown as Pool,
+        eventId,
+        waiverSignatures,
+        {
+          categoryId: Number(meta.categoryId),
+          dateOfBirth: athleteDobRow?.date_of_birth ?? null,
+          eventStartDate: eventStartRow?.start_date ?? null,
+        },
+      );
+      if ("error" in waiverValidation) {
+        return failFinalize(waiverValidation.error);
+      }
+    }
+
+    const [dupReg] = await conn.query<RowDataPacket[]>(
+      `SELECT id FROM registrations
+       WHERE event_id = ? AND athlete_id = ? AND status = 'confirmed' AND deleted_at IS NULL
+       LIMIT 1`,
+      [eventId, athleteId],
+    );
+    if (dupReg.length > 0) {
+      return failFinalize("Already registered for this event");
+    }
+
+    const [catRows] = await conn.query<RowDataPacket[]>(
+      `SELECT id, name, capacity, currency,
+              registration_opens_at, registration_closes_at,
+              ${CATEGORY_SOLD_COUNT_UNALIASED_SQL} AS sold_count
+       FROM event_categories
+       WHERE id = ? AND event_id = ? AND is_active = 1 LIMIT 1
+       FOR UPDATE`,
+      [meta.categoryId, eventId],
+    );
+    if (catRows.length === 0) {
+      return failFinalize("Category not found");
+    }
+    const category = catRows[0];
+
+    const [[eventWindow]] = await conn.query<RowDataPacket[]>(
+      `SELECT start_date, end_date, registration_opens_at, registration_closes_at
+       FROM events WHERE id = ? LIMIT 1`,
+      [eventId],
+    );
+    const windowErr = getRegistrationWindowError(
+      {
+        registration_opens_at: (eventWindow?.registration_opens_at ??
+          pay.registration_opens_at) as string | null,
+        registration_closes_at: (eventWindow?.registration_closes_at ??
+          pay.registration_closes_at) as string | null,
+        start_date: (eventWindow?.start_date as string | null) ?? null,
+        end_date: (eventWindow?.end_date as string | null) ?? null,
+      },
+      {
+        registration_opens_at: category.registration_opens_at as string | null,
+        registration_closes_at: category.registration_closes_at as
+          | string
+          | null,
+      },
+    );
+    if (windowErr) {
+      return failFinalize(windowErr.error);
+    }
+
+    const waitlistEntryId = meta.waitlistEntryId;
+    let isWaitlistClaim = false;
+
+    if (waitlistEntryId) {
+      await expireStaleWaitlistOffers(conn);
+      const [wlRows] = await conn.query<RowDataPacket[]>(
+        `SELECT id FROM waitlist_entries
+         WHERE id = ? AND athlete_id = ? AND event_id = ? AND event_category_id = ?
+           AND status = 'offered'
+           AND (offer_expires_at IS NULL OR offer_expires_at > NOW())
+         LIMIT 1 FOR UPDATE`,
+        [waitlistEntryId, athleteId, eventId, meta.categoryId],
+      );
+      if (wlRows.length === 0) {
+        return failFinalize("Waitlist offer is no longer valid");
+      }
+      isWaitlistClaim = true;
+    } else if (
+      category.capacity != null &&
+      Number(category.sold_count) >= Number(category.capacity)
+    ) {
+      return failFinalize("Category is sold out");
+    }
+
+    const [[eventMetaRow]] = await conn.query<RowDataPacket[]>(
+      "SELECT slug, start_date FROM events WHERE id = ? LIMIT 1",
+      [eventId],
+    );
+    const eventStartsAt = eventMetaRow?.start_date as
+      | string
+      | Date
+      | null
+      | undefined;
+    const eventYear =
+      eventStartsAt != null
+        ? String(new Date(eventStartsAt).getFullYear())
+        : String(new Date().getFullYear());
+    const eventCode = String(eventMetaRow?.slug ?? eventId)
+      .toUpperCase()
+      .replace(/[^A-Z0-9]/g, "")
+      .slice(0, 8);
+
+    let discountCode: string | null = null;
+    if (meta.discountCodeId) {
+      const [[discountRow]] = await conn.query<RowDataPacket[]>(
+        "SELECT code FROM discount_codes WHERE id = ? LIMIT 1",
+        [meta.discountCodeId],
+      );
+      discountCode = discountRow?.code ? String(discountRow.code) : null;
+    }
+
+    const regUuid = newPublicUuid();
+    let regNumber: string;
+    let folioSegmentId: number | null;
+    try {
+      const allocated = await nextRegistrationNumber(
+        {
+          eventId,
+          categoryId: Number(category.id),
+          discountCodeId: meta.discountCodeId ?? null,
+          discountCode,
+          eventYear,
+          eventCode,
+        },
+        conn,
+      );
+      regNumber = allocated.registrationNumber;
+      folioSegmentId = allocated.folioSegmentId;
+    } catch (err) {
+      if (isFolioBlockFullError(err)) {
+        return failFinalize(err.message);
+      }
+      throw err;
+    }
+    const qrToken = newQrToken();
+    const priceCents =
+      meta.breakdown?.listPriceCents ?? Number(pay.registration_amount_cents);
+    const serviceFeeCents = Number(pay.service_fee_cents);
+    const totalCents = Number(pay.amount_cents);
+    const bibMode = await fetchEventBibMode(conn, eventId);
+    const bibNumber = resolveRegistrationBibNumber({
+      registrationNumber: regNumber,
+      bibMode,
+    });
+
+    const isSimReg = Number(pay.is_simulation) === 1;
+    const [regResult] = await conn.query<ResultSetHeader>(
+      `INSERT INTO registrations (
+        public_uuid, event_id, event_category_id, athlete_id, registration_number,
+        folio_segment_id, qr_code_token, bib_number, status, price_cents, service_fee_cents, total_cents,
+        discount_code_id, currency, source, payment_id, is_simulation
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [
+        regUuid,
+        eventId,
+        category.id,
+        athleteId,
+        regNumber,
+        folioSegmentId,
+        qrToken,
+        bibNumber,
+        "confirmed",
+        priceCents,
+        serviceFeeCents,
+        totalCents,
+        meta.discountCodeId ?? null,
+        pay.currency || category.currency || "MXN",
+        "web",
+        pay.id,
+        isSimReg ? 1 : 0,
+      ],
+    );
+    const registrationId = regResult.insertId;
+
+    if (meta.discountCodeId) {
+      const [discUp] = await conn.query<ResultSetHeader>(
+        `UPDATE discount_codes SET used_count = used_count + 1
+         WHERE id = ? AND (max_uses IS NULL OR used_count < max_uses)`,
+        [meta.discountCodeId],
+      );
+      if (discUp.affectedRows === 0) {
+        return failFinalize("Discount code is no longer available");
+      }
+    }
+
+    const fieldRows = await fetchRegistrationFieldsForCategory(
+      conn,
+      eventId,
+      meta.categoryId,
+    );
+    for (const field of fieldRows) {
+      const key = field.field_key as string;
+      const raw = meta.fieldValues[key];
+      let valueText: string | null = null;
+      if (field.field_type === "checkbox") {
+        valueText = raw === true || raw === "true" ? "true" : "false";
+      } else if (raw != null && String(raw).trim()) {
+        valueText = String(raw).trim();
+      }
+      if (valueText != null) {
+        await conn.query<ResultSetHeader>(
+          `INSERT INTO registration_field_values (registration_id, field_id, value_text)
+           VALUES (?,?,?)`,
+          [registrationId, field.id, valueText],
+        );
+      }
+    }
+
+    if (waiverSignatures.length > 0) {
+      await insertRegistrationWaiverSignatures(
+        conn,
+        registrationId,
+        waiverSignatures,
+        {
+          clientIp: meta.clientIp,
+          userAgent: meta.userAgent,
+          deviceInfo: meta.deviceInfo,
+        },
+      );
+    }
+
+    const connectIds = await resolveConnectPaymentIds(pi);
+
+    await conn.query<ResultSetHeader>(
+      `UPDATE payments SET status = 'succeeded', paid_at = NOW(), registration_id = ?,
+       stripe_charge_id = ?, stripe_payment_intent_id = COALESCE(stripe_payment_intent_id, ?),
+       stripe_transfer_id = COALESCE(?, stripe_transfer_id),
+       stripe_application_fee_id = COALESCE(?, stripe_application_fee_id)
+     WHERE id = ?`,
+      [
+        registrationId,
+        typeof pi.latest_charge === "string" ? pi.latest_charge : null,
+        pi.id,
+        connectIds.transferId,
+        connectIds.applicationFeeId,
+        pay.id,
+      ],
+    );
+    try {
+      await ensurePendingSpeiSettlement(conn, Number(pay.id));
+    } catch (speiErr) {
+      console.error(
+        "[finalize] ensurePendingSpeiSettlement failed (non-fatal)",
+        speiErr,
+      );
+    }
+    const [soldInc] = await conn.query<ResultSetHeader>(
+      isWaitlistClaim
+        ? `UPDATE event_categories SET sold_count = sold_count + 1 WHERE id = ?`
+        : `UPDATE event_categories SET sold_count = sold_count + 1
+           WHERE id = ? AND (capacity IS NULL OR sold_count < capacity)`,
+      [category.id],
+    );
+    if (soldInc.affectedRows === 0) {
+      return failFinalize("Category is sold out");
+    }
+
+    if (meta.selectedExtras?.length) {
+      const extrasSoldErr = await incrementExtrasSoldCount(
+        conn,
+        meta.selectedExtras,
+      );
+      if (extrasSoldErr) {
+        return failFinalize(extrasSoldErr.error);
+      }
+      await insertRegistrationExtras(
+        conn,
+        registrationId,
+        meta.selectedExtras,
+        meta.extraFieldAnswers,
+      );
+    }
+
+    if (isWaitlistClaim && waitlistEntryId) {
+      const [wlUp] = await conn.query<ResultSetHeader>(
+        `UPDATE waitlist_entries
+         SET status = 'converted', converted_registration_id = ?
+         WHERE id = ? AND athlete_id = ? AND status = 'offered'`,
+        [registrationId, waitlistEntryId, athleteId],
+      );
+      if (wlUp.affectedRows === 0) {
+        return failFinalize("Waitlist offer expired");
+      }
+    }
+
+    await conn.query<ResultSetHeader>(
+      `UPDATE events SET registration_count = registration_count + 1 WHERE id = ?`,
+      [eventId],
+    );
+
+    await conn.commit();
+
+    await deliverRegistrationConfirmedEmail(registrationId);
+
+    const [updated] = await pool.query<RowDataPacket[]>(
+      `SELECT r.public_uuid, r.registration_number, r.qr_code_token, r.status, r.total_cents,
+              ec.name AS category_name, e.title AS event_title, e.slug AS event_slug
+       FROM registrations r
+       JOIN event_categories ec ON ec.id = r.event_category_id
+       JOIN events e ON e.id = r.event_id
+       WHERE r.id = ?`,
+      [registrationId],
+    );
+    return { success: true, registration: updated[0] };
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}
+
+async function confirmRegistrationPayment(
+  paymentPublicUuid: string,
+  athleteId: number,
+  paymentIntentId?: string,
+  paymentMethodId?: string,
+): Promise<{
+  success: boolean;
+  registration?: RowDataPacket;
+  order?: ReturnType<typeof formatGroupOrderResponse>;
+  error?: string;
+  code?: string;
+  requiresAction?: boolean;
+  clientSecret?: string;
+}> {
+  const [payRows] = await pool.query<RowDataPacket[]>(
+    `SELECT p.id, p.registration_id, p.stripe_payment_intent_id, p.provider, p.status, p.amount_cents,
+            p.is_simulation, p.event_id
+     FROM payments p
+     WHERE p.public_uuid = ? AND p.athlete_id = ? LIMIT 1`,
+    [paymentPublicUuid, athleteId],
+  );
+  if (payRows.length === 0) {
+    return { success: false, error: "Checkout not found", code: "checkout_not_found" };
+  }
+  const pay = payRows[0];
+  const isSimPay = Number(pay.is_simulation) === 1;
+
+  if (pay.registration_id) {
+    const [existing] = await pool.query<RowDataPacket[]>(
+      `SELECT r.public_uuid, r.registration_number, r.qr_code_token, r.status, r.total_cents,
+              ec.name AS category_name, e.title AS event_title, e.slug AS event_slug
+       FROM registrations r
+       JOIN event_categories ec ON ec.id = r.event_category_id
+       JOIN events e ON e.id = r.event_id
+       WHERE r.id = ? AND r.deleted_at IS NULL`,
+      [pay.registration_id],
+    );
+    if (existing.length > 0) {
+      return { success: true, registration: existing[0] };
+    }
+  }
+
+  if (pay.provider === "mock") {
+    if (Number(pay.amount_cents) === 0) {
+      const zeroPi = {
+        status: "succeeded",
+        amount: 0,
+        id: `zero_${paymentPublicUuid}`,
+        metadata: { payment_public_uuid: paymentPublicUuid },
+      } as unknown as Stripe.PaymentIntent;
+      const finalized = await finalizeRegistrationAfterPayment(
+        paymentPublicUuid,
+        zeroPi,
+      );
+      if (finalized.success && isSimPay && pay.event_id) {
+        await pool.query(
+          `UPDATE registrations SET is_simulation = 1 WHERE event_id = ? AND payment_id = ?`,
+          [pay.event_id, pay.id],
+        );
+        await bumpSimulationActivity(pool, Number(pay.event_id));
+      }
+      return finalized;
+    }
+    return {
+      success: false,
+      error: apiErrorMessage("en", "checkout_outdated"),
+      code: "checkout_outdated",
+    };
+  }
+
+  // Defense: discount-to-$0 resume must not require a payment method
+  if (Number(pay.amount_cents) === 0) {
+    if (pay.stripe_payment_intent_id && stripeClientForSimulation(isSimPay)) {
+      try {
+        await stripeClientForSimulation(isSimPay)!.paymentIntents.cancel(
+          String(pay.stripe_payment_intent_id),
+        );
+      } catch {
+        /* orphan cancel best-effort */
+      }
+    }
+    await pool.query(
+      `UPDATE payments SET provider = 'mock', status = 'succeeded',
+         stripe_payment_intent_id = NULL, paid_at = COALESCE(paid_at, NOW())
+       WHERE id = ?`,
+      [pay.id],
+    );
+    const zeroPi = {
+      status: "succeeded",
+      amount: 0,
+      id: `zero_${paymentPublicUuid}`,
+      metadata: { payment_public_uuid: paymentPublicUuid },
+    } as unknown as Stripe.PaymentIntent;
+    return finalizeRegistrationAfterPayment(paymentPublicUuid, zeroPi);
+  }
+
+  if (pay.provider === "mercadopago") {
+    const [[mpRow]] = await pool.query<RowDataPacket[]>(
+      `SELECT mercadopago_payment_id, status, amount_cents FROM payments WHERE id = ? LIMIT 1`,
+      [pay.id],
+    );
+    if (mpRow?.status === "succeeded" && mpRow.mercadopago_payment_id) {
+      const mpPi = {
+        status: "succeeded",
+        amount: Number(mpRow.amount_cents),
+        id: `mp_${mpRow.mercadopago_payment_id}`,
+        metadata: { payment_public_uuid: paymentPublicUuid },
+      } as unknown as Stripe.PaymentIntent;
+      return finalizeRegistrationAfterPayment(paymentPublicUuid, mpPi);
+    }
+    return {
+      success: false,
+      error: "Mercado Pago payment is not completed yet",
+    };
+  }
+
+  if (
+    !isStripeReadyForSimulation(isSimPay) ||
+    !stripeClientForSimulation(isSimPay)
+  ) {
+    return { success: false, error: "Payment service unavailable" };
+  }
+
+  const stripe = stripeClientForSimulation(isSimPay)!;
+  const piId = paymentIntentId || (pay.stripe_payment_intent_id as string);
+  if (!piId) {
+    return { success: false, error: "Payment not initialized" };
+  }
+
+  let pi = await stripe.paymentIntents.retrieve(piId);
+
+  if (pi.status !== "succeeded" && paymentMethodId) {
+    try {
+      await stripe.paymentIntents.update(piId, {
+        payment_method: paymentMethodId,
+      });
+      // return_url required by Stripe when PI still allows redirect methods
+      // (legacy intents created before allow_redirects: never).
+      pi = await stripe.paymentIntents.confirm(piId, {
+        return_url: `${APP_URL.replace(/\/$/, "")}/portal/registrations`,
+      });
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : "Payment confirmation failed. Please try again.";
+      return { success: false, error: message };
+    }
+  }
+
+  if (pi.status === "requires_action") {
+    return {
+      success: false,
+      error: "Additional authentication required",
+      requiresAction: true,
+      clientSecret: pi.client_secret ?? undefined,
+    };
+  }
+
+  if (pi.status !== "succeeded") {
+    return {
+      success: false,
+      error:
+        pi.last_payment_error?.message ||
+        (pi.status === "requires_payment_method"
+          ? "Payment was not completed. Please try again or re-apply your discount code."
+          : `Payment status: ${pi.status}`),
+    };
+  }
+
+  if (!isSimPay) {
+    await ensureDefaultPaymentMethodAfterPay(pi);
+  }
+
+  const finalized = await finalizeRegistrationAfterPayment(
+    paymentPublicUuid,
+    pi,
+  );
+  if (finalized.success && isSimPay && pay.event_id) {
+    await pool.query(
+      `UPDATE registrations SET is_simulation = 1 WHERE event_id = ? AND payment_id = ?`,
+      [pay.event_id, pay.id],
+    );
+    await pool
+      .query(
+        `UPDATE registration_orders SET is_simulation = 1 WHERE payment_id = ?`,
+        [pay.id],
+      )
+      .catch(() => undefined);
+    await bumpSimulationActivity(pool, Number(pay.event_id));
+  }
+  return finalized;
+}
+
+// ============================================================================
+// EXPRESS APP
+// ============================================================================
+
+function buildApp() {
+  const app = express();
+  app.use(cors());
+
+  app.post(
+    "/api/webhooks/stripe",
+    express.raw({ type: "application/json" }),
+    handleStripeWebhook,
+  );
+
+  app.post("/api/webhooks/mercadopago", express.json(), async (req, res) => {
+    try {
+      const topic = String(
+        req.query.topic || req.query.type || req.body?.type || "",
+      ).toLowerCase();
+      const action = String(req.body?.action || "");
+      const dataId = String(
+        req.query["data.id"] ||
+          req.query.id ||
+          req.body?.data?.id ||
+          req.body?.id ||
+          "",
+      );
+
+      const secret = mpWebhookSecret();
+      if (secret) {
+        if (!dataId) {
+          console.warn("[mp] webhook missing data.id with secret configured");
+          return res.status(401).json({ error: "invalid signature" });
+        }
+        const ok = validateMpWebhookSignature({
+          xSignature: String(req.headers["x-signature"] || ""),
+          xRequestId: String(req.headers["x-request-id"] || ""),
+          dataId,
+          secret,
+        });
+        if (!ok) {
+          console.warn("[mp] webhook signature rejected");
+          return res.status(401).json({ error: "invalid signature" });
+        }
+      } else if (isMercadoPagoConfigured()) {
+        console.warn(
+          "[mp] MP_WEBHOOK_SECRET missing — accepting webhook without signature check",
+        );
+      }
+
+      const eventKey = `${topic}:${dataId}:${action || "notify"}`;
+      const claim = await claimMpWebhookEvent(
+        pool,
+        eventKey.slice(0, 128),
+        topic || null,
+        action || null,
+        req.body,
+      );
+      if (claim === "done") {
+        return res.status(200).json({ duplicate: true });
+      }
+
+      const body =
+        req.body && typeof req.body === "object"
+          ? (req.body as Record<string, unknown>)
+          : {};
+      const mpEventId = eventKey.slice(0, 128);
+
+      try {
+        if (
+          topic.includes("mp-connect") ||
+          topic.includes("mp_connect") ||
+          action.toLowerCase().includes("application.")
+        ) {
+          await handleMpConnectWebhook(pool, body);
+          await markMpWebhookProcessed(pool, mpEventId);
+          return res.status(200).json({ ok: true });
+        }
+
+        if (
+          topic.includes("claim") ||
+          topic.includes("chargeback") ||
+          action.toLowerCase().includes("chargeback")
+        ) {
+          if (dataId) {
+            const result = await applyMpPaymentWebhookStatus(pool, dataId, {
+              ...body,
+              action: action || "chargeback",
+            });
+            if (result.reverse) {
+              await applyExternalMpPaymentReversal(result.reverse);
+            }
+          }
+          await markMpWebhookProcessed(pool, mpEventId);
+          return res.status(200).json({ ok: true, topic: "dispute" });
+        }
+
+        if (
+          dataId &&
+          (topic.includes("payment") ||
+            !topic ||
+            action.toLowerCase().includes("payment"))
+        ) {
+          const result = await applyMpPaymentWebhookStatus(pool, dataId, body);
+          if (result.confirm) {
+            await confirmRegistrationPayment(
+              result.confirm.paymentPublicUuid,
+              result.confirm.athleteId,
+            );
+          }
+          if (result.reverse) {
+            await applyExternalMpPaymentReversal(result.reverse);
+          }
+        }
+
+        await markMpWebhookProcessed(pool, mpEventId);
+        return res.status(200).json({ ok: true });
+      } catch (err) {
+        // Leave processed_at NULL so Mercado Pago redelivery can retry.
+        console.error("[mp] webhook process", err);
+        return res.status(500).json({ error: "webhook processing failed" });
+      }
+    } catch (err) {
+      console.error("[mp] webhook", err);
+      return res.status(500).json({ error: "webhook failed" });
+    }
+  });
+
+
+  app.use(cdnAwareJsonBodyParser);
+  app.use(express.urlencoded({ extended: true }));
+  app.use(dbUnavailable);
+
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    const start = Date.now();
+    res.on("finish", () => {
+      const ms = Date.now() - start;
+      const status = res.statusCode;
+      const color =
+        status >= 500 ? "\x1b[31m" : status >= 400 ? "\x1b[33m" : "\x1b[32m";
+      console.log(
+        `${color}${req.method}\x1b[0m ${req.path} → ${color}${status}\x1b[0m (${ms}ms)`,
+      );
+    });
+    next();
+  });
+
+  registerHealthRoutes(app);
+  registerAuthRoutes(app);
+  registerMarketplaceRoutes(app);
+  registerAthleteRoutes(app);
+  registerOrganizerRoutes(app);
+  registerOrganizerSiteRoutes(app, {
+    pool,
+    requireOrganizer,
+    requireAdmin,
+    asyncHandler,
+  });
+  registerAdminRoutes(app);
+  registerSimulationPublicRoutes(app, {
+    pool,
+    optionalAthleteAuth,
+    getStripeTestPublishableKey,
+    isStripeTestConfigured,
+    getStripeTestClient,
+    cronSecret:
+      process.env.CRON_SECRET?.trim() ||
+      process.env.SIMULATION_CRON_SECRET?.trim() ||
+      "",
+  });
+  registerSimulationStaffRoutes(app, {
+    pool,
+    requireAdmin,
+    requireOrganizer,
+    newPublicUuid,
+    getStripeTestClient,
+  });
+  registerStaffPortalRoutes(app, {
+    pool,
+    requireAdmin,
+    requireOrganizer,
+    newPublicUuid,
+    newQrToken,
+    nextRegistrationNumber,
+    normalizeLocale,
+    sendEmail,
+    appUrl: APP_URL,
+    getStripeClient,
+    processPaymentRefund,
+    deliverRegistrationConfirmedEmail,
+    buildWelcomeStaffEmail: (params) =>
+      buildWelcomeStaffEmail({
+        locale: params.locale as AppLocale,
+        firstName: params.firstName,
+        audience: params.audience,
+        appUrl: params.appUrl,
+      }),
+    buildEventSubmittedForApprovalEmail: (params) =>
+      buildEventSubmittedForApprovalEmail({
+        locale: params.locale as AppLocale,
+        firstName: params.firstName,
+        eventTitle: params.eventTitle,
+        appUrl: params.appUrl,
+      }),
+    buildEventApprovedEmail: (params) =>
+      buildEventApprovedEmail({
+        locale: params.locale as AppLocale,
+        firstName: params.firstName,
+        eventTitle: params.eventTitle,
+        appUrl: params.appUrl,
+        eventId: params.eventId,
+      }),
+    buildEventRejectedEmail: (params) =>
+      buildEventRejectedEmail({
+        locale: params.locale as AppLocale,
+        firstName: params.firstName,
+        eventTitle: params.eventTitle,
+        reason: params.reason,
+        appUrl: params.appUrl,
+        eventId: params.eventId,
+      }),
+    buildOrganizerPayoutSetupEmail: (params) =>
+      buildOrganizerPayoutSetupEmail({
+        locale: params.locale as AppLocale,
+        firstName: params.firstName,
+        eventTitle: params.eventTitle,
+        appUrl: params.appUrl,
+      }),
+    sendStaffLoginOtp: async ({
+      adminId,
+      to,
+      firstName,
+      preferredLanguage,
+    }) => {
+      const code = await createOtp("admin", adminId, "login");
+      await deliverOtpEmail({
+        to,
+        locale: normalizeLocale(
+          preferredLanguage != null ? String(preferredLanguage) : undefined,
+        ),
+        firstName,
+        code,
+        logTag: "admin-invite-otp",
+      });
+    },
+  });
+  registerPhase2Routes(app, {
+    pool,
+    requireAthlete,
+    requireOrganizer,
+    requireAdmin,
+    newPublicUuid,
+    sendEmail,
+    appUrl: APP_URL,
+  });
+  registerEventBroadcastRoutes(app, {
+    pool,
+    requireOrganizer,
+    requireAdmin,
+    resend: resendClient,
+    fromEmail: FROM_EMAIL,
+    appUrl: APP_URL,
+    newPublicUuid,
+    normalizeLocale: (value) => normalizeLocale(value) as "es" | "en",
+  });
+
+  // ── Global JSON error handler (must be last use()) ───────────────────────
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+    const status = typeof err?.status === "number" ? err.status : 500;
+    const message =
+      process.env.NODE_ENV === "production"
+        ? "An unexpected error occurred."
+        : (err?.message ?? String(err));
+    console.error(`[Express error handler] ${status}:`, err?.message ?? err);
+    if (err instanceof Error && err.stack) {
+      console.error("[Express error handler] stack:", err.stack);
+    }
+    res.status(status).json({ error: message });
+  });
+
+  return app;
+}
+
+// ============================================================================
+// ROUTES — HEALTH
+// ============================================================================
+
+function registerHealthRoutes(app: express.Express) {
+  app.get("/api/health", async (_req, res) => {
+    try {
+      await pool.query("SELECT 1");
+      res.json({
+        status: "ok",
+        database: "connected",
+        timestamp: new Date().toISOString(),
+      });
+    } catch {
+      res.status(503).json({
+        status: "degraded",
+        database: "disconnected",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  });
+
+  app.get("/api/ping", (_req, res) => {
+    res.json({ message: "pong" });
+  });
+
+  app.get("/api/config/auth", (_req, res) => {
+    res.json(getClerkConfigDiagnostics());
+  });
+
+  app.get("/api/config/payments", (req, res) => {
+    if (!isStripeConfigured()) {
+      return res.status(503).json(apiErrorJson(req, "stripe_not_configured"));
+    }
+    res.json({
+      publishableKey: getStripePublishableKey(),
+      currency: "MXN",
+    });
+  });
+
+  app.get("/api/config/app-version", async (_req, res) => {
+    try {
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT setting_value
+           FROM system_settings
+          WHERE setting_key = 'app_version'
+          LIMIT 1`,
+      );
+      const dbVersion =
+        (rows[0]?.setting_value as string | undefined)?.trim() || null;
+      res.json({
+        version:
+          dbVersion ||
+          process.env.APP_VERSION?.trim() ||
+          process.env.VITE_APP_VERSION?.trim() ||
+          null,
+      });
+    } catch {
+      res.json({
+        version:
+          process.env.APP_VERSION?.trim() ||
+          process.env.VITE_APP_VERSION?.trim() ||
+          null,
+      });
+    }
+  });
+}
+
+// ============================================================================
+// ROUTES — AUTH (athlete, organizer, admin)
+// ============================================================================
+
+function respondAthleteAuthRateLimited(
+  req: Request,
+  res: Response,
+  scope: AthleteAuthRateLimitScope,
+): boolean {
+  const check = checkAthleteAuthRateLimit(req, scope);
+  if (check.ok === false) {
+    res.setHeader("Retry-After", String(check.retryAfterSec));
+    res.status(429).json({
+      ...authErrorJson(req, "rate_limited", undefined, req.body?.locale, {
+        retryAfterSec: check.retryAfterSec,
+      }),
+    });
+    return true;
+  }
+  return false;
+}
+
+function registerAuthRoutes(app: express.Express) {
+  app.post("/api/auth/athlete/check-email", async (req, res) => {
+    if (respondAthleteAuthRateLimited(req, res, "check-email")) return;
+    const email = String(req.body?.email || "")
+      .trim()
+      .toLowerCase();
+    if (!email || !/.+@.+\..+/.test(email)) {
+      return res.status(400).json(apiErrorJson(req, "valid_email_required", undefined, req.body?.locale));
+    }
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT id, password_hash, google_id, apple_id, facebook_id, clerk_user_id
+       FROM athletes WHERE email = ? AND status = 'active' AND deleted_at IS NULL LIMIT 1`,
+      [email],
+    );
+    if (rows.length === 0) {
+      return res.json({
+        exists: false,
+        hasPassword: false,
+        hasSocialLogin: false,
+      });
+    }
+    const row = rows[0];
+    res.json({
+      exists: true,
+      hasPassword: Boolean(row.password_hash),
+      hasSocialLogin: Boolean(
+        row.google_id || row.apple_id || row.facebook_id || row.clerk_user_id,
+      ),
+    });
+  });
+
+  /** Passwordless: send email OTP for an existing athlete account. */
+  app.post("/api/auth/athlete/request-otp", async (req, res) => {
+    if (respondAthleteAuthRateLimited(req, res, "request-otp")) return;
+    const email = String(req.body?.email || "")
+      .trim()
+      .toLowerCase();
+    if (!email || !/.+@.+\..+/.test(email)) {
+      return res
+        .status(400)
+        .json(authErrorJson(req, "valid_email_required", undefined, req.body?.locale));
+    }
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT id, email, first_name, preferred_language, google_id, apple_id,
+              facebook_id, clerk_user_id, password_hash
+       FROM athletes
+       WHERE email = ? AND status = 'active' AND deleted_at IS NULL
+       LIMIT 1`,
+      [email],
+    );
+    if (rows.length === 0) {
+      return res.status(404).json(
+        authErrorJson(req, "account_not_found", undefined, req.body?.locale),
+      );
+    }
+    const athlete = rows[0];
+    // Passwordless platform: social-only accounts may still receive email OTP.
+    const locale = resolveRequestLocale(
+      req,
+      athlete.preferred_language as string | undefined,
+      req.body?.locale,
+    );
+    const code = await createOtp("athlete", athlete.id as number, "login", req.ip);
+    const orgChrome = await resolveOtpOrgChromeFromRequest(req);
+    await deliverOtpEmail({
+      to: email,
+      locale,
+      firstName: String(athlete.first_name || "Athlete"),
+      code,
+      logTag: "athlete-login-otp",
+      orgChrome,
+    });
+    res.json({ ok: true, email, ...apiSuccessJson(req, "verification_code_sent", undefined, req.body?.locale), });
+  });
+
+  /** Passwordless: verify email OTP and issue session. */
+  app.post("/api/auth/athlete/verify-otp", async (req, res) => {
+    if (respondAthleteAuthRateLimited(req, res, "verify-otp")) return;
+    const email = String(req.body?.email || "")
+      .trim()
+      .toLowerCase();
+    const code = String(req.body?.code || "").trim();
+    if (!email || !code) {
+      return res
+        .status(400)
+        .json(authErrorJson(req, "email_and_code_required", undefined, req.body?.locale));
+    }
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT id, email, first_name, last_name, date_of_birth, gender, avatar_url,
+              preferred_language, preferred_theme, last_login_at, status
+       FROM athletes
+       WHERE email = ? AND deleted_at IS NULL
+       LIMIT 1`,
+      [email],
+    );
+    if (rows.length === 0 || rows[0].status !== "active") {
+      return res.status(401).json(
+        authErrorJson(req, "invalid_or_expired_code", undefined, req.body?.locale),
+      );
+    }
+    const athlete = rows[0];
+    const loginOk = await consumeOtp(
+      "athlete",
+      athlete.id as number,
+      code,
+      "login",
+    );
+    const registerOk = loginOk
+      ? false
+      : await consumeOtp("athlete", athlete.id as number, code, "register");
+    if (!loginOk && !registerOk) {
+      return res.status(401).json(
+        authErrorJson(
+          req,
+          "invalid_or_expired_code",
+          athlete.preferred_language as string | undefined,
+          req.body?.locale,
+        ),
+      );
+    }
+    await pool.query<ResultSetHeader>(
+      `UPDATE athletes SET email_verified_at = COALESCE(email_verified_at, NOW()) WHERE id = ?`,
+      [athlete.id],
+    );
+    const locale = resolveRequestLocale(
+      req,
+      athlete.preferred_language as string | undefined,
+      req.body?.locale,
+    );
+    const session = await issueAthleteSession(athlete, req, {
+      welcomeIfFirst: registerOk,
+      locale,
+    });
+    res.json({ ...session, isNew: registerOk });
+  });
+
+  app.post("/api/auth/athlete/register", async (req, res) => {
+    if (respondAthleteAuthRateLimited(req, res, "register")) return;
+    const email = String(req.body?.email || "")
+      .trim()
+      .toLowerCase();
+    const firstName = String(
+      req.body?.firstName ?? req.body?.first_name ?? "",
+    ).trim();
+    const lastName = String(
+      req.body?.lastName ?? req.body?.last_name ?? "",
+    ).trim();
+    const passwordRaw = req.body?.password;
+    const password =
+      passwordRaw === undefined || passwordRaw === null
+        ? ""
+        : String(passwordRaw);
+    const passwordless = password.length === 0;
+    const dateOfBirth = String(
+      req.body?.dateOfBirth ?? req.body?.date_of_birth ?? "",
+    ).trim();
+    const genderRaw = req.body?.gender;
+    const gender =
+      genderRaw === null || genderRaw === undefined || genderRaw === ""
+        ? null
+        : String(genderRaw);
+
+    if (!email || !/.+@.+\..+/.test(email)) {
+      return res
+        .status(400)
+        .json(authErrorJson(req, "valid_email_required", undefined, req.body?.locale));
+    }
+    if (!firstName || !lastName) {
+      return res
+        .status(400)
+        .json(apiErrorJson(req, "names_required", undefined, req.body?.locale));
+    }
+    if (!dateOfBirth || !/^\d{4}-\d{2}-\d{2}$/.test(dateOfBirth)) {
+      return res
+        .status(400)
+        .json(
+          apiErrorJson(
+            req,
+            "date_of_birth_required",
+            undefined,
+            req.body?.locale,
+          ),
+        );
+    }
+    if (
+      gender &&
+      !["male", "female", "other", "prefer_not_to_say"].includes(gender)
+    ) {
+      return res
+        .status(400)
+        .json(apiErrorJson(req, "invalid_gender", undefined, req.body?.locale));
+    }
+    if (!passwordless) {
+      const policy = validateAthletePassword(password);
+      if (!policy.valid) {
+        return res
+          .status(400)
+          .json(
+            apiErrorJson(req, "password_policy", undefined, req.body?.locale),
+          );
+      }
+    }
+
+    const [existing] = await pool.query<RowDataPacket[]>(
+      `SELECT id, password_hash, google_id, apple_id, facebook_id, clerk_user_id, status, deleted_at
+       FROM athletes WHERE email = ? LIMIT 1`,
+      [email],
+    );
+    if (existing.length > 0) {
+      const row = existing[0];
+      const isActiveAccount = row.status === "active" && row.deleted_at == null;
+
+      if (isActiveAccount) {
+        if (
+          !row.password_hash &&
+          (row.google_id ||
+            row.apple_id ||
+            row.facebook_id ||
+            row.clerk_user_id)
+        ) {
+          return res.status(409).json(
+            authErrorJson(
+              req,
+              "social_account_exists",
+              row.preferred_language as string | undefined,
+              req.body?.locale,
+            ),
+          );
+        }
+        return res
+          .status(409)
+          .json(authErrorJson(req, "account_exists", undefined, req.body?.locale));
+      }
+
+      const locale = resolveRequestLocale(req, undefined, req.body?.locale);
+      const theme = normalizeTheme(
+        (req.body?.theme ?? req.body?.preferred_theme) as string | undefined,
+      );
+      const passwordHash = passwordless
+        ? null
+        : await hashAthletePassword(password);
+      await pool.query<ResultSetHeader>(
+        `UPDATE athletes SET
+           status = 'active',
+           deleted_at = NULL,
+           first_name = ?,
+           last_name = ?,
+           password_hash = ?,
+           password_set_at = ${passwordless ? "NULL" : "NOW()"},
+           date_of_birth = ?,
+           gender = ?,
+           preferred_language = ?,
+           preferred_theme = ?,
+           email_verified_at = ${passwordless ? "NULL" : "COALESCE(email_verified_at, NOW())"}
+         WHERE id = ?`,
+        [
+          firstName,
+          lastName,
+          passwordHash,
+          dateOfBirth,
+          gender,
+          locale,
+          theme,
+          row.id,
+        ],
+      );
+
+      if (passwordless) {
+        const code = await createOtp("athlete", row.id as number, "register", req.ip);
+        await deliverOtpEmail({
+          to: email,
+          locale,
+          firstName,
+          code,
+          logTag: "athlete-register-otp",
+        });
+        return res.json({
+          ok: true,
+          requiresOtp: true,
+          email,
+          ...apiSuccessJson(req, "verification_code_sent", undefined, req.body?.locale),
+        });
+      }
+
+      const [reactivated] = await pool.query<RowDataPacket[]>(
+        `SELECT id, email, first_name, last_name, date_of_birth, gender, avatar_url,
+                preferred_language, preferred_theme, last_login_at
+         FROM athletes WHERE id = ? LIMIT 1`,
+        [row.id],
+      );
+      const session = await issueAthleteSession(reactivated[0], req, {
+        welcomeIfFirst: true,
+        locale,
+      });
+      return res.json({ ...session, reactivated: true });
+    }
+
+    const locale = resolveRequestLocale(req, undefined, req.body?.locale);
+    const theme = normalizeTheme(
+      (req.body?.theme ?? req.body?.preferred_theme) as string | undefined,
+    );
+    const passwordHash = passwordless
+      ? null
+      : await hashAthletePassword(password);
+    const [ins] = await pool.query<ResultSetHeader>(
+      passwordless
+        ? `INSERT INTO athletes (
+             public_uuid, email, email_verified_at, password_hash, password_set_at,
+             first_name, last_name, date_of_birth, gender, preferred_language, preferred_theme
+           ) VALUES (?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?)`
+        : `INSERT INTO athletes (
+             public_uuid, email, email_verified_at, password_hash, password_set_at,
+             first_name, last_name, date_of_birth, gender, preferred_language, preferred_theme
+           ) VALUES (?, ?, NOW(), ?, NOW(), ?, ?, ?, ?, ?, ?)`,
+      passwordless
+        ? [
+            newPublicUuid(),
+            email,
+            firstName,
+            lastName,
+            dateOfBirth,
+            gender,
+            locale,
+            theme,
+          ]
+        : [
+            newPublicUuid(),
+            email,
+            passwordHash,
+            firstName,
+            lastName,
+            dateOfBirth,
+            gender,
+            locale,
+            theme,
+          ],
+    );
+
+    if (passwordless) {
+      const code = await createOtp(
+        "athlete",
+        ins.insertId,
+        "register",
+        req.ip,
+      );
+      await deliverOtpEmail({
+        to: email,
+        locale,
+        firstName,
+        code,
+        logTag: "athlete-register-otp",
+      });
+      return res.json({
+        ok: true,
+        requiresOtp: true,
+        email,
+        ...apiSuccessJson(req, "verification_code_sent", undefined, req.body?.locale),
+      });
+    }
+
+    const [created] = await pool.query<RowDataPacket[]>(
+      `SELECT id, email, first_name, last_name, date_of_birth, gender, avatar_url,
+              preferred_language, preferred_theme, last_login_at
+       FROM athletes WHERE id = ? LIMIT 1`,
+      [ins.insertId],
+    );
+    const session = await issueAthleteSession(created[0], req, {
+      welcomeIfFirst: true,
+      locale,
+    });
+    res.json(session);
+  });
+
+  app.post("/api/auth/athlete/login", async (_req, res) => {
+    return res.status(410).json({
+      error: "password_auth_disabled",
+      message: "Use email OTP login.",
+    });
+  });
+
+  app.post("/api/auth/athlete/forgot-password", async (_req, res) => {
+    // Passwordless: password reset is disabled — use OTP login.
+    return res.status(410).json({
+      error: "password_auth_disabled",
+      message: "Use email OTP login instead of password reset.",
+    });
+  });
+
+  app.post("/api/auth/athlete/reset-password", async (_req, res) => {
+    return res.status(410).json({
+      error: "password_auth_disabled",
+      message: "Use email OTP login instead of password reset.",
+    });
+  });
+
+  // ============================================================
+  // AUTH — ORGANIZER
+  // ============================================================
+  app.post("/api/auth/organizer/request-otp", async (req, res) => {
+    const email = String(req.body?.email || "")
+      .trim()
+      .toLowerCase();
+    if (!email || !/.+@.+\..+/.test(email)) {
+      return res.status(400).json(
+        authErrorJson(req, "valid_email_required", undefined, req.body?.locale),
+      );
+    }
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT om.id, om.first_name, om.preferred_language, om.organizer_id, o.name AS organizer_name
+       FROM organizer_members om
+       JOIN organizers o ON o.id = om.organizer_id
+       WHERE om.email = ? AND om.status = 'active' LIMIT 1`,
+      [email],
+    );
+    if (rows.length === 0) {
+      return res.status(404).json(
+        authErrorJson(req, "organizer_account_not_found", undefined, req.body?.locale),
+      );
+    }
+    const locale = resolveRequestLocale(
+      req,
+      rows[0].preferred_language as string,
+      req.body?.locale,
+    );
+    const code = await createOtp(
+      "organizer",
+      rows[0].id as number,
+      "login",
+      req.ip,
+    );
+    const otpMail = buildOtpEmail({
+      locale,
+      firstName: rows[0].first_name as string,
+      code,
+      appUrl: APP_URL,
+    });
+    await sendEmail({
+      to: email,
+      subject: otpMail.subject,
+      html: otpMail.html,
+      text: otpMail.text,
+    });
+    res.json({ ok: true, ...apiSuccessJson(req, "verification_code_sent", undefined, req.body?.locale), });
+  });
+
+  app.post("/api/auth/organizer/verify-otp", async (req, res) => {
+    const email = String(req.body?.email || "")
+      .trim()
+      .toLowerCase();
+    const code = String(req.body?.code || "").trim();
+    if (!email || !code) {
+      return res.status(400).json(
+        authErrorJson(req, "email_and_code_required", undefined, req.body?.locale),
+      );
+    }
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT om.id, om.email, om.first_name, om.last_name, om.organizer_id, om.role
+       FROM organizer_members om WHERE om.email = ? LIMIT 1`,
+      [email],
+    );
+    if (rows.length === 0) {
+      return res.status(404).json(
+        authErrorJson(req, "organizer_account_not_found", undefined, req.body?.locale),
+      );
+    }
+    const member = rows[0];
+    const ok = await consumeOtp(
+      "organizer",
+      member.id as number,
+      code,
+      "login",
+    );
+    if (!ok) {
+      return res.status(401).json(
+        authErrorJson(req, "invalid_or_expired_code", undefined, req.body?.locale),
+      );
+    }
+    await pool.query<ResultSetHeader>(
+      "UPDATE organizer_members SET last_login_at = NOW() WHERE id = ?",
+      [member.id],
+    );
+
+    const token = await createSession(
+      "organizer",
+      member.id as number,
+      member.email as string,
+      req.ip,
+      req.headers["user-agent"],
+      member.organizer_id as number,
+    );
+    res.json({
+      token,
+      member: {
+        id: member.id,
+        email: member.email,
+        firstName: member.first_name,
+        lastName: member.last_name,
+        role: member.role,
+        organizerId: member.organizer_id,
+      },
+    });
+  });
+
+  // ============================================================
+  // AUTH — STAFF (unified admin + organizer)
+  // ============================================================
+  app.post("/api/auth/staff/request-otp", async (req, res) => {
+    const email = normalizeLookupEmail(String(req.body?.email || ""));
+    if (!email || !/.+@.+\..+/.test(email)) {
+      return res.status(400).json(
+        authErrorJson(req, "valid_email_required", undefined, req.body?.locale),
+      );
+    }
+    const account = await resolveStaffByEmail(email);
+    if (!account) {
+      return res.status(404).json(
+        authErrorJson(req, "staff_account_not_found", undefined, req.body?.locale),
+      );
+    }
+    const locale = resolveRequestLocale(
+      req,
+      account.preferredLanguage,
+      req.body?.locale,
+    );
+    const code = await createOtp(
+      account.role === "admin" ? "admin" : "organizer",
+      account.actorId,
+      "login",
+      req.ip,
+    );
+    try {
+      await deliverOtpEmail({
+        to: account.email,
+        locale,
+        firstName: account.firstName,
+        code,
+        logTag: "otp-staff",
+      });
+    } catch {
+      return res.status(502).json(
+        authErrorJson(req, "generic", account.preferredLanguage, req.body?.locale),
+      );
+    }
+    res.json({
+      ok: true,
+      role: account.role,
+      ...apiSuccessJson(req, "verification_code_sent", undefined, req.body?.locale),
+    });
+  });
+
+  app.post("/api/auth/staff/verify-otp", async (req, res) => {
+    const email = normalizeLookupEmail(String(req.body?.email || ""));
+    const code = String(req.body?.code || "").trim();
+    if (!email || !code) {
+      return res.status(400).json(
+        authErrorJson(req, "email_and_code_required", undefined, req.body?.locale),
+      );
+    }
+    const account = await resolveStaffByEmail(email);
+    if (!account) {
+      return res.status(404).json(
+        authErrorJson(req, "staff_account_not_found", undefined, req.body?.locale),
+      );
+    }
+
+    if (account.role === "admin") {
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT id, email, first_name, last_name, role, preferred_language, preferred_theme, last_login_at
+         FROM admins
+         WHERE LOWER(TRIM(email)) = ? AND status = 'active' AND deleted_at IS NULL
+         LIMIT 1`,
+        [normalizeLookupEmail(email)],
+      );
+      if (rows.length === 0) {
+        return res.status(404).json(
+          authErrorJson(req, "staff_account_not_found", undefined, req.body?.locale),
+        );
+      }
+      const admin = rows[0];
+      const ok = await consumeOtp("admin", admin.id as number, code, "login");
+      if (!ok) {
+        return res.status(401).json(
+          authErrorJson(
+            req,
+            "invalid_or_expired_code",
+            admin.preferred_language as string | undefined,
+            req.body?.locale,
+          ),
+        );
+      }
+      const isFirstLogin = !admin.last_login_at;
+      const adminLocale = normalizeLocale(admin.preferred_language as string);
+      await pool.query<ResultSetHeader>(
+        "UPDATE admins SET last_login_at = NOW() WHERE id = ?",
+        [admin.id],
+      );
+      if (isFirstLogin) {
+        const welcome = buildWelcomeStaffEmail({
+          locale: adminLocale,
+          firstName: admin.first_name as string,
+          audience: "admin",
+          appUrl: APP_URL,
+        });
+        sendEmail({
+          to: admin.email as string,
+          subject: welcome.subject,
+          html: welcome.html,
+          text: welcome.text,
+        }).catch((err) => console.error("[email:welcome-admin]", err));
+      }
+      const token = await createSession(
+        "admin",
+        admin.id as number,
+        admin.email as string,
+        req.ip,
+        req.headers["user-agent"],
+      );
+      return res.json({
+        token,
+        role: "admin" as const,
+        admin: {
+          id: admin.id,
+          email: admin.email,
+          firstName: admin.first_name,
+          lastName: admin.last_name,
+          role: admin.role,
+          preferredLanguage: normalizeLocale(
+            admin.preferred_language as string | undefined,
+          ),
+          preferredTheme: normalizeTheme(
+            admin.preferred_theme as string | undefined,
+          ),
+        },
+      });
+    }
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT om.id, om.email, om.first_name, om.last_name, om.role, om.organizer_id,
+              om.preferred_language, om.preferred_theme
+       FROM organizer_members om
+       WHERE LOWER(TRIM(om.email)) = ? AND om.status = 'active'
+       LIMIT 1`,
+      [normalizeLookupEmail(email)],
+    );
+    if (rows.length === 0) {
+      return res.status(404).json(
+        authErrorJson(req, "staff_account_not_found", undefined, req.body?.locale),
+      );
+    }
+    const member = rows[0];
+    const ok = await consumeOtp(
+      "organizer",
+      member.id as number,
+      code,
+      "login",
+    );
+    if (!ok) {
+      return res.status(401).json(
+        authErrorJson(req, "invalid_or_expired_code", undefined, req.body?.locale),
+      );
+    }
+    await pool.query<ResultSetHeader>(
+      "UPDATE organizer_members SET last_login_at = NOW() WHERE id = ?",
+      [member.id],
+    );
+    const token = await createSession(
+      "organizer",
+      member.id as number,
+      member.email as string,
+      req.ip,
+      req.headers["user-agent"],
+      member.organizer_id as number,
+    );
+    res.json({
+      token,
+      role: "organizer" as const,
+      member: {
+        id: member.id,
+        email: member.email,
+        firstName: member.first_name,
+        lastName: member.last_name,
+        role: member.role,
+        organizerId: member.organizer_id,
+        preferredLanguage: normalizeLocale(
+          member.preferred_language as string | undefined,
+        ),
+        preferredTheme: normalizeTheme(
+          member.preferred_theme as string | undefined,
+        ),
+      },
+    });
+  });
+
+  // ============================================================
+  // AUTH — ADMIN
+  // ============================================================
+  app.post("/api/auth/admin/request-otp", async (req, res) => {
+    const email = normalizeLookupEmail(String(req.body?.email || ""));
+    if (!email || !/.+@.+\..+/.test(email)) {
+      return res.status(400).json(apiErrorJson(req, "valid_email_required", undefined, req.body?.locale));
+    }
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT id, email, first_name, preferred_language FROM admins
+       WHERE LOWER(TRIM(email)) = ? AND status = 'active' AND deleted_at IS NULL
+       LIMIT 1`,
+      [email],
+    );
+    if (rows.length === 0) {
+      return res.status(404).json(apiErrorJson(req, "no_admin_account", undefined, req.body?.locale));
+    }
+    const locale = resolveRequestLocale(
+      req,
+      rows[0].preferred_language as string,
+      req.body?.locale,
+    );
+    const code = await createOtp(
+      "admin",
+      rows[0].id as number,
+      "login",
+      req.ip,
+    );
+    try {
+      await deliverOtpEmail({
+        to: rows[0].email as string,
+        locale,
+        firstName: rows[0].first_name as string,
+        code,
+        logTag: "otp-admin",
+      });
+    } catch {
+      return res.status(502).json({
+        ...apiErrorJson(req, "could_not_send_verification_email", undefined, req.body?.locale),
+      });
+    }
+    res.json({ ok: true, ...apiSuccessJson(req, "verification_code_sent", undefined, req.body?.locale), });
+  });
+
+  app.post("/api/auth/admin/verify-otp", async (req, res) => {
+    const email = normalizeLookupEmail(String(req.body?.email || ""));
+    const code = String(req.body?.code || "").trim();
+    if (!email || !code) {
+      return res.status(400).json(apiErrorJson(req, "email_and_code_required", undefined, req.body?.locale));
+    }
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT id, email, first_name, last_name, role, preferred_language, preferred_theme, last_login_at
+       FROM admins
+       WHERE LOWER(TRIM(email)) = ? AND status = 'active' AND deleted_at IS NULL
+       LIMIT 1`,
+      [email],
+    );
+    if (rows.length === 0) {
+      return res.status(404).json(apiErrorJson(req, "account_not_found_generic", undefined, req.body?.locale));
+    }
+    const admin = rows[0];
+    const isFirstLogin = !admin.last_login_at;
+    const adminLocale = normalizeLocale(admin.preferred_language as string);
+    const ok = await consumeOtp("admin", admin.id as number, code, "login");
+    if (!ok) {
+      return res.status(401).json(apiErrorJson(req, "invalid_or_expired_code", undefined, req.body?.locale));
+    }
+    await pool.query<ResultSetHeader>(
+      "UPDATE admins SET last_login_at = NOW() WHERE id = ?",
+      [admin.id],
+    );
+
+    if (isFirstLogin) {
+      const welcome = buildWelcomeStaffEmail({
+        locale: adminLocale,
+        firstName: admin.first_name as string,
+        audience: "admin",
+        appUrl: APP_URL,
+      });
+      sendEmail({
+        to: admin.email as string,
+        subject: welcome.subject,
+        html: welcome.html,
+        text: welcome.text,
+      }).catch((err) => console.error("[email:welcome-admin]", err));
+    }
+
+    const token = await createSession(
+      "admin",
+      admin.id as number,
+      admin.email as string,
+      req.ip,
+      req.headers["user-agent"],
+    );
+    res.json({
+      token,
+      admin: {
+        id: admin.id,
+        email: admin.email,
+        firstName: admin.first_name,
+        lastName: admin.last_name,
+        role: admin.role,
+      },
+    });
+  });
+
+  app.get(
+    "/api/auth/admin/me",
+    requireAdmin,
+    async (req: AuthedRequest, res) => {
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT id, email, first_name, last_name, role, phone, avatar_url, preferred_language,
+                preferred_theme, last_login_at, created_at
+       FROM admins WHERE id = ? AND status = 'active' AND deleted_at IS NULL LIMIT 1`,
+        [req.auth!.id],
+      );
+      if (rows.length === 0) {
+        return res.status(404).json(apiErrorJson(req, "admin_not_found"));
+      }
+      const admin = rows[0];
+      res.json({
+        admin: {
+          id: admin.id,
+          email: admin.email,
+          firstName: admin.first_name,
+          lastName: admin.last_name,
+          role: admin.role,
+          phone: admin.phone ?? null,
+          avatarUrl: admin.avatar_url ?? null,
+          preferredLanguage: admin.preferred_language,
+          preferredTheme: admin.preferred_theme,
+          lastLoginAt: admin.last_login_at ?? null,
+          createdAt: admin.created_at,
+        },
+      });
+    },
+  );
+
+  app.patch(
+    "/api/auth/admin/me",
+    requireAdmin,
+    async (req: AuthedRequest, res) => {
+      const parsed = parseStaffProfileUpdate(
+        (req.body ?? {}) as Record<string, unknown>,
+      );
+      if ("error" in parsed) {
+        return res.status(400).json({ error: parsed.error });
+      }
+
+      const params = [...parsed.params, req.auth!.id];
+      await pool.query<ResultSetHeader>(
+        `UPDATE admins SET ${parsed.updates.join(", ")} WHERE id = ? AND deleted_at IS NULL`,
+        params,
+      );
+
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT id, email, first_name, last_name, role, phone, avatar_url, preferred_language,
+                preferred_theme, last_login_at, created_at
+         FROM admins WHERE id = ? AND deleted_at IS NULL LIMIT 1`,
+        [req.auth!.id],
+      );
+      if (rows.length === 0) {
+        return res.status(404).json(apiErrorJson(req, "admin_not_found"));
+      }
+      const admin = rows[0];
+      res.json({
+        admin: {
+          id: admin.id,
+          email: admin.email,
+          firstName: admin.first_name,
+          lastName: admin.last_name,
+          role: admin.role,
+          phone: admin.phone ?? null,
+          avatarUrl: admin.avatar_url ?? null,
+          preferredLanguage: admin.preferred_language,
+          preferredTheme: admin.preferred_theme,
+          lastLoginAt: admin.last_login_at ?? null,
+          createdAt: admin.created_at,
+        },
+      });
+    },
+  );
+
+  app.post(
+    "/api/auth/admin/avatar",
+    requireAdmin,
+    async (req: AuthedRequest, res) => {
+      const parsed = parseAvatarDataUrl(req.body?.image);
+      if ("error" in parsed) {
+        return res.status(400).json(apiErrorJson(req, parsed.code));
+      }
+      await pool.query<ResultSetHeader>(
+        "UPDATE admins SET avatar_url = ? WHERE id = ? AND deleted_at IS NULL",
+        [parsed.dataUrl, req.auth!.id],
+      );
+      res.json({ ok: true, avatarUrl: parsed.dataUrl });
+    },
+  );
+
+  app.delete(
+    "/api/auth/admin/avatar",
+    requireAdmin,
+    async (req: AuthedRequest, res) => {
+      await pool.query<ResultSetHeader>(
+        "UPDATE admins SET avatar_url = NULL WHERE id = ? AND deleted_at IS NULL",
+        [req.auth!.id],
+      );
+      res.json({ ok: true, avatarUrl: null });
+    },
+  );
+
+  app.get(
+    "/api/auth/organizer/me",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT om.id, om.email, om.first_name, om.last_name, om.role, om.organizer_id,
+                om.phone, om.avatar_url, om.preferred_language, om.preferred_theme,
+                om.event_access_scope, om.last_login_at, om.created_at,
+                o.name AS organizer_name
+         FROM organizer_members om
+         JOIN organizers o ON o.id = om.organizer_id
+         WHERE om.id = ? AND om.status = 'active' AND om.deleted_at IS NULL LIMIT 1`,
+        [req.auth!.id],
+      );
+      if (rows.length === 0) {
+        return res.status(404).json(apiErrorJson(req, "organizer_member_not_found"));
+      }
+      const member = rows[0];
+      const [assignedRows] = await pool.query<RowDataPacket[]>(
+        `SELECT event_id FROM organizer_member_events WHERE organizer_member_id = ?`,
+        [member.id],
+      );
+      res.json({
+        member: {
+          id: member.id,
+          email: member.email,
+          firstName: member.first_name,
+          lastName: member.last_name,
+          role: member.role,
+          organizerId: member.organizer_id,
+          organizerName: member.organizer_name,
+          phone: member.phone ?? null,
+          avatarUrl: member.avatar_url ?? null,
+          preferredLanguage: member.preferred_language,
+          preferredTheme: member.preferred_theme,
+          eventAccessScope: member.event_access_scope ?? "organization",
+          assignedEventIds: assignedRows.map((r) => Number(r.event_id)),
+          lastLoginAt: member.last_login_at ?? null,
+          createdAt: member.created_at,
+        },
+      });
+    },
+  );
+
+  app.patch(
+    "/api/auth/organizer/me",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const parsed = parseStaffProfileUpdate(
+        (req.body ?? {}) as Record<string, unknown>,
+      );
+      if ("error" in parsed) {
+        return res.status(400).json({ error: parsed.error });
+      }
+
+      const params = [...parsed.params, req.auth!.id];
+      await pool.query<ResultSetHeader>(
+        `UPDATE organizer_members SET ${parsed.updates.join(", ")} WHERE id = ? AND deleted_at IS NULL`,
+        params,
+      );
+
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT om.id, om.email, om.first_name, om.last_name, om.role, om.organizer_id,
+                om.phone, om.avatar_url, om.preferred_language, om.preferred_theme,
+                om.event_access_scope, om.last_login_at, om.created_at,
+                o.name AS organizer_name
+         FROM organizer_members om
+         JOIN organizers o ON o.id = om.organizer_id
+         WHERE om.id = ? AND om.deleted_at IS NULL LIMIT 1`,
+        [req.auth!.id],
+      );
+      if (rows.length === 0) {
+        return res.status(404).json(apiErrorJson(req, "organizer_member_not_found"));
+      }
+      const member = rows[0];
+      const [assignedRows] = await pool.query<RowDataPacket[]>(
+        `SELECT event_id FROM organizer_member_events WHERE organizer_member_id = ?`,
+        [member.id],
+      );
+      res.json({
+        member: {
+          id: member.id,
+          email: member.email,
+          firstName: member.first_name,
+          lastName: member.last_name,
+          role: member.role,
+          organizerId: member.organizer_id,
+          organizerName: member.organizer_name,
+          phone: member.phone ?? null,
+          avatarUrl: member.avatar_url ?? null,
+          preferredLanguage: member.preferred_language,
+          preferredTheme: member.preferred_theme,
+          eventAccessScope: member.event_access_scope ?? "organization",
+          assignedEventIds: assignedRows.map((r) => Number(r.event_id)),
+          lastLoginAt: member.last_login_at ?? null,
+          createdAt: member.created_at,
+        },
+      });
+    },
+  );
+
+  app.post(
+    "/api/auth/organizer/avatar",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const parsed = parseAvatarDataUrl(req.body?.image);
+      if ("error" in parsed) {
+        return res.status(400).json(apiErrorJson(req, parsed.code));
+      }
+      await pool.query<ResultSetHeader>(
+        "UPDATE organizer_members SET avatar_url = ? WHERE id = ? AND deleted_at IS NULL",
+        [parsed.dataUrl, req.auth!.id],
+      );
+      res.json({ ok: true, avatarUrl: parsed.dataUrl });
+    },
+  );
+
+  app.delete(
+    "/api/auth/organizer/avatar",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      await pool.query<ResultSetHeader>(
+        "UPDATE organizer_members SET avatar_url = NULL WHERE id = ? AND deleted_at IS NULL",
+        [req.auth!.id],
+      );
+      res.json({ ok: true, avatarUrl: null });
+    },
+  );
+
+  app.post("/api/auth/clerk/athlete", async (_req, res) => {
+    return res.status(410).json({
+      error: "clerk_disabled",
+      message: "Clerk social auth is disabled. Use email OTP.",
+    });
+  });
+
+  app.post("/api/auth/logout", async (req, res) => {
+    const token = extractToken(req);
+    if (token) await revokeSession(token);
+    res.json({ ok: true });
+  });
+}
+
+// ============================================================================
+// ROUTES — MARKETPLACE (public event discovery)
+// ============================================================================
+
+function asyncHandler(
+  fn: (
+    req: Request,
+    res: Response,
+    next: NextFunction,
+  ) => void | Promise<void | Response>,
+): express.RequestHandler {
+  return (req, res, next) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+}
+
+function registerMarketplaceRoutes(app: express.Express) {
+  app.get("/api/sport-types", async (_req, res) => {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT id, slug, name, icon FROM sport_types WHERE is_active = 1 ORDER BY sort_order ASC`,
+    );
+    res.json({ sportTypes: rows });
+  });
+
+  const withNormalizedEventMedia = <T extends RowDataPacket>(row: T): T => ({
+    ...row,
+    hero_image_url: normalizeEventMediaUrl(row.hero_image_url as string | null),
+    banner_image_url: normalizeEventMediaUrl(
+      row.banner_image_url as string | null,
+    ),
+  });
+
+  const publishedEventSelect = `
+      SELECT e.id, e.public_uuid, e.slug, e.title, e.short_description, e.start_date, e.end_date,
+             e.location_city, e.location_state, e.location_country, e.location_lat, e.location_lng,
+             e.featured, e.hero_image_url, e.msi_enabled, ${EVENT_REGISTRATION_COUNT_SQL} AS registration_count,
+             e.registration_closes_at,
+             st.slug AS sport_slug, st.name AS sport_name,
+             o.name AS organizer_name, o.slug AS organizer_slug,
+             ec_min.from_price_cents
+      FROM events e
+      JOIN sport_types st ON st.id = e.sport_type_id
+      JOIN organizers o ON o.id = e.organizer_id AND o.deleted_at IS NULL
+      ${MARKETPLACE_MIN_PRICE_JOIN_SQL}
+      WHERE e.status = 'published' AND e.visibility = 'public' AND e.deleted_at IS NULL AND COALESCE(e.is_simulation, 0) = 0
+      ${MARKETPLACE_AUTO_DEACTIVATE_SQL}`;
+
+  app.get(
+    "/api/public/site-profile",
+    asyncHandler(async (_req, res) => {
+      const profile = await fetchSitePublicProfile(pool);
+      res.json({ profile });
+    }),
+  );
+
+    app.get(
+    "/api/public/home",
+    asyncHandler(async (_req, res) => {
+      const emptyStats = {
+        published_events: 0,
+        active_athletes: 0,
+        confirmed_registrations: 0,
+      };
+
+      const loadStats = async () => {
+        const [[statsRow]] = await pool.query<RowDataPacket[]>(
+          `SELECT
+             (SELECT COUNT(*) FROM events WHERE status = 'published' AND deleted_at IS NULL AND COALESCE(is_simulation, 0) = 0) AS published_events,
+             (SELECT COUNT(*) FROM athletes WHERE status = 'active' AND deleted_at IS NULL AND COALESCE(is_simulation, 0) = 0) AS active_athletes,
+             (SELECT COUNT(*) FROM registrations WHERE status = 'confirmed' AND deleted_at IS NULL AND COALESCE(is_simulation, 0) = 0) AS confirmed_registrations`,
+        );
+        return {
+          published_events: Number(statsRow?.published_events ?? 0),
+          active_athletes: Number(statsRow?.active_athletes ?? 0),
+          confirmed_registrations: Number(
+            statsRow?.confirmed_registrations ?? 0,
+          ),
+        };
+      };
+
+      const [statsResult, eventsResult] = await Promise.allSettled([
+        loadStats(),
+        pool.query<RowDataPacket[]>(
+          `${publishedEventSelect} ORDER BY e.start_date ASC LIMIT 50`,
+        ),
+      ]);
+
+      if (statsResult.status === "rejected") {
+        console.error(`[GET /api/public/home] stats`, statsResult.reason);
+      }
+      if (eventsResult.status === "rejected") {
+        console.error(`[GET /api/public/home] events`, eventsResult.reason);
+      }
+
+      const stats =
+        statsResult.status === "fulfilled" ? statsResult.value : emptyStats;
+      const publishedEvents =
+        eventsResult.status === "fulfilled" ? eventsResult.value[0] : [];
+      const normalizedEvents = publishedEvents.map(withNormalizedEventMedia);
+
+      res.json({
+        stats,
+        featured_events: [],
+        upcoming_events: normalizedEvents,
+        events: normalizedEvents,
+      });
+    }),
+  );
+
+  app.get("/api/geo/states", async (req, res) => {
+    const country = String(req.query.country ?? "MX")
+      .toUpperCase()
+      .slice(0, 2);
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT id, country, name, code
+       FROM geo_states
+       WHERE country = ? AND is_active = 1
+       ORDER BY sort_order ASC, name ASC`,
+      [country],
+    );
+    res.json({ states: rows });
+  });
+
+  app.get("/api/geo/cities", async (req, res) => {
+    const country = String(req.query.country ?? "MX")
+      .toUpperCase()
+      .slice(0, 2);
+    const stateId = req.query.state_id ? Number(req.query.state_id) : null;
+    const q = req.query.q ? String(req.query.q).trim() : null;
+
+    let sql = `
+      SELECT gc.id, gc.state_id, gc.name, gc.lat, gc.lng,
+             gs.name AS state_name, gs.code AS state_code
+      FROM geo_cities gc
+      JOIN geo_states gs ON gs.id = gc.state_id
+      WHERE gs.country = ? AND gc.is_active = 1 AND gs.is_active = 1
+    `;
+    const params: unknown[] = [country];
+
+    if (stateId != null && Number.isFinite(stateId)) {
+      sql += " AND gc.state_id = ?";
+      params.push(stateId);
+    }
+    if (q && q.length >= 1) {
+      sql += " AND gc.name LIKE ?";
+      params.push(`%${q}%`);
+    }
+
+    sql += " ORDER BY gc.name ASC LIMIT 100";
+
+    const [rows] = await pool.query<RowDataPacket[]>(sql, params);
+    res.json({ cities: rows });
+  });
+
+  /** Resolve a map pin for event location: catalog coords first, Nominatim fallback. */
+  app.get("/api/geo/resolve-place", async (req, res) => {
+    const country = String(req.query.country ?? "MX")
+      .toUpperCase()
+      .slice(0, 2);
+    const city = req.query.city ? String(req.query.city).trim() : "";
+    const state = req.query.state ? String(req.query.state).trim() : "";
+    const name = req.query.name ? String(req.query.name).trim() : "";
+    const latRaw = req.query.lat != null ? Number(req.query.lat) : null;
+    const lngRaw = req.query.lng != null ? Number(req.query.lng) : null;
+
+    const labelFromParts = [name || city, state].filter(Boolean).join(", ");
+
+    if (
+      latRaw != null &&
+      lngRaw != null &&
+      Number.isFinite(latRaw) &&
+      Number.isFinite(lngRaw) &&
+      Math.abs(latRaw) <= 90 &&
+      Math.abs(lngRaw) <= 180
+    ) {
+      return res.json({
+        place: {
+          lat: latRaw,
+          lng: lngRaw,
+          label: labelFromParts || `${latRaw.toFixed(4)}, ${lngRaw.toFixed(4)}`,
+          source: "event",
+        },
+      });
+    }
+
+    if (!city && !name) {
+      return res.json({ place: null });
+    }
+
+    if (city) {
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT gc.name, gc.lat, gc.lng, gs.name AS state_name, gs.code AS state_code
+         FROM geo_cities gc
+         JOIN geo_states gs ON gs.id = gc.state_id
+         WHERE gs.country = ? AND gc.is_active = 1 AND gs.is_active = 1
+           AND gc.name = ?
+           AND gc.lat IS NOT NULL AND gc.lng IS NOT NULL
+           ${state ? "AND (gs.name = ? OR gs.code = ?)" : ""}
+         ORDER BY gc.id ASC
+         LIMIT 1`,
+        state ? [country, city, state, state] : [country, city],
+      );
+      if (rows[0]) {
+        const lat = Number(rows[0].lat);
+        const lng = Number(rows[0].lng);
+        if (Number.isFinite(lat) && Number.isFinite(lng)) {
+          return res.json({
+            place: {
+              lat,
+              lng,
+              label: `${rows[0].name}, ${rows[0].state_name}`,
+              source: "geo_cities",
+            },
+          });
+        }
+      }
+    }
+
+    const query = [name, city, state, country === "MX" ? "Mexico" : country]
+      .filter(Boolean)
+      .join(", ");
+    try {
+      const url = new URL("https://nominatim.openstreetmap.org/search");
+      url.searchParams.set("format", "json");
+      url.searchParams.set("limit", "1");
+      url.searchParams.set("q", query);
+      if (country.length === 2) {
+        url.searchParams.set("countrycodes", country.toLowerCase());
+      }
+      const nomRes = await fetch(url.toString(), {
+        headers: {
+          "User-Agent": "Atleita/1.0 (https://atleita.com; support@atleita.com)",
+          Accept: "application/json",
+          "Accept-Language": "es,en",
+        },
+      });
+      if (!nomRes.ok) {
+        return res.json({ place: null });
+      }
+      const results = (await nomRes.json()) as Array<{
+        lat?: string;
+        lon?: string;
+        display_name?: string;
+      }>;
+      const hit = results[0];
+      const lat = hit?.lat != null ? Number(hit.lat) : NaN;
+      const lng = hit?.lon != null ? Number(hit.lon) : NaN;
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+        return res.json({ place: null });
+      }
+      return res.json({
+        place: {
+          lat,
+          lng,
+          label: labelFromParts || hit.display_name || query,
+          source: "nominatim",
+        },
+      });
+    } catch (err) {
+      console.error("[geo/resolve-place] nominatim failed", err);
+      return res.json({ place: null });
+    }
+  });
+
+  app.get("/api/events", async (req, res) => {
+    const sport = req.query.sport ? String(req.query.sport) : null;
+    const city = req.query.city ? String(req.query.city) : null;
+    const geoCityId = req.query.geoCityId ? Number(req.query.geoCityId) : null;
+    const qRaw = req.query.q ? String(req.query.q).trim() : null;
+    const q = qRaw && qRaw.length >= 2 ? qRaw : null;
+    const featured =
+      req.query.featured === "1" || req.query.featured === "true" ? true : null;
+    const { dateFrom, dateTo } = parseEventDateRange(
+      req.query.dateFrom ? String(req.query.dateFrom) : null,
+      req.query.dateTo ? String(req.query.dateTo) : null,
+    );
+    const minPrice = req.query.minPrice ? Number(req.query.minPrice) : null;
+    const maxPrice = req.query.maxPrice ? Number(req.query.maxPrice) : null;
+    const sort = req.query.sort ? String(req.query.sort) : "date_asc";
+    const limit = Math.min(Number(req.query.limit) || 24, 100);
+    const offset = Number(req.query.offset) || 0;
+
+    const geoCityIdProvided =
+      geoCityId != null && Number.isFinite(geoCityId) && geoCityId > 0;
+    const resolvedGeoCity = geoCityIdProvided
+      ? await resolveGeoCityById(pool, geoCityId)
+      : null;
+
+    if (geoCityIdProvided && !resolvedGeoCity) {
+      res.json({ events: [], total: 0, limit, offset });
+      return;
+    }
+
+    const listFilters: MarketplaceListFilters = {
+      sport,
+      city,
+      resolvedGeoCity,
+      featured,
+      dateFrom,
+      dateTo,
+      minPrice,
+      maxPrice,
+    };
+
+    if (q) {
+      const fuzzyResult = await listMarketplaceEventsWithFuzzySearch(pool, {
+        registrationCountSql: EVENT_REGISTRATION_COUNT_SQL,
+        filters: listFilters,
+        q,
+        sort,
+        limit,
+        offset,
+      });
+      res.json({
+        events: fuzzyResult.events.map(withNormalizedEventMedia),
+        total: fuzzyResult.total,
+        limit,
+        offset,
+      });
+      return;
+    }
+
+    let sql = `
+      SELECT e.id, e.public_uuid, e.slug, e.title, e.short_description, e.start_date, e.end_date,
+             e.location_city, e.location_state, e.location_country, e.location_lat, e.location_lng,
+             e.featured, e.hero_image_url, ${EVENT_REGISTRATION_COUNT_SQL} AS registration_count, e.registration_closes_at,
+             st.slug AS sport_slug, st.name AS sport_name,
+             o.name AS organizer_name, o.slug AS organizer_slug,
+             ec_min.from_price_cents
+      FROM events e
+      JOIN sport_types st ON st.id = e.sport_type_id
+      JOIN organizers o ON o.id = e.organizer_id AND o.deleted_at IS NULL
+      ${MARKETPLACE_MIN_PRICE_JOIN_SQL}
+      WHERE e.status = 'published' AND e.visibility = 'public' AND e.deleted_at IS NULL AND COALESCE(e.is_simulation, 0) = 0
+      ${MARKETPLACE_AUTO_DEACTIVATE_SQL}
+    `;
+    const params: unknown[] = [];
+    sql = appendMarketplaceListFilters(sql, params, listFilters);
+
+    const orderMap: Record<string, string> = {
+      date_asc: "e.featured DESC, e.start_date ASC",
+      date_desc: "e.start_date DESC",
+      price_asc: "ec_min.from_price_cents IS NULL, ec_min.from_price_cents ASC",
+      price_desc: "ec_min.from_price_cents DESC",
+      popular: `${EVENT_REGISTRATION_COUNT_SQL} DESC, e.start_date ASC`,
+    };
+    const orderBy = orderMap[sort] ?? orderMap.date_asc;
+
+    sql += ` ORDER BY ${orderBy} LIMIT ? OFFSET ?`;
+    params.push(limit, offset);
+
+    const [rows] = await pool.query<RowDataPacket[]>(sql, params);
+
+    let countSql = `
+      SELECT COUNT(*) AS total
+      FROM events e
+      JOIN sport_types st ON st.id = e.sport_type_id
+      JOIN organizers o ON o.id = e.organizer_id AND o.deleted_at IS NULL
+      ${MARKETPLACE_MIN_PRICE_JOIN_SQL}
+      WHERE e.status = 'published' AND e.visibility = 'public' AND e.deleted_at IS NULL AND COALESCE(e.is_simulation, 0) = 0
+      ${MARKETPLACE_AUTO_DEACTIVATE_SQL}
+    `;
+    const countParams: unknown[] = [];
+    countSql = appendMarketplaceListFilters(countSql, countParams, listFilters);
+
+    const [countRows] = await pool.query<RowDataPacket[]>(
+      countSql,
+      countParams,
+    );
+
+    res.json({
+      events: rows.map(withNormalizedEventMedia),
+      total: Number(countRows[0]?.total ?? rows.length),
+      limit,
+      offset,
+    });
+  });
+
+  app.get("/api/events/filters/cities", async (_req, res) => {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT gc.id, gc.name AS city, gs.name AS state, gc.lat, gc.lng, COUNT(e.id) AS event_count
+       FROM geo_cities gc
+       JOIN geo_states gs ON gs.id = gc.state_id AND gs.country = 'MX' AND gs.is_active = 1
+       LEFT JOIN events e ON e.location_city = gc.name
+         AND (e.location_state = gs.name OR e.location_state = gs.code)
+         AND e.status = 'published' AND e.visibility = 'public' AND e.deleted_at IS NULL AND COALESCE(e.is_simulation, 0) = 0
+         ${MARKETPLACE_AUTO_DEACTIVATE_SQL}
+       WHERE gc.is_active = 1
+       GROUP BY gc.id, gc.name, gs.name
+       HAVING event_count > 0
+       ORDER BY event_count DESC, gc.name ASC
+       LIMIT 100`,
+    );
+    res.json({ cities: rows });
+  });
+
+  /** Live availability for event vanity hosts (create wizard). */
+  app.get("/api/events/subdomain-available", async (req, res) => {
+    const subdomain = normalizeEventSubdomain(String(req.query.subdomain ?? ""));
+    const formatErr = validateEventSubdomainFormat(subdomain);
+    if (formatErr) {
+      return res.json({
+        available: false,
+        subdomain,
+        error: formatErr,
+      });
+    }
+    // Match uk_events_subdomain (unique across soft-deleted rows too)
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT id FROM events WHERE subdomain = ? LIMIT 1`,
+      [subdomain],
+    );
+    if (rows.length > 0) {
+      return res.json({ available: false, subdomain, error: "taken" });
+    }
+    res.json({ available: true, subdomain });
+  });
+
+  /**
+   * Resolve vanity host → path slug. Canonical public URL stays /events/{slug}.
+   * Used when athletes land on {subdomain}.atleita.com.
+   */
+  app.get("/api/events/subdomain/:subdomain", async (req, res) => {
+    const subdomain = normalizeEventSubdomain(String(req.params.subdomain ?? ""));
+    if (validateEventSubdomainFormat(subdomain)) {
+      return res.status(404).json({
+        error: apiErrorMessage(resolveRequestLocale(req), "event_not_found"),
+        code: "not_found",
+      });
+    }
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT slug, subdomain, title, status, visibility
+       FROM events
+       WHERE subdomain = ?
+         AND deleted_at IS NULL
+         AND COALESCE(is_simulation, 0) = 0
+         AND status IN ('published', 'completed')
+         AND visibility IN ('public', 'unlisted')
+       LIMIT 1`,
+      [subdomain],
+    );
+    if (rows.length === 0) {
+      // Reserved vanity (draft / pending / private) vs unknown host — clearer athlete UX
+      const [reserved] = await pool.query<RowDataPacket[]>(
+        `SELECT status, visibility
+         FROM events
+         WHERE subdomain = ?
+           AND deleted_at IS NULL
+           AND COALESCE(is_simulation, 0) = 0
+         LIMIT 1`,
+        [subdomain],
+      );
+      if (reserved.length > 0) {
+        return res.status(404).json({
+          ...apiErrorJson(req, "event_not_live"),
+          code: "not_live",
+          status: String(reserved[0].status ?? ""),
+          visibility: String(reserved[0].visibility ?? ""),
+        });
+      }
+      return res.status(404).json({
+        error: apiErrorMessage(resolveRequestLocale(req), "event_not_found"),
+        code: "not_found",
+      });
+    }
+    const row = rows[0];
+    res.json({
+      subdomain: String(row.subdomain),
+      slug: String(row.slug),
+      title: String(row.title),
+      canonical_path: `/events/${row.slug}`,
+    });
+  });
+
+  app.get(
+    "/api/search/suggest",
+    asyncHandler(async (req, res) => {
+      const q = String(req.query.q ?? "").trim();
+      if (q.length < 2) {
+        res.json({
+          query: q,
+          events: [],
+          cities: [],
+          sports: [],
+        });
+        return;
+      }
+
+      const tokens = searchTokens(q);
+      const likePatterns = likePatternsForTokens(tokens);
+      const published = `e.status = 'published' AND e.visibility = 'public' AND e.deleted_at IS NULL AND COALESCE(e.is_simulation, 0) = 0 ${MARKETPLACE_AUTO_DEACTIVATE_SQL}`;
+
+      const eventSelect = `SELECT e.slug, e.title, e.start_date, e.location_city, e.location_state,
+                  e.hero_image_url, e.featured, st.name AS sport_name, st.slug AS sport_slug,
+                  e.short_description, e.search_keywords, e.location_name`;
+
+      const eventOrClauses = likePatterns.flatMap(() => [
+        `e.title LIKE ?`,
+        `e.short_description LIKE ?`,
+        `e.search_keywords LIKE ?`,
+        `e.location_city LIKE ?`,
+        `e.location_name LIKE ?`,
+        `st.name LIKE ?`,
+        `st.slug LIKE ?`,
+      ]);
+      const eventParams = likePatterns.flatMap((pattern) =>
+        Array(7).fill(pattern),
+      );
+
+      const cityOrClauses = likePatterns.flatMap(() => [
+        `e.location_city LIKE ?`,
+        `e.location_state LIKE ?`,
+      ]);
+      const cityParams = likePatterns.flatMap((pattern) => [pattern, pattern]);
+
+      const geoCityOrClauses = likePatterns.flatMap(() => [
+        `gc.name LIKE ?`,
+        `gs.name LIKE ?`,
+        `gs.code LIKE ?`,
+      ]);
+      const geoCityParams = likePatterns.flatMap((pattern) => [
+        pattern,
+        pattern,
+        pattern,
+      ]);
+
+      const sportOrClauses = likePatterns.flatMap(() => [
+        `name LIKE ?`,
+        `slug LIKE ?`,
+      ]);
+      const sportParams = likePatterns.flatMap((pattern) => [pattern, pattern]);
+
+      const hasTokenFilter = likePatterns.length > 0;
+      const emptyRows: RowDataPacket[] = [];
+
+      const [
+        eventsResult,
+        eventsBroadResult,
+        citiesResult,
+        geoCatalogCitiesResult,
+        sportsResult,
+        sportsBroadResult,
+      ] = await Promise.allSettled([
+        hasTokenFilter
+          ? pool.query<RowDataPacket[]>(
+              `${eventSelect}
+           FROM events e
+           JOIN sport_types st ON st.id = e.sport_type_id
+           WHERE ${published}
+             AND (${eventOrClauses.join(" OR ")})
+           ORDER BY e.featured DESC, e.start_date ASC
+           LIMIT 40`,
+              eventParams,
+            )
+          : Promise.resolve([emptyRows, []] as [RowDataPacket[], unknown[]]),
+        pool.query<RowDataPacket[]>(
+          `${eventSelect}
+           FROM events e
+           JOIN sport_types st ON st.id = e.sport_type_id
+           WHERE ${published}
+           ORDER BY e.featured DESC, e.start_date ASC
+           LIMIT 50`,
+        ),
+        hasTokenFilter
+          ? pool.query<RowDataPacket[]>(
+              `SELECT MIN(gc.id) AS id, e.location_city AS city, e.location_state AS state,
+                  COUNT(*) AS event_count
+           FROM events e
+           LEFT JOIN geo_cities gc ON gc.name = e.location_city AND gc.is_active = 1
+           LEFT JOIN geo_states gs ON gs.id = gc.state_id
+             AND (e.location_state = gs.name OR e.location_state = gs.code)
+           WHERE ${published}
+             AND e.location_city IS NOT NULL AND e.location_city != ''
+             AND (${cityOrClauses.join(" OR ")})
+           GROUP BY e.location_city, e.location_state
+           ORDER BY event_count DESC, e.location_city ASC
+           LIMIT 20`,
+              cityParams,
+            )
+          : Promise.resolve([emptyRows, []] as [RowDataPacket[], unknown[]]),
+        hasTokenFilter
+          ? pool.query<RowDataPacket[]>(
+              `SELECT gc.id, gc.name AS city, gs.name AS state,
+                  COALESCE(ec.event_count, 0) AS event_count
+           FROM geo_cities gc
+           JOIN geo_states gs ON gs.id = gc.state_id AND gs.country = 'MX' AND gs.is_active = 1
+           LEFT JOIN (
+             SELECT e.location_city, e.location_state, COUNT(*) AS event_count
+             FROM events e
+             WHERE ${published}
+             GROUP BY e.location_city, e.location_state
+           ) ec ON ec.location_city = gc.name
+             AND (ec.location_state = gs.name OR ec.location_state = gs.code)
+           WHERE gc.is_active = 1
+             AND (${geoCityOrClauses.join(" OR ")})
+           ORDER BY event_count DESC, gc.name ASC
+           LIMIT 20`,
+              geoCityParams,
+            )
+          : Promise.resolve([emptyRows, []] as [RowDataPacket[], unknown[]]),
+        hasTokenFilter
+          ? pool.query<RowDataPacket[]>(
+              `SELECT slug, name, icon
+           FROM sport_types
+           WHERE is_active = 1 AND (${sportOrClauses.join(" OR ")})
+           ORDER BY sort_order ASC
+           LIMIT 16`,
+              sportParams,
+            )
+          : Promise.resolve([emptyRows, []] as [RowDataPacket[], unknown[]]),
+        pool.query<RowDataPacket[]>(
+          `SELECT slug, name, icon
+           FROM sport_types
+           WHERE is_active = 1
+           ORDER BY sort_order ASC
+           LIMIT 20`,
+        ),
+      ]);
+
+      const rawEventsMatched: RowDataPacket[] =
+        eventsResult.status === "fulfilled" ? eventsResult.value[0] : emptyRows;
+      const rawEventsBroad: RowDataPacket[] =
+        eventsBroadResult.status === "fulfilled"
+          ? eventsBroadResult.value[0]
+          : emptyRows;
+      const rawCities: RowDataPacket[] =
+        citiesResult.status === "fulfilled" ? citiesResult.value[0] : emptyRows;
+      const rawGeoCatalogCities: RowDataPacket[] =
+        geoCatalogCitiesResult.status === "fulfilled"
+          ? geoCatalogCitiesResult.value[0]
+          : emptyRows;
+      const rawSportsMatched: RowDataPacket[] =
+        sportsResult.status === "fulfilled" ? sportsResult.value[0] : emptyRows;
+      const rawSportsBroad: RowDataPacket[] =
+        sportsBroadResult.status === "fulfilled"
+          ? sportsBroadResult.value[0]
+          : emptyRows;
+
+      if (eventsResult.status === "rejected") {
+        console.error("[GET /api/search/suggest] events", eventsResult.reason);
+      }
+      if (eventsBroadResult.status === "rejected") {
+        console.error(
+          "[GET /api/search/suggest] events-broad",
+          eventsBroadResult.reason,
+        );
+      }
+      if (citiesResult.status === "rejected") {
+        console.error("[GET /api/search/suggest] cities", citiesResult.reason);
+      }
+      if (geoCatalogCitiesResult.status === "rejected") {
+        console.error(
+          "[GET /api/search/suggest] geo-catalog-cities",
+          geoCatalogCitiesResult.reason,
+        );
+      }
+      if (sportsResult.status === "rejected") {
+        console.error("[GET /api/search/suggest] sports", sportsResult.reason);
+      }
+
+      const stripEventExtras = (row: RowDataPacket) => {
+        const {
+          short_description: _sd,
+          search_keywords: _sk,
+          location_name: _ln,
+          featured: _f,
+          ...rest
+        } = row;
+        return rest;
+      };
+
+      const seenEventSlugs = new Set<string>();
+      const eventPool = [...rawEventsMatched, ...rawEventsBroad].filter(
+        (row) => {
+          if (seenEventSlugs.has(row.slug as string)) return false;
+          seenEventSlugs.add(row.slug as string);
+          return true;
+        },
+      );
+
+      const events = rankByFuzzy(
+        eventPool,
+        q,
+        (row) => [
+          row.title as string,
+          row.sport_name as string,
+          row.sport_slug as string,
+          row.location_city as string,
+          row.location_state as string,
+          row.location_name as string,
+          row.short_description as string,
+          row.search_keywords as string,
+        ],
+        6,
+      ).map(stripEventExtras);
+
+      const seenCities = new Set<string>();
+      const cityPool = [...rawCities, ...rawGeoCatalogCities].sort(
+        (a, b) => Number(b.event_count ?? 0) - Number(a.event_count ?? 0),
+      );
+      const cities = rankByFuzzy(
+        cityPool.filter((row) => {
+          const key = row.id
+            ? `id:${row.id}`
+            : `${row.city}|${row.state ?? ""}`;
+          if (seenCities.has(key)) return false;
+          seenCities.add(key);
+          return true;
+        }),
+        q,
+        (row) => [row.city as string, row.state as string],
+        5,
+      );
+
+      const seenSports = new Set<string>();
+      const sportPool = [...rawSportsMatched, ...rawSportsBroad].filter(
+        (row) => {
+          if (seenSports.has(row.slug as string)) return false;
+          seenSports.add(row.slug as string);
+          return true;
+        },
+      );
+      const sports = rankByFuzzy(
+        sportPool,
+        q,
+        (row) => [row.name as string, row.slug as string],
+        4,
+      );
+
+      const eventsOut =
+        events.length > 0
+          ? events
+          : rankByFuzzy(eventPool, q, (row) => [row.title as string], 6).map(
+              stripEventExtras,
+            );
+      const citiesOut = cities.length > 0 ? cities : cityPool.slice(0, 5);
+      const sportsOut =
+        sports.length > 0
+          ? sports
+          : rankByFuzzy(sportPool, q, (row) => [row.name as string], 4);
+
+      res.json({
+        query: q,
+        events: eventsOut,
+        cities: citiesOut,
+        sports: sportsOut,
+      });
+    }),
+  );
+
+  app.post("/api/events/:slug/sponsors/track", async (req, res) => {
+    const slug = String(req.params.slug);
+    const sponsorId = Number(req.body?.sponsorId);
+    const type = String(req.body?.type ?? "").trim();
+    if (
+      !Number.isFinite(sponsorId) ||
+      !["impression", "click"].includes(type)
+    ) {
+      return res
+        .status(400)
+        .json({ error: "sponsorId and type (impression|click) required" });
+    }
+
+    const [eventRows] = await pool.query<RowDataPacket[]>(
+      `SELECT id FROM events WHERE slug = ? AND status = 'published' AND deleted_at IS NULL LIMIT 1`,
+      [slug],
+    );
+    if (eventRows.length === 0) {
+      return res.status(404).json(apiErrorJson(req, "event_not_found"));
+    }
+    const eventId = eventRows[0].id as number;
+
+    const [sponsorRows] = await pool.query<RowDataPacket[]>(
+      `SELECT id FROM event_sponsors WHERE id = ? AND event_id = ? AND is_active = 1 LIMIT 1`,
+      [sponsorId, eventId],
+    );
+    if (sponsorRows.length === 0) {
+      return res.status(404).json(apiErrorJson(req, "sponsor_not_found"));
+    }
+
+    await pool.query<ResultSetHeader>(
+      `INSERT INTO sponsor_analytics_events (event_sponsor_id, event_id, event_type)
+         VALUES (?,?,?)`,
+      [sponsorId, eventId, type],
+    );
+    res.json({ ok: true });
+  });
+
+  app.get(
+    "/api/events/:slug",
+    optionalAthleteAuth,
+    async (req: AuthedRequest, res) => {
+      const slug = String(req.params.slug);
+      const [events] = await pool.query<RowDataPacket[]>(
+        `SELECT e.*, st.slug AS sport_slug, st.name AS sport_name,
+              o.name AS organizer_name, o.slug AS organizer_slug, o.logo_url AS organizer_logo,
+              o.service_fee_percent AS org_service_fee_percent,
+              o.fee_presentation AS org_fee_presentation,
+              os.subdomain AS organizer_site_subdomain,
+              v.name AS venue_name, v.address_line1 AS venue_address, v.lat AS venue_lat, v.lng AS venue_lng
+       FROM events e
+       JOIN sport_types st ON st.id = e.sport_type_id
+       JOIN organizers o ON o.id = e.organizer_id AND o.deleted_at IS NULL
+       LEFT JOIN organizer_sites os
+         ON os.organizer_id = o.id
+        AND os.deleted_at IS NULL
+        AND os.status = 'published'
+       LEFT JOIN venues v ON v.id = e.venue_id AND v.deleted_at IS NULL
+       WHERE e.slug = ? AND e.status IN ('published','completed') AND e.deleted_at IS NULL
+       LIMIT 1`,
+        [slug],
+      );
+      if (events.length === 0) {
+        return res.status(404).json(apiErrorJson(req, "event_not_found"));
+      }
+      const event = events[0];
+      if (Number(event.is_simulation) !== 1) {
+        await maybeAutoDeactivateEvent(pool, Number(event.id));
+        const [[vis]] = await pool.query<RowDataPacket[]>(
+          `SELECT visibility FROM events WHERE id = ? LIMIT 1`,
+          [event.id],
+        );
+        if (vis?.visibility) event.visibility = vis.visibility;
+      }
+      event.registration_count = Number(
+        (
+          await pool.query<RowDataPacket[]>(
+            `SELECT COUNT(*) AS cnt FROM registrations
+           WHERE event_id = ? AND status = 'confirmed' AND deleted_at IS NULL`,
+            [event.id],
+          )
+        )[0][0]?.cnt ?? 0,
+      );
+
+      const [categories] = await pool.query<RowDataPacket[]>(
+        `SELECT id, public_uuid, name, description, distance_km, difficulty, capacity,
+              ${CATEGORY_SOLD_COUNT_UNALIASED_SQL} AS sold_count,
+              price_cents, currency, gender_restriction, min_age, max_age, waitlist_enabled,
+              registration_opens_at, registration_closes_at, sort_order
+       FROM event_categories
+       WHERE event_id = ? AND is_active = 1
+       ORDER BY sort_order ASC`,
+        [event.id],
+      );
+
+      const fields = await fetchActiveRegistrationFieldsForEvent(
+        pool,
+        event.id as number,
+      );
+
+      const [sponsors] = await pool.query<RowDataPacket[]>(
+        `SELECT id, name, logo_url, website_url, tier, sort_order
+       FROM event_sponsors WHERE event_id = ? AND is_active = 1 ORDER BY sort_order ASC`,
+        [event.id],
+      );
+
+      const [tags] = await pool.query<RowDataPacket[]>(
+        `SELECT t.slug, t.name, t.category
+       FROM event_tags et JOIN tags t ON t.id = et.tag_id
+       WHERE et.event_id = ? AND t.is_active = 1 ORDER BY t.sort_order ASC`,
+        [event.id],
+      );
+
+      const [waves] = await pool.query<RowDataPacket[]>(
+        `SELECT id, name, starts_at, capacity,
+              ${WAVE_REGISTERED_COUNT_SQL} AS registered_count, sort_order
+       FROM event_schedule_waves WHERE event_id = ? ORDER BY sort_order ASC`,
+        [event.id],
+      );
+
+      const feePercent = resolveServiceFeePercent(
+        event.service_fee_percent as number | string | null,
+        event.org_service_fee_percent as number | string | null,
+      );
+      const feePresentation = resolveFeePresentation(
+        event.fee_presentation as string | null,
+        event.org_fee_presentation as string | null,
+      );
+
+      const categoriesWithFees = (categories as RowDataPacket[]).map((cat) =>
+        mapCategoryWithCheckoutFees(cat, feePercent, feePresentation),
+      );
+
+      const [courseRows] = await pool.query<RowDataPacket[]>(
+        `SELECT route_geojson, points_json, distance_km, elevation_gain_m, elevation_profile_json
+       FROM event_courses WHERE event_id = ? LIMIT 1`,
+        [event.id],
+      );
+      const courseRow = courseRows[0];
+      let course = null;
+      if (courseRow) {
+        course = normalizeEventCourse({
+          routeGeojson:
+            typeof courseRow.route_geojson === "string"
+              ? JSON.parse(courseRow.route_geojson as string)
+              : courseRow.route_geojson,
+          points:
+            typeof courseRow.points_json === "string"
+              ? JSON.parse(courseRow.points_json as string)
+              : courseRow.points_json,
+          distanceKm: courseRow.distance_km,
+          elevationGainM: courseRow.elevation_gain_m,
+          elevationProfile: parseElevationProfile(
+            courseRow.elevation_profile_json,
+          ),
+        });
+      }
+
+      const [media] = await pool.query<RowDataPacket[]>(
+        `SELECT asset_type, url, alt_text, mime_type, sort_order, is_primary
+       FROM media_assets
+       WHERE entity_type = 'event' AND entity_id = ? AND deleted_at IS NULL
+       ORDER BY sort_order ASC`,
+        [event.id],
+      );
+
+      let myRegistration: Record<string, unknown> | null = null;
+      if (req.auth?.id) {
+        const [myRegRows] = await pool.query<RowDataPacket[]>(
+          `SELECT r.public_uuid, r.status, r.registration_number, r.event_category_id,
+                ec.name AS category_name
+         FROM registrations r
+         JOIN event_categories ec ON ec.id = r.event_category_id
+         WHERE r.event_id = ? AND r.athlete_id = ? AND r.status = 'confirmed'
+           AND r.deleted_at IS NULL
+         LIMIT 1`,
+          [event.id, req.auth.id],
+        );
+        if (myRegRows.length > 0) {
+          const row = myRegRows[0];
+          myRegistration = {
+            status: "confirmed",
+            registrationPublicUuid: row.public_uuid,
+            registrationNumber: row.registration_number,
+            categoryId: row.event_category_id,
+            categoryName: row.category_name,
+          };
+        }
+      }
+
+      let waivers: RowDataPacket[] = [];
+      if (event.requires_waiver) {
+        waivers = await fetchActiveEventWaiversPublic(pool, event.id as number);
+      }
+      const waiver = waivers[0] ?? null;
+
+      const paymentAvailability = await attachEventPaymentAvailability(
+        pool,
+        {
+          id: event.id as number,
+          status: String(event.status),
+          organizer_id: Number(event.organizer_id),
+        },
+        getStripeClient(),
+      );
+
+      const extras = await fetchEventExtras(pool, event.id as number);
+
+      res.json({
+        event: withNormalizedEventMedia(event),
+        categories: categoriesWithFees,
+        extras,
+        payments_available: paymentAvailability.payments_available,
+        has_paid_categories: paymentAvailability.has_paid_categories,
+        registrationFields: fields.map(mapPublicRegistrationField),
+        sponsors,
+        tags,
+        scheduleWaves: waves,
+        serviceFeePercent: feePercent,
+        feePresentation,
+        course,
+        media,
+        waivers,
+        waiver,
+        myRegistration,
+      });
+    },
+  );
+
+  app.post(
+    "/api/events/:slug/discount/validate",
+    optionalAthleteAuth,
+    async (req: AuthedRequest, res) => {
+      const slug = String(req.params.slug);
+      const code = String(req.body?.code ?? "").trim();
+      const categoryId = Number(req.body?.categoryId);
+
+      if (!code) {
+        return res.status(400).json(apiErrorJson(req, "code_required"));
+      }
+      if (!Number.isFinite(categoryId)) {
+        return res.status(400).json(apiErrorJson(req, "category_id_required"));
+      }
+
+      const [eventRows] = await pool.query<RowDataPacket[]>(
+        `SELECT e.id, e.organizer_id, e.status, e.fee_presentation,
+                o.service_fee_percent AS org_fee_percent,
+                o.fee_presentation AS org_fee_presentation,
+                e.service_fee_percent
+         FROM events e
+         JOIN organizers o ON o.id = e.organizer_id
+         WHERE e.slug = ? AND e.status = 'published' AND e.deleted_at IS NULL
+         LIMIT 1`,
+        [slug],
+      );
+      if (eventRows.length === 0) {
+        return res.status(404).json(apiErrorJson(req, "event_not_found"));
+      }
+      const event = eventRows[0];
+
+      const [catRows] = await pool.query<RowDataPacket[]>(
+        `SELECT id, price_cents, currency
+         FROM event_categories
+         WHERE id = ? AND event_id = ? AND is_active = 1 LIMIT 1`,
+        [categoryId, event.id],
+      );
+      if (catRows.length === 0) {
+        return res.status(404).json(apiErrorJson(req, "category_not_found"));
+      }
+      const category = catRows[0];
+
+      const discountResult = await fetchValidDiscountCode(
+        code,
+        event.id as number,
+        event.organizer_id as number,
+      );
+      if ("error" in discountResult) {
+        return res.status(400).json({ error: discountResult.error });
+      }
+
+      const feePercent = resolveServiceFeePercent(
+        event.service_fee_percent as number | string | null,
+        event.org_fee_percent as number | string | null,
+      );
+      const feePresentation = resolveFeePresentation(
+        event.fee_presentation as string | null,
+        event.org_fee_presentation as string | null,
+      );
+      const originalPriceCents = Number(category.price_cents);
+      const originalBreakdown = computeCheckoutBreakdown({
+        listPriceCents: originalPriceCents,
+        serviceFeePercent: feePercent,
+        feePresentation,
+      });
+
+      try {
+        const applied = applyDiscountToCheckout({
+          listPriceCents: originalPriceCents,
+          serviceFeePercent: feePercent,
+          feePresentation,
+          discount: discountResult.discount,
+        });
+        const { breakdown } = applied;
+        res.json({
+          valid: true,
+          code: discountResult.discount.code,
+          discountCodeId: discountResult.discount.id,
+          discountType: discountResult.discount.discount_type,
+          discountValue: Number(discountResult.discount.discount_value),
+          appliesTo: discountResult.discount.applies_to,
+          feePresentation,
+          discountAmountCents: applied.discountAmountCents,
+          priceCents: breakdown.listPriceCents,
+          serviceFeeCents: breakdown.serviceFeeCents,
+          totalCents: breakdown.athleteTotalCents,
+          displayIvaCents: breakdown.displayIvaCents,
+          organizerFiscalNetCents: breakdown.organizerFiscalNetCents,
+          originalPriceCents,
+          originalServiceFeeCents: originalBreakdown.serviceFeeCents,
+          originalTotalCents: originalBreakdown.athleteTotalCents,
+        });
+      } catch (err) {
+        return res.status(400).json({
+          error: err instanceof Error ? err.message : "Discount not applicable",
+        });
+      }
+    },
+  );
+
+  app.post(
+    "/api/events/:slug/waitlist",
+    requireAthlete,
+    async (req: AuthedRequest, res) => {
+      const slug = String(req.params.slug);
+      const athleteId = req.auth!.id;
+      const categoryId = Number(req.body?.categoryId);
+
+      if (!Number.isFinite(categoryId)) {
+        return res.status(400).json(apiErrorJson(req, "category_id_required"));
+      }
+
+      const [eventRows] = await pool.query<RowDataPacket[]>(
+        `SELECT id, title, slug, start_date, end_date, registration_opens_at, registration_closes_at FROM events
+         WHERE slug = ? AND status = 'published' AND deleted_at IS NULL LIMIT 1`,
+        [slug],
+      );
+      if (eventRows.length === 0) {
+        return res.status(404).json(apiErrorJson(req, "event_not_found"));
+      }
+      const event = eventRows[0];
+      await maybeAutoDeactivateEvent(pool, Number(event.id));
+
+      const [catRows] = await pool.query<RowDataPacket[]>(
+        `SELECT id, name, capacity, waitlist_enabled,
+                registration_opens_at, registration_closes_at,
+                min_age, max_age, gender_restriction,
+                ${CATEGORY_SOLD_COUNT_UNALIASED_SQL} AS sold_count
+         FROM event_categories
+         WHERE id = ? AND event_id = ? AND is_active = 1 LIMIT 1`,
+        [categoryId, event.id],
+      );
+      if (catRows.length === 0) {
+        return res.status(404).json(apiErrorJson(req, "category_not_found"));
+      }
+      const category = catRows[0];
+
+      const athleteProfile = await loadAthleteEligibilityProfile(athleteId);
+      if (!athleteProfile) {
+        return res.status(401).json(apiErrorJson(req, "athlete_not_found"));
+      }
+      const eligibilityErr = categoryEligibilityResponse(
+        req,
+        category,
+        athleteProfile,
+        event.start_date as string,
+      );
+      if (eligibilityErr) {
+        return res.status(eligibilityErr.status).json(eligibilityErr.body);
+      }
+
+      const windowErr = getRegistrationWindowError(
+        {
+          registration_opens_at: event.registration_opens_at as string | null,
+          registration_closes_at: event.registration_closes_at as string | null,
+          start_date: event.start_date as string | null,
+          end_date: (event.end_date as string | null) ?? null,
+        },
+        {
+          registration_opens_at: category.registration_opens_at as
+            | string
+            | null,
+          registration_closes_at: category.registration_closes_at as
+            | string
+            | null,
+        },
+      );
+      if (windowErr) {
+        return res
+          .status(409)
+          .json({ error: windowErr.error, code: windowErr.code });
+      }
+
+      const soldOut =
+        category.capacity != null &&
+        Number(category.sold_count) >= Number(category.capacity);
+      if (!soldOut) {
+        return res.status(400).json(apiErrorJson(req, "category_not_sold_out"));
+      }
+      if (!Boolean(category.waitlist_enabled)) {
+        return res
+          .status(400)
+          .json(apiErrorJson(req, "waitlist_not_enabled"));
+      }
+
+      const [existingReg] = await pool.query<RowDataPacket[]>(
+        `SELECT id FROM registrations
+         WHERE event_id = ? AND athlete_id = ? AND status = 'confirmed'
+           AND deleted_at IS NULL LIMIT 1`,
+        [event.id, athleteId],
+      );
+      if (existingReg.length > 0) {
+        return res
+          .status(409)
+          .json(apiErrorJson(req, "already_registered"));
+      }
+
+      const [existingWaitlist] = await pool.query<RowDataPacket[]>(
+        `SELECT id, status FROM waitlist_entries
+         WHERE event_category_id = ? AND athlete_id = ?
+           AND status IN ('waiting', 'offered') LIMIT 1`,
+        [categoryId, athleteId],
+      );
+      if (existingWaitlist.length > 0) {
+        return res.status(409).json({
+          ...apiErrorJson(req, "already_on_waitlist"),
+          entry: existingWaitlist[0],
+        });
+      }
+
+      const [posRows] = await pool.query<RowDataPacket[]>(
+        `SELECT COALESCE(MAX(position), 0) AS max_pos FROM waitlist_entries
+         WHERE event_category_id = ? AND status IN ('waiting', 'offered')`,
+        [categoryId],
+      );
+      const position = Number(posRows[0]?.max_pos ?? 0) + 1;
+
+      const [result] = await pool.query<ResultSetHeader>(
+        `INSERT INTO waitlist_entries (event_id, event_category_id, athlete_id, status, position)
+         VALUES (?,?,?,?,?)`,
+        [event.id, categoryId, athleteId, "waiting", position],
+      );
+
+      const [entryRows] = await pool.query<RowDataPacket[]>(
+        `SELECT id, event_id, event_category_id, status, position, created_at
+         FROM waitlist_entries WHERE id = ? LIMIT 1`,
+        [result.insertId],
+      );
+
+      res.status(201).json({
+        entry: {
+          ...entryRows[0],
+          event_title: event.title,
+          event_slug: event.slug,
+          category_name: category.name,
+        },
+      });
+    },
+  );
+
+  app.post(
+    "/api/events/:slug/register/checkout",
+    requireAthlete,
+    asyncHandler(async (req: AuthedRequest, res) => {
+      const slug = String(req.params.slug);
+      const athleteId = req.auth!.id;
+      const categoryId = Number(req.body?.categoryId);
+      const fieldValues = (req.body?.fieldValues ?? {}) as Record<
+        string,
+        string | boolean
+      >;
+      const idempotencyKey = String(req.body?.idempotencyKey ?? "").trim();
+      const discountCodeInput = req.body?.discountCode
+        ? String(req.body.discountCode).trim()
+        : "";
+
+      checkoutTrace("start", {
+        slug,
+        athleteId,
+        categoryId,
+        idempotencyKey,
+        hasDiscountCode: Boolean(discountCodeInput),
+        stripeConfigured: isStripeConfigured(),
+      });
+
+      if (!idempotencyKey || idempotencyKey.length > 64) {
+        return res
+          .status(400)
+          .json(apiErrorJson(req, "idempotency_key_required"));
+      }
+
+      const lineItemsRaw = Array.isArray(req.body?.lineItems)
+        ? req.body.lineItems
+        : null;
+      if (lineItemsRaw && lineItemsRaw.length >= 1) {
+        const discountCodeInput = req.body?.discountCode
+          ? String(req.body.discountCode).trim()
+          : "";
+
+        const loaded = await loadEventRowForCheckout(
+          slug,
+          req.body?.simulationToken ?? req.headers["x-simulation-token"],
+        );
+        if (!loaded) {
+          return res.status(404).json(apiErrorJson(req, "event_not_found"));
+        }
+        const event = loaded.row;
+        const isSimulation = loaded.isSimulation;
+        if (!isSimulation) {
+          await maybeAutoDeactivateEvent(pool, Number(event.id));
+        }
+        if (isSimulation) {
+          const quota = await assertSimulationRegQuota(pool, Number(event.id));
+          if (quota.ok === false) {
+            return res
+              .status(400)
+              .json({ error: quota.error, code: quota.code });
+          }
+        }
+
+        const groupWindowErr = getRegistrationWindowError(
+          {
+            registration_opens_at: event.registration_opens_at as string | null,
+            registration_closes_at: event.registration_closes_at as
+              | string
+              | null,
+            start_date: event.start_date as string | null,
+            end_date: (event.end_date as string | null) ?? null,
+          },
+          {
+            registration_opens_at: null,
+            registration_closes_at: null,
+          },
+        );
+        if (groupWindowErr) {
+          return res
+            .status(409)
+            .json({ error: groupWindowErr.error, code: groupWindowErr.code });
+        }
+
+        await cancelStalePendingEventPayments(
+          athleteId,
+          event.id as number,
+          idempotencyKey,
+        );
+
+        const feePresentation = resolveFeePresentation(
+          event.fee_presentation as string | null,
+          event.org_fee_presentation as string | null,
+        );
+        const maxPerOrder = Number(event.max_registrations_per_order) || 10;
+
+        let checkoutRail: "stripe" | "manual" = "stripe";
+        let feePercent = resolveServiceFeePercent(
+          event.service_fee_percent as number | string | null,
+          event.org_fee_percent as number | string | null,
+        );
+        let payoutBlocked: { code: string } | null = null;
+        if (!isSimulation) {
+          const dest = await resolveOrganizerCheckoutDestination(
+            pool,
+            event.organizer_id as number,
+            getStripeClient(),
+          );
+          if (dest.ok === false) {
+            // Allow free checkout / field validation; only block when athlete must pay.
+            payoutBlocked = { code: dest.code };
+          } else {
+            checkoutRail = dest.rail;
+            feePercent = resolveServiceFeePercentForRail({
+              eventFee: event.service_fee_percent as number | string | null,
+              organizerFee: event.org_fee_percent as number | string | null,
+              rail: dest.rail,
+            });
+          }
+        }
+
+        let discount:
+          | {
+              id: number;
+              code: string;
+              discount_type: string;
+              discount_value: number;
+              applies_to: string;
+              min_purchase_cents: number | null;
+            }
+          | undefined;
+        if (discountCodeInput) {
+          const discountResult = await fetchValidDiscountCode(
+            discountCodeInput,
+            event.id as number,
+            event.organizer_id as number,
+          );
+          if ("error" in discountResult) {
+            return res.status(400).json({ error: discountResult.error });
+          }
+          discount = discountResult.discount;
+        }
+
+        const priced = await validateAndPriceGroupCheckout(pool, {
+          eventId: event.id as number,
+          eventStartDate: String(event.start_date),
+          eventEndDate: (event.end_date as string | null) ?? null,
+          eventRegistrationOpensAt: (event.registration_opens_at as string | null) ?? null,
+          eventRegistrationClosesAt: (event.registration_closes_at as string | null) ?? null,
+          purchaserAthleteId: athleteId,
+          maxPerOrder,
+          feePercent,
+          feePresentation,
+          requiresWaiver: Boolean(event.requires_waiver),
+          lineItems: lineItemsRaw,
+          discount,
+          isSimulation,
+        });
+        if (priced.ok === false) {
+          return res.status(priced.error.status).json(priced.error.body);
+        }
+
+        const orderPublicUuid = newGroupPublicUuid();
+        const { resolved, totals } = priced;
+
+        const checkoutMetadata = {
+          orderMode: "group" as const,
+          orderPublicUuid,
+          lineItems: resolved,
+          itemCount: resolved.length,
+          categoryId: resolved[0].categoryId,
+          fieldValues: {},
+          categoryName: resolved.map((l) => l.categoryName).join(", "),
+          feePresentation,
+          breakdown: totals.orderBreakdown,
+          payout_rail: checkoutRail,
+          ...(discount
+            ? {
+                discountCodeId: discount.id,
+                discountCode: discount.code,
+                discountAmountCents: totals.discountAmountCents,
+              }
+            : {}),
+          clientIp: req.ip?.slice(0, 45),
+          userAgent: String(req.headers["user-agent"] ?? "").slice(0, 500),
+          deviceInfo: String(req.headers["user-agent"] ?? "").slice(0, 255),
+        };
+
+        let payUuid = newPublicUuid();
+        const currency = "MXN";
+        const totalCents = totals.totalCents;
+        let reusingGroupPayment = false;
+
+        const [existingGroupPay] = await pool.query<RowDataPacket[]>(
+          `SELECT public_uuid, status, stripe_payment_intent_id, mercadopago_preference_id,
+                  metadata_json, amount_cents, provider
+           FROM payments
+           WHERE idempotency_key = ? AND athlete_id = ? AND registration_id IS NULL
+           LIMIT 1`,
+          [idempotencyKey, athleteId],
+        );
+        if (existingGroupPay.length > 0) {
+          const existing = existingGroupPay[0];
+          const existingUuid = String(existing.public_uuid);
+          const existingStatus = String(existing.status ?? "");
+          let existingMeta: Record<string, unknown> = {};
+          try {
+            const raw =
+              typeof existing.metadata_json === "string"
+                ? existing.metadata_json
+                : JSON.stringify(existing.metadata_json ?? {});
+            existingMeta = JSON.parse(raw) as Record<string, unknown>;
+          } catch {
+            existingMeta = {};
+          }
+
+          if (
+            ["pending", "processing", "succeeded"].includes(existingStatus) &&
+            Number(existing.amount_cents) === totalCents
+          ) {
+            if (totalCents === 0 || existing.provider === "mock") {
+              return res.json({
+                paymentPublicUuid: existingUuid,
+                clientSecret: null,
+                amountCents: 0,
+                registrationAmountCents: totals.registrationAmountCents,
+                serviceFeeCents: totals.serviceFeeCents,
+                currency,
+                categoryName: checkoutMetadata.categoryName,
+                eventTitle: String(event.title),
+                feePresentation,
+                listPriceCents: totals.subtotalCents,
+                discountAmountCents: totals.discountAmountCents || undefined,
+                discountCode: discount?.code,
+                orderMode: "group",
+                orderPublicUuid: String(
+                  existingMeta.orderPublicUuid ?? orderPublicUuid,
+                ),
+                itemCount: resolved.length,
+                lineItems: resolved,
+                provider: "mock",
+              } satisfies GroupCheckoutApiResponse);
+            }
+            // Skip resuming Mercado Pago sessions — fall through to recreate on stripe/manual.
+            if (
+              existing.stripe_payment_intent_id &&
+              stripeClientForSimulation(isSimulation)
+            ) {
+              try {
+                const pi = await stripeClientForSimulation(
+                  isSimulation,
+                )!.paymentIntents.retrieve(
+                  String(existing.stripe_payment_intent_id),
+                );
+                if (
+                  pi.client_secret &&
+                  !["canceled", "succeeded"].includes(pi.status)
+                ) {
+                  return res.json({
+                    paymentPublicUuid: existingUuid,
+                    clientSecret: pi.client_secret,
+                    amountCents: totalCents,
+                    registrationAmountCents: totals.registrationAmountCents,
+                    serviceFeeCents: totals.serviceFeeCents,
+                    currency,
+                    categoryName: checkoutMetadata.categoryName,
+                    eventTitle: String(event.title),
+                    feePresentation,
+                    listPriceCents: totals.subtotalCents,
+                    discountAmountCents:
+                      totals.discountAmountCents || undefined,
+                    discountCode: discount?.code,
+                    orderMode: "group",
+                    orderPublicUuid: String(
+                      existingMeta.orderPublicUuid ?? orderPublicUuid,
+                    ),
+                    itemCount: resolved.length,
+                    lineItems: resolved,
+                    provider: "stripe",
+                  } satisfies GroupCheckoutApiResponse);
+                }
+              } catch (err) {
+                console.error("[checkout] group resume PI retrieve failed:", err);
+              }
+            }
+            const resumed = await buildCheckoutResponseForPayment(
+              existingUuid,
+              athleteId,
+            );
+            if (resumed?.clientSecret) {
+              return res.json({
+                ...resumed,
+                orderMode: "group",
+                orderPublicUuid: String(
+                  existingMeta.orderPublicUuid ?? orderPublicUuid,
+                ),
+                itemCount: resolved.length,
+                lineItems: resolved,
+                discountAmountCents: totals.discountAmountCents || undefined,
+                discountCode: discount?.code,
+                listPriceCents: totals.subtotalCents,
+              } satisfies GroupCheckoutApiResponse);
+            }
+          }
+
+          // Failed/canceled or unusable pending — revive this row instead of INSERT.
+          payUuid = existingUuid;
+          reusingGroupPayment = true;
+          await pool.query<ResultSetHeader>(
+            `UPDATE payments SET
+               status = 'pending',
+               failure_code = NULL,
+               failure_message = NULL,
+               stripe_payment_intent_id = NULL,
+               mercadopago_payment_id = NULL,
+               mercadopago_preference_id = NULL,
+               metadata_json = ?,
+               amount_cents = ?,
+               registration_amount_cents = ?,
+               service_fee_cents = ?,
+               provider = ?
+             WHERE public_uuid = ? AND registration_id IS NULL`,
+            [
+              JSON.stringify({
+                ...checkoutMetadata,
+                is_simulation: isSimulation,
+              }),
+              totalCents,
+              totals.registrationAmountCents,
+              totals.serviceFeeCents,
+              totalCents === 0 ? "mock" : "stripe",
+              payUuid,
+            ],
+          );
+        }
+
+        if (totalCents === 0) {
+          if (reusingGroupPayment) {
+            await pool.query<ResultSetHeader>(
+              `UPDATE payments SET
+                 provider = 'mock', status = 'succeeded', paid_at = COALESCE(paid_at, NOW()),
+                 amount_cents = 0, registration_amount_cents = ?, service_fee_cents = ?,
+                 metadata_json = ?
+               WHERE public_uuid = ?`,
+              [
+                totals.registrationAmountCents,
+                totals.serviceFeeCents,
+                JSON.stringify({
+                  ...checkoutMetadata,
+                  is_simulation: isSimulation,
+                }),
+                payUuid,
+              ],
+            );
+          } else {
+            await pool.query<ResultSetHeader>(
+              `INSERT INTO payments (
+                public_uuid, idempotency_key, registration_id, athlete_id, organizer_id, event_id,
+                amount_cents, registration_amount_cents, service_fee_cents, currency, status, provider,
+                metadata_json, paid_at, is_simulation
+              ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,NOW(),?)`,
+              [
+                payUuid,
+                idempotencyKey,
+                null,
+                athleteId,
+                event.organizer_id,
+                event.id,
+                0,
+                totals.registrationAmountCents,
+                totals.serviceFeeCents,
+                currency,
+                "succeeded",
+                "mock",
+                JSON.stringify({
+                  ...checkoutMetadata,
+                  is_simulation: isSimulation,
+                }),
+                isSimulation ? 1 : 0,
+              ],
+            );
+          }
+          if (isSimulation)
+            await bumpSimulationActivity(pool, Number(event.id));
+          const response: GroupCheckoutApiResponse = {
+            paymentPublicUuid: payUuid,
+            clientSecret: null,
+            amountCents: 0,
+            registrationAmountCents: totals.registrationAmountCents,
+            serviceFeeCents: totals.serviceFeeCents,
+            currency,
+            categoryName: checkoutMetadata.categoryName,
+            eventTitle: String(event.title),
+            feePresentation,
+            listPriceCents: totals.subtotalCents,
+            discountAmountCents: totals.discountAmountCents || undefined,
+            discountCode: discount?.code,
+            orderMode: "group",
+            orderPublicUuid,
+            itemCount: resolved.length,
+            lineItems: resolved,
+            provider: "mock",
+          };
+          return res.json(response);
+        }
+
+        if (payoutBlocked) {
+          return res.status(503).json({
+            error:
+              "Registration payments are temporarily unavailable for this event",
+            code: payoutBlocked.code,
+          });
+        }
+
+        if (
+          !isStripeReadyForSimulation(isSimulation) ||
+          !stripeClientForSimulation(isSimulation)
+        ) {
+          return res.status(503).json(apiErrorJson(req, "payment_unavailable"));
+        }
+
+        const stripe = stripeClientForSimulation(isSimulation)!;
+        const stripeCustomerId = isSimulation
+          ? null
+          : await ensureStripeCustomer(athleteId);
+        let piParams = buildRegistrationPaymentIntentParams({
+          amount: totalCents,
+          currency,
+          metadata: {
+            payment_public_uuid: payUuid,
+            event_slug: slug,
+            athlete_id: String(athleteId),
+            order_mode: "group",
+            event_id: String(event.id),
+            organizer_id: String(event.organizer_id ?? ""),
+            is_simulation: isSimulation ? "1" : "0",
+          },
+          eventTitle: event.title as string | undefined,
+          customerId: stripeCustomerId,
+        });
+        if (!isSimulation) {
+          const connectMode = await resolveCheckoutConnectMode(
+            pool,
+            Number(event.organizer_id),
+            getStripeClient(),
+          );
+          if (connectMode.mode === "blocked") {
+            return res.status(503).json({
+              error:
+                "Registration payments are temporarily unavailable for this event",
+              code: connectMode.code,
+            });
+          }
+          if (connectMode.mode === "destination") {
+            piParams = applyConnectToPaymentIntent(piParams, {
+              destinationAccountId: connectMode.stripeAccountId,
+              applicationFeeCents: totals.serviceFeeCents,
+            });
+          }
+        }
+
+        let pi: Stripe.PaymentIntent;
+        try {
+          pi = await stripe.paymentIntents.create(piParams, {
+            idempotencyKey: `pi_${payUuid}`,
+          });
+        } catch (err) {
+          const message =
+            err instanceof Error ? err.message : "Payment intent creation failed";
+          if (reusingGroupPayment) {
+            await pool.query<ResultSetHeader>(
+              `UPDATE payments SET status = 'failed', failure_code = 'pi_create_failed',
+               failure_message = ? WHERE public_uuid = ?`,
+              [message.slice(0, 500), payUuid],
+            );
+          }
+          return res.status(503).json({
+            ...apiErrorJson(req, "payment_init_failed"),
+            code: "payment_setup_failed",
+          });
+        }
+
+        try {
+          if (reusingGroupPayment) {
+            await pool.query<ResultSetHeader>(
+              `UPDATE payments SET
+                 stripe_payment_intent_id = ?, status = 'processing', provider = 'stripe',
+                 amount_cents = ?, registration_amount_cents = ?, service_fee_cents = ?,
+                 metadata_json = ?
+               WHERE public_uuid = ?`,
+              [
+                pi.id,
+                totalCents,
+                totals.registrationAmountCents,
+                totals.serviceFeeCents,
+                JSON.stringify({
+                  ...checkoutMetadata,
+                  is_simulation: isSimulation,
+                }),
+                payUuid,
+              ],
+            );
+          } else {
+            await pool.query<ResultSetHeader>(
+              `INSERT INTO payments (
+                public_uuid, idempotency_key, registration_id, athlete_id, organizer_id, event_id,
+                amount_cents, registration_amount_cents, service_fee_cents, currency, status, provider,
+                stripe_payment_intent_id, metadata_json, is_simulation
+              ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+              [
+                payUuid,
+                idempotencyKey,
+                null,
+                athleteId,
+                event.organizer_id,
+                event.id,
+                totalCents,
+                totals.registrationAmountCents,
+                totals.serviceFeeCents,
+                currency,
+                "pending",
+                "stripe",
+                pi.id,
+                JSON.stringify({
+                  ...checkoutMetadata,
+                  is_simulation: isSimulation,
+                }),
+                isSimulation ? 1 : 0,
+              ],
+            );
+          }
+        } catch (err) {
+          if (!isMysqlDuplicateEntry(err)) throw err;
+          const resumed = await buildCheckoutResponseForPayment(
+            payUuid,
+            athleteId,
+          );
+          if (resumed?.clientSecret) {
+            return res.json({
+              ...resumed,
+              orderMode: "group",
+              orderPublicUuid,
+              itemCount: resolved.length,
+              lineItems: resolved,
+              discountAmountCents: totals.discountAmountCents || undefined,
+              discountCode: discount?.code,
+              listPriceCents: totals.subtotalCents,
+            } satisfies GroupCheckoutApiResponse);
+          }
+          return res.status(503).json({
+            ...apiErrorJson(req, "payment_init_failed"),
+            code: "payment_setup_failed",
+          });
+        }
+        if (isSimulation) await bumpSimulationActivity(pool, Number(event.id));
+
+        const response: GroupCheckoutApiResponse = {
+          paymentPublicUuid: payUuid,
+          clientSecret: pi.client_secret,
+          amountCents: totalCents,
+          registrationAmountCents: totals.registrationAmountCents,
+          serviceFeeCents: totals.serviceFeeCents,
+          currency,
+          categoryName: checkoutMetadata.categoryName,
+          eventTitle: String(event.title),
+          feePresentation,
+          listPriceCents: totals.subtotalCents,
+          discountAmountCents: totals.discountAmountCents || undefined,
+          discountCode: discount?.code,
+          orderMode: "group",
+          orderPublicUuid,
+          itemCount: resolved.length,
+          lineItems: resolved,
+          provider: "stripe",
+        };
+        return res.json(response);
+      }
+
+      if (!Number.isFinite(categoryId)) {
+        return res.status(400).json(apiErrorJson(req, "category_id_required"));
+      }
+
+      const loadedSolo = await loadEventRowForCheckout(
+        slug,
+        req.body?.simulationToken ?? req.headers["x-simulation-token"],
+      );
+      if (!loadedSolo) {
+        return res.status(404).json(apiErrorJson(req, "event_not_found"));
+      }
+      const event = loadedSolo.row;
+      const isSimulation = loadedSolo.isSimulation;
+      if (!isSimulation) {
+        await maybeAutoDeactivateEvent(pool, Number(event.id));
+      }
+      if (isSimulation) {
+        const quota = await assertSimulationRegQuota(pool, Number(event.id));
+        if (quota.ok === false) {
+          return res.status(400).json({ error: quota.error, code: quota.code });
+        }
+      }
+
+      await cancelStalePendingEventPayments(
+        athleteId,
+        event.id as number,
+        idempotencyKey,
+      );
+      checkoutTrace("stale-payments-cancelled", { eventId: event.id });
+
+      const [dupReg] = await pool.query<RowDataPacket[]>(
+        `SELECT id FROM registrations
+         WHERE event_id = ? AND athlete_id = ? AND status = 'confirmed'
+           AND deleted_at IS NULL LIMIT 1`,
+        [event.id, athleteId],
+      );
+      if (dupReg.length > 0) {
+        return res.status(409).json({
+          ...apiErrorJson(req, "already_registered"),
+          code: "already_registered",
+        });
+      }
+
+      const [catRows] = await pool.query<RowDataPacket[]>(
+        `SELECT id, name, price_cents, capacity, currency, waitlist_enabled,
+                registration_opens_at, registration_closes_at,
+                min_age, max_age, gender_restriction,
+                ${CATEGORY_SOLD_COUNT_UNALIASED_SQL} AS sold_count
+         FROM event_categories
+         WHERE id = ? AND event_id = ? AND is_active = 1 LIMIT 1`,
+        [categoryId, event.id],
+      );
+      if (catRows.length === 0) {
+        return res.status(404).json(apiErrorJson(req, "category_not_found"));
+      }
+      const category = catRows[0];
+
+      const athleteProfile = await loadAthleteEligibilityProfile(athleteId);
+      if (!athleteProfile) {
+        return res.status(401).json(apiErrorJson(req, "athlete_not_found"));
+      }
+      const eligibilityErr = categoryEligibilityResponse(
+        req,
+        category,
+        athleteProfile,
+        event.start_date as string,
+      );
+      if (eligibilityErr) {
+        return res.status(eligibilityErr.status).json(eligibilityErr.body);
+      }
+
+      const windowErr = getRegistrationWindowError(
+        {
+          registration_opens_at: event.registration_opens_at as string | null,
+          registration_closes_at: event.registration_closes_at as string | null,
+          start_date: event.start_date as string | null,
+          end_date: (event as { end_date?: string | null }).end_date ?? null,
+        },
+        {
+          registration_opens_at: category.registration_opens_at as
+            | string
+            | null,
+          registration_closes_at: category.registration_closes_at as
+            | string
+            | null,
+        },
+      );
+      if (windowErr) {
+        return res
+          .status(409)
+          .json({ error: windowErr.error, code: windowErr.code });
+      }
+
+      const waitlistEntryId =
+        req.body?.waitlistEntryId != null
+          ? Number(req.body.waitlistEntryId)
+          : null;
+      const soldOut =
+        category.capacity != null &&
+        Number(category.sold_count) >= Number(category.capacity);
+      if (soldOut) {
+        if (
+          waitlistEntryId &&
+          Number.isFinite(waitlistEntryId) &&
+          (await getValidWaitlistOffer(
+            pool,
+            athleteId,
+            event.id,
+            category.id as number,
+            waitlistEntryId,
+          ))
+        ) {
+          // Waitlist claim bypasses sold-out gate
+        } else if (Boolean(category.waitlist_enabled)) {
+          return res.status(409).json({
+            ...apiErrorJson(req, "category_sold_out"),
+            code: "waitlist_available",
+            categoryId: category.id,
+          });
+        } else {
+          return res.status(409).json(apiErrorJson(req, "category_sold_out"));
+        }
+      }
+
+      const fieldRows = await fetchRegistrationFieldsForCategory(
+        pool,
+        event.id as number,
+        categoryId,
+      );
+
+      for (const field of fieldRows) {
+        const key = field.field_key as string;
+        const raw = fieldValues[key];
+        const required = Boolean(field.is_required);
+        if (field.field_type === "checkbox") {
+          if (required && raw !== true && raw !== "true") {
+            return res
+              .status(400)
+              .json({ error: `${field.label} is required` });
+          }
+          continue;
+        }
+        const strVal = raw == null ? "" : String(raw).trim();
+        if (required && !strVal) {
+          return res.status(400).json({ error: `${field.label} is required` });
+        }
+        if (field.field_type === "select" && strVal) {
+          const opts = parseFieldOptions(field.options_json);
+          if (opts.length > 0 && !opts.includes(strVal)) {
+            return res
+              .status(400)
+              .json({ error: `Invalid option for ${field.label}` });
+          }
+        }
+      }
+
+      const requiresWaiver = Boolean(event.requires_waiver);
+      let waiverSignatures: WaiverSignatureInput[] | null = null;
+
+      if (requiresWaiver) {
+        waiverSignatures = parseWaiverSignatures(req.body);
+        if (!waiverSignatures) {
+          return res.status(400).json(apiErrorJson(req, "waiver_required"));
+        }
+        const [[athleteDobRow]] = await pool.query<RowDataPacket[]>(
+          "SELECT date_of_birth FROM athletes WHERE id = ? LIMIT 1",
+          [athleteId],
+        );
+        const validation = await validateWaiverSignaturesForEvent(
+          pool,
+          event.id as number,
+          waiverSignatures,
+          {
+            categoryId: Number(categoryId),
+            dateOfBirth: athleteDobRow?.date_of_birth ?? null,
+            eventStartDate: (event.start_date as string | null) ?? null,
+          },
+        );
+        if ("error" in validation) {
+          return res.status(400).json({ error: validation.error });
+        }
+      }
+
+      let checkoutRail: "stripe" | "manual" = "stripe";
+      let feePercent = resolveServiceFeePercent(
+        event.service_fee_percent as number | string | null,
+        event.org_fee_percent as number | string | null,
+      );
+      let payoutBlocked: { code: string } | null = null;
+      if (!isSimulation) {
+        const dest = await resolveOrganizerCheckoutDestination(
+          pool,
+          event.organizer_id as number,
+          getStripeClient(),
+        );
+        if (dest.ok === false) {
+          // Allow pricing/discount validation; only block when athlete must pay.
+          payoutBlocked = { code: dest.code };
+        } else {
+          checkoutRail = dest.rail;
+          feePercent = resolveServiceFeePercentForRail({
+            eventFee: event.service_fee_percent as number | string | null,
+            organizerFee: event.org_fee_percent as number | string | null,
+            rail: dest.rail,
+          });
+        }
+      }
+      const feePresentation = resolveFeePresentation(
+        event.fee_presentation as string | null,
+        event.org_fee_presentation as string | null,
+      );
+      const basePriceCents = Number(category.price_cents);
+      let breakdown = computeCheckoutBreakdown({
+        listPriceCents: basePriceCents,
+        serviceFeePercent: feePercent,
+        feePresentation,
+      });
+      const breakdownError = validateCheckoutBreakdown(breakdown);
+      if (breakdownError) {
+        return res.status(400).json({ error: breakdownError });
+      }
+      let discountCodeId: number | undefined;
+      let discountCode: string | undefined;
+      let discountAmountCents = 0;
+
+      if (discountCodeInput) {
+        checkoutTrace("discount-apply", { code: discountCodeInput });
+        const discountResult = await fetchValidDiscountCode(
+          discountCodeInput,
+          event.id as number,
+          event.organizer_id as number,
+        );
+        if ("error" in discountResult) {
+          return res.status(400).json({ error: discountResult.error });
+        }
+        try {
+          const applied = applyDiscountToCheckout({
+            listPriceCents: basePriceCents,
+            serviceFeePercent: feePercent,
+            feePresentation,
+            discount: discountResult.discount,
+          });
+          breakdown = applied.breakdown;
+          discountAmountCents = applied.discountAmountCents;
+          discountCodeId = discountResult.discount.id;
+          discountCode = discountResult.discount.code;
+        } catch (err) {
+          return res.status(400).json({
+            error:
+              err instanceof Error ? err.message : "Discount not applicable",
+          });
+        }
+      }
+
+      const selectedExtrasRaw = Array.isArray(req.body?.selectedExtras)
+        ? (req.body.selectedExtras as Array<{
+            extraId?: unknown;
+            quantity?: unknown;
+          }>)
+        : undefined;
+
+      if (selectedExtrasRaw) {
+        for (const item of selectedExtrasRaw) {
+          const extraId = Number(item?.extraId);
+          const quantity = Number(item?.quantity);
+          if (!Number.isFinite(extraId) || extraId <= 0) {
+            return res.status(400).json(apiErrorJson(req, "invalid_extra_selection"));
+          }
+          if (!Number.isFinite(quantity) || quantity < 1 || quantity > 99) {
+            return res.status(400).json(apiErrorJson(req, "invalid_extra_quantity"));
+          }
+        }
+      }
+
+      const selectedExtrasInput =
+        selectedExtrasRaw?.map((item) => ({
+          extraId: Number(item.extraId),
+          quantity: Number(item.quantity),
+        })) ?? [];
+
+      const extraFieldAnswersRaw = Array.isArray(req.body?.extraFieldAnswers)
+        ? (req.body.extraFieldAnswers as Array<{
+            extraId?: unknown;
+            values?: unknown;
+          }>)
+        : undefined;
+      const extraFieldAnswers: ExtraFieldAnswersInput | undefined =
+        extraFieldAnswersRaw
+          ?.map((row) => ({
+            extraId: Number(row.extraId),
+            values:
+              row.values && typeof row.values === "object"
+                ? (row.values as Record<string, unknown>)
+                : {},
+          }))
+          .filter((row) => Number.isFinite(row.extraId) && row.extraId > 0);
+
+      const extrasResult = await resolveSelectedExtras(
+        pool,
+        event.id as number,
+        selectedExtrasInput,
+        { categoryId: category.id as number },
+      );
+      if (extrasResult.ok === false) {
+        return res.status(400).json({ error: extrasResult.error });
+      }
+
+      const extraAnswersValidation = await validateExtraFieldAnswersForCheckout(
+        pool,
+        event.id as number,
+        selectedExtrasInput,
+        extraFieldAnswers,
+      );
+      if (extraAnswersValidation.ok === false) {
+        return res.status(400).json({ error: extraAnswersValidation.error });
+      }
+
+      const categoryListPriceCents = breakdown.listPriceCents;
+      const extrasSubtotalCents = sumExtrasSubtotalCents(extrasResult.lines);
+      if (extrasSubtotalCents > 0) {
+        breakdown = computeCheckoutWithExtras({
+          categoryListPriceCents,
+          extrasSubtotalCents,
+          serviceFeePercent: feePercent,
+          feePresentation,
+        });
+      }
+      const breakdownErrorWithExtras = validateCheckoutBreakdown(breakdown);
+      if (breakdownErrorWithExtras) {
+        return res.status(400).json({ error: breakdownErrorWithExtras });
+      }
+
+      const extrasCheckoutPayload = {
+        extrasSubtotalCents,
+        extras: extrasResult.lines.map((line) => ({
+          extraId: line.extraId,
+          name: line.name,
+          quantity: line.quantity,
+          unitPriceCents: line.unitPriceCents,
+          totalCents: line.totalCents,
+        })),
+      };
+
+      const listPriceCents = breakdown.listPriceCents;
+      const registrationAmountCents = breakdown.stripeOrganizerTransferCents;
+      const serviceFeeCents = breakdown.serviceFeeCents;
+      const totalCents = breakdown.athleteTotalCents;
+      const eventOffersMsi = eventRowMsiEnabled(event);
+      const msiAvailableAtCheckout = resolveCheckoutMsiAvailable({
+        eventMsiEnabled: eventOffersMsi,
+        provider: checkoutRail,
+        baseAthleteTotalCents: totalCents,
+      });
+      const msiCheckoutFields = msiFieldsForCheckoutResponse({
+        msiAvailable: msiAvailableAtCheckout,
+        planMonths: null,
+      });
+
+      checkoutTrace("pricing", {
+        eventId: event.id,
+        categoryId: category.id,
+        totalCents,
+        listPriceCents,
+        registrationAmountCents,
+        serviceFeeCents,
+        feePresentation,
+        discountApplied: Boolean(discountCodeId),
+        msiAvailable: msiAvailableAtCheckout,
+      });
+
+      const checkoutMetadata: CheckoutPaymentMetadata = {
+        categoryId: category.id as number,
+        fieldValues,
+        categoryName: String(category.name),
+        feePresentation,
+        breakdown: breakdownToSnapshot(breakdown),
+        categoryListPriceCents,
+        extrasSubtotalCents,
+        selectedExtras: extrasResult.lines,
+        baseServiceFeePercent: feePercent,
+        msiEnabled: eventOffersMsi,
+        msiPlanMonths: null,
+        ...(extraFieldAnswers?.length ? { extraFieldAnswers } : {}),
+        ...(waitlistEntryId && Number.isFinite(waitlistEntryId)
+          ? { waitlistEntryId }
+          : {}),
+        ...(discountCodeId
+          ? { discountCodeId, discountCode, discountAmountCents }
+          : {}),
+        ...(requiresWaiver && waiverSignatures
+          ? {
+              waiverSignatures,
+              waiverAcceptedAt: new Date().toISOString(),
+              clientIp: req.ip?.slice(0, 45),
+              userAgent: String(req.headers["user-agent"] ?? "").slice(0, 500),
+              deviceInfo: String(req.headers["user-agent"] ?? "").slice(0, 255),
+            }
+          : {}),
+      };
+
+      const metadataJson = JSON.stringify(checkoutMetadata);
+
+      const [existingPay] = await pool.query<RowDataPacket[]>(
+        `SELECT public_uuid, status, stripe_payment_intent_id, amount_cents, service_fee_cents
+         FROM payments
+         WHERE idempotency_key = ? AND athlete_id = ? AND registration_id IS NULL
+         LIMIT 1`,
+        [idempotencyKey, athleteId],
+      );
+      if (existingPay.length > 0) {
+        const existingUuid = existingPay[0].public_uuid as string;
+        const existingStatus = String(existingPay[0].status ?? "");
+        checkoutTrace("existing-payment", {
+          paymentPublicUuid: existingUuid,
+          totalCents,
+          status: existingStatus,
+        });
+
+        const priorAmountCents = Number(existingPay[0].amount_cents ?? 0);
+        const priorServiceFeeCents = Number(
+          existingPay[0].service_fee_cents ?? 0,
+        );
+
+        // Revive failed/canceled rows so the same browser idempotency key can retry.
+        if (existingStatus === "failed" || existingStatus === "canceled") {
+          await pool.query<ResultSetHeader>(
+            `UPDATE payments SET
+               status = 'pending',
+               failure_code = NULL,
+               failure_message = NULL,
+               stripe_payment_intent_id = NULL,
+               mercadopago_payment_id = NULL,
+               mercadopago_preference_id = NULL,
+               metadata_json = ?,
+               amount_cents = ?,
+               registration_amount_cents = ?,
+               service_fee_cents = ?,
+               provider = ?
+             WHERE public_uuid = ? AND registration_id IS NULL`,
+            [
+              metadataJson,
+              totalCents,
+              registrationAmountCents,
+              serviceFeeCents,
+              "stripe",
+              existingUuid,
+            ],
+          );
+        } else {
+          await pool.query<ResultSetHeader>(
+            `UPDATE payments SET metadata_json = ?, amount_cents = ?,
+             registration_amount_cents = ?, service_fee_cents = ?
+             WHERE public_uuid = ?`,
+            [
+              metadataJson,
+              totalCents,
+              registrationAmountCents,
+              serviceFeeCents,
+              existingUuid,
+            ],
+          );
+
+          if (
+            existingPay[0].stripe_payment_intent_id &&
+            stripeClientForSimulation(isSimulation) &&
+            totalCents > 0 &&
+            (priorAmountCents !== totalCents ||
+              priorServiceFeeCents !== serviceFeeCents)
+          ) {
+            try {
+              await stripeClientForSimulation(
+                isSimulation,
+              )!.paymentIntents.update(
+                String(existingPay[0].stripe_payment_intent_id),
+                isSimulation
+                  ? { amount: totalCents }
+                  : {
+                      amount: totalCents,
+                      application_fee_amount: serviceFeeCents,
+                    },
+              );
+            } catch (err) {
+              console.error(
+                "[checkout] payment intent amount update failed:",
+                err,
+              );
+            }
+          }
+        }
+
+        if (totalCents === 0) {
+          checkoutTrace("free-checkout-resume", {
+            paymentPublicUuid: existingUuid,
+          });
+          const priorPiId = existingPay[0].stripe_payment_intent_id
+            ? String(existingPay[0].stripe_payment_intent_id)
+            : null;
+          if (priorPiId && stripeClientForSimulation(isSimulation)) {
+            try {
+              await stripeClientForSimulation(isSimulation)!.paymentIntents.cancel(
+                priorPiId,
+              );
+            } catch (err) {
+              console.error("[checkout] cancel orphan PI on free resume:", err);
+            }
+          }
+          await pool.query<ResultSetHeader>(
+            `UPDATE payments SET
+               provider = 'mock',
+               status = 'succeeded',
+               stripe_payment_intent_id = NULL,
+               mercadopago_payment_id = NULL,
+               mercadopago_preference_id = NULL,
+               paid_at = COALESCE(paid_at, NOW()),
+               amount_cents = 0,
+               registration_amount_cents = ?,
+               service_fee_cents = ?,
+               metadata_json = ?
+             WHERE public_uuid = ?`,
+            [
+              registrationAmountCents,
+              serviceFeeCents,
+              metadataJson,
+              existingUuid,
+            ],
+          );
+          return res.json({
+            paymentPublicUuid: existingUuid,
+            clientSecret: null,
+            provider: "mock",
+            amountCents: 0,
+            registrationAmountCents,
+            serviceFeeCents,
+            currency: category.currency || "MXN",
+            categoryName: category.name,
+            eventTitle: event.title,
+            fieldValues,
+            feePresentation,
+            listPriceCents,
+            ...extrasCheckoutPayload,
+            ...msiCheckoutFields,
+            ...(discountCode ? { discountCode, discountAmountCents } : {}),
+          });
+        }
+
+        if (payoutBlocked) {
+          return res.status(503).json({
+            error:
+              "Registration payments are temporarily unavailable for this event",
+            code: payoutBlocked.code,
+          });
+        }
+
+        if (
+          !isStripeReadyForSimulation(isSimulation) ||
+          !stripeClientForSimulation(isSimulation)
+        ) {
+          return res.status(503).json(apiErrorJson(req, "payment_unavailable"));
+        }
+
+        const resumed = await buildCheckoutResponseForPayment(
+          existingUuid,
+          athleteId,
+        );
+        if (resumed) {
+          checkoutTrace("checkout-resumed", {
+            paymentPublicUuid: existingUuid,
+          });
+          return res.json({
+            ...resumed,
+            fieldValues,
+            ...extrasCheckoutPayload,
+            ...msiCheckoutFields,
+          });
+        }
+
+        // Never fall through to INSERT — same idempotency_key would 500.
+        checkoutTraceError(
+          "checkout-resume-failed",
+          new Error("Could not resume existing payment"),
+          { paymentPublicUuid: existingUuid },
+        );
+        return res.status(503).json({
+          ...apiErrorJson(req, "payment_init_failed"),
+          code: "payment_setup_failed",
+        });
+      }
+
+      const payUuid = newPublicUuid();
+
+      if (totalCents === 0) {
+        checkoutTrace("free-checkout-new", { paymentPublicUuid: payUuid });
+        await pool.query<ResultSetHeader>(
+          `INSERT INTO payments (
+            public_uuid, idempotency_key, registration_id, athlete_id, organizer_id, event_id,
+            amount_cents, registration_amount_cents, service_fee_cents, currency, status, provider,
+            metadata_json, paid_at, is_simulation
+          ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,NOW(),?)`,
+          [
+            payUuid,
+            idempotencyKey,
+            null,
+            athleteId,
+            event.organizer_id,
+            event.id,
+            0,
+            registrationAmountCents,
+            serviceFeeCents,
+            category.currency || "MXN",
+            "succeeded",
+            "mock",
+            JSON.stringify({
+              ...checkoutMetadata,
+              is_simulation: isSimulation,
+            }),
+            isSimulation ? 1 : 0,
+          ],
+        );
+        if (isSimulation) await bumpSimulationActivity(pool, Number(event.id));
+
+        return res.json({
+          paymentPublicUuid: payUuid,
+          clientSecret: null,
+          amountCents: 0,
+          registrationAmountCents,
+          serviceFeeCents,
+          currency: category.currency || "MXN",
+          categoryName: category.name,
+          eventTitle: event.title,
+          feePresentation,
+          listPriceCents,
+          ...extrasCheckoutPayload,
+          ...msiCheckoutFields,
+          ...(discountCode ? { discountCode, discountAmountCents } : {}),
+        });
+      }
+
+      if (payoutBlocked) {
+        return res.status(503).json({
+          error:
+            "Registration payments are temporarily unavailable for this event",
+          code: payoutBlocked.code,
+        });
+      }
+
+      if (
+        (checkoutRail === "stripe" || checkoutRail === "manual") &&
+        (!isStripeReadyForSimulation(isSimulation) ||
+          !stripeClientForSimulation(isSimulation))
+      ) {
+        checkoutTrace("stripe-unavailable");
+        return res.status(503).json(apiErrorJson(req, "payment_unavailable"));
+      }
+
+      let connectDestinationAccountId: string | null = null;
+      let connectChargeMode: "destination" | "platform" | "platform_test" =
+        "destination";
+      if (
+        totalCents > 0 &&
+        !isSimulation &&
+        (checkoutRail === "stripe" || checkoutRail === "manual")
+      ) {
+        const connectMode = await resolveCheckoutConnectMode(
+          pool,
+          event.organizer_id as number,
+          getStripeClient(),
+        );
+        if (connectMode.mode === "blocked") {
+          checkoutTrace("organizer-payouts-blocked", {
+            code: connectMode.code,
+          });
+          return res.status(503).json({
+            error:
+              "Registration payments are temporarily unavailable for this event",
+            code: connectMode.code,
+          });
+        }
+        if (connectMode.mode === "destination") {
+          connectDestinationAccountId = connectMode.stripeAccountId;
+        } else {
+          connectChargeMode = "platform";
+        }
+      }
+      if (isSimulation) {
+        connectChargeMode = "platform_test";
+      }
+
+      checkoutTrace("payment-insert", {
+        paymentPublicUuid: payUuid,
+        totalCents,
+        checkoutRail,
+      });
+      const checkoutMetadataWithConnect = {
+        ...checkoutMetadata,
+        connect_charge_mode: connectChargeMode,
+        is_simulation: isSimulation,
+        payout_rail: checkoutRail,
+      };
+      let paymentId: number;
+      try {
+        const [payResult] = await pool.query<ResultSetHeader>(
+          `INSERT INTO payments (
+            public_uuid, idempotency_key, registration_id, athlete_id, organizer_id, event_id,
+            amount_cents, registration_amount_cents, service_fee_cents, currency, status, provider, metadata_json, is_simulation
+          ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          [
+            payUuid,
+            idempotencyKey,
+            null,
+            athleteId,
+            event.organizer_id,
+            event.id,
+            totalCents,
+            registrationAmountCents,
+            serviceFeeCents,
+            category.currency || "MXN",
+            "pending",
+            "stripe",
+            JSON.stringify(checkoutMetadataWithConnect),
+            isSimulation ? 1 : 0,
+          ],
+        );
+        paymentId = payResult.insertId;
+      } catch (err) {
+        if (!isMysqlDuplicateEntry(err)) throw err;
+        checkoutTrace("payment-insert-duplicate", { idempotencyKey });
+        const [dupRows] = await pool.query<RowDataPacket[]>(
+          `SELECT public_uuid FROM payments
+           WHERE idempotency_key = ? AND athlete_id = ? AND registration_id IS NULL
+           LIMIT 1`,
+          [idempotencyKey, athleteId],
+        );
+        const dupUuid = dupRows[0]?.public_uuid
+          ? String(dupRows[0].public_uuid)
+          : "";
+        if (dupUuid) {
+          await pool.query<ResultSetHeader>(
+            `UPDATE payments SET
+               status = 'pending',
+               failure_code = NULL,
+               failure_message = NULL,
+               metadata_json = ?,
+               amount_cents = ?,
+               registration_amount_cents = ?,
+               service_fee_cents = ?,
+               provider = ?
+             WHERE public_uuid = ? AND registration_id IS NULL`,
+            [
+              JSON.stringify(checkoutMetadataWithConnect),
+              totalCents,
+              registrationAmountCents,
+              serviceFeeCents,
+              "stripe",
+              dupUuid,
+            ],
+          );
+          const resumed = await buildCheckoutResponseForPayment(
+            dupUuid,
+            athleteId,
+          );
+          if (resumed) {
+            return res.json({
+              ...resumed,
+              fieldValues,
+              ...extrasCheckoutPayload,
+              ...msiCheckoutFields,
+            });
+          }
+        }
+        return res.status(503).json({
+          ...apiErrorJson(req, "payment_init_failed"),
+          code: "payment_setup_failed",
+        });
+      }
+
+      const stripeCustomerId = isSimulation
+        ? null
+        : await ensureStripeCustomer(athleteId);
+      checkoutTrace("stripe-customer", {
+        paymentPublicUuid: payUuid,
+        hasCustomer: Boolean(stripeCustomerId),
+        isSimulation,
+      });
+      let piParams = buildRegistrationPaymentIntentParams({
+        amount: totalCents,
+        currency: (category.currency as string) || "mxn",
+        metadata: {
+          payment_public_uuid: payUuid,
+          event_slug: slug,
+          athlete_id: String(athleteId),
+          category_id: String(category.id),
+          event_id: String(event.id),
+          organizer_id: String(event.organizer_id),
+          connect_charge_mode: connectChargeMode,
+          is_simulation: isSimulation ? "1" : "0",
+          ...(discountCodeId
+            ? { discount_code_id: String(discountCodeId) }
+            : {}),
+        },
+        eventTitle: String(event.title),
+        customerId: stripeCustomerId,
+        ...(msiAvailableAtCheckout ? { msiPlanMonths: null } : {}),
+      });
+
+      if (totalCents > 0 && connectDestinationAccountId && !isSimulation) {
+        piParams = applyConnectToPaymentIntent(piParams, {
+          destinationAccountId: connectDestinationAccountId,
+          applicationFeeCents: serviceFeeCents,
+        });
+      }
+
+      checkoutTrace("payment-intent-create", {
+        paymentPublicUuid: payUuid,
+        totalCents,
+        currency: piParams.currency,
+        isSimulation,
+      });
+      let pi: Stripe.PaymentIntent;
+      try {
+        pi = await stripeClientForSimulation(
+          isSimulation,
+        )!.paymentIntents.create(piParams, {
+          idempotencyKey: `pi_${payUuid}`,
+        });
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : "Payment intent creation failed";
+        checkoutTraceError("payment-intent-create", err, {
+          paymentPublicUuid: payUuid,
+        });
+        await pool.query<ResultSetHeader>(
+          `UPDATE payments SET status = 'failed', failure_code = 'pi_create_failed', failure_message = ?
+           WHERE id = ? AND registration_id IS NULL`,
+          [message.slice(0, 500), paymentId],
+        );
+        return res.status(503).json({
+          ...apiErrorJson(req, "payment_init_failed"),
+          code: "payment_setup_failed",
+        });
+      }
+      const clientSecret = pi.client_secret;
+      checkoutTrace("payment-intent-created", {
+        paymentPublicUuid: payUuid,
+        paymentIntentId: pi.id,
+        hasClientSecret: Boolean(clientSecret),
+      });
+      await pool.query<ResultSetHeader>(
+        `UPDATE payments SET stripe_payment_intent_id = ?, status = 'processing' WHERE id = ?`,
+        [pi.id, paymentId],
+      );
+      if (isSimulation) await bumpSimulationActivity(pool, Number(event.id));
+
+      res.json({
+        paymentPublicUuid: payUuid,
+        clientSecret,
+        provider: "stripe",
+        amountCents: totalCents,
+        registrationAmountCents,
+        serviceFeeCents,
+        currency: category.currency || "MXN",
+        categoryName: category.name,
+        eventTitle: event.title,
+        feePresentation,
+        listPriceCents,
+        displayIvaCents: breakdown.displayIvaCents,
+        organizerFiscalNetCents: breakdown.organizerFiscalNetCents,
+        ...extrasCheckoutPayload,
+        ...msiCheckoutFields,
+        ...(discountCode ? { discountCode, discountAmountCents } : {}),
+      });
+    }),
+  );
+
+  app.post(
+    "/api/events/:slug/register/checkout/msi-plan",
+    requireAthlete,
+    asyncHandler(async (req: AuthedRequest, res) => {
+      const slug = String(req.params.slug);
+      const athleteId = req.auth!.id;
+      const paymentPublicUuid = String(req.body?.paymentPublicUuid || "").trim();
+      const rawPlan = req.body?.planMonths;
+      let planMonths: MsiPlanMonths | null = null;
+      if (rawPlan !== null && rawPlan !== undefined && rawPlan !== "" && rawPlan !== 0) {
+        const n = Number(rawPlan);
+        if (!isMsiPlanMonths(n)) {
+          return res.status(400).json({
+            error: "planMonths must be null, 3, 6, or 9",
+            code: "invalid_msi_plan",
+          });
+        }
+        planMonths = n;
+      }
+
+      if (!paymentPublicUuid) {
+        return res.status(400).json(apiErrorJson(req, "payment_public_uuid_required"));
+      }
+
+      const [payRows] = await pool.query<RowDataPacket[]>(
+        `SELECT p.id, p.public_uuid, p.status, p.provider, p.stripe_payment_intent_id,
+                p.amount_cents, p.registration_amount_cents, p.service_fee_cents,
+                p.currency, p.metadata_json, p.organizer_id, p.event_id, p.is_simulation,
+                e.slug AS event_slug, e.msi_enabled, e.title AS event_title,
+                e.service_fee_percent, e.fee_presentation,
+                o.service_fee_percent AS org_fee_percent,
+                o.fee_presentation AS org_fee_presentation
+         FROM payments p
+         JOIN events e ON e.id = p.event_id
+         JOIN organizers o ON o.id = p.organizer_id
+         WHERE p.public_uuid = ? AND p.athlete_id = ? AND p.registration_id IS NULL
+         LIMIT 1`,
+        [paymentPublicUuid, athleteId],
+      );
+      if (payRows.length === 0) {
+        return res.status(404).json(apiErrorJson(req, "payment_not_found"));
+      }
+      const pay = payRows[0];
+      if (String(pay.event_slug) !== slug) {
+        return res.status(404).json(apiErrorJson(req, "payment_not_found"));
+      }
+      if (!["pending", "processing"].includes(String(pay.status))) {
+        return res.status(409).json({
+          ...apiErrorJson(req, "payment_not_editable"),
+          code: "payment_not_editable",
+        });
+      }
+      if (String(pay.provider) !== "stripe") {
+        return res.status(400).json({
+          ...apiErrorJson(req, "msi_stripe_only"),
+          code: "msi_stripe_only",
+        });
+      }
+
+      const meta = parseCheckoutPaymentMetadata(
+        typeof pay.metadata_json === "string"
+          ? JSON.parse(pay.metadata_json as string)
+          : pay.metadata_json,
+      );
+      if (!meta) {
+        return res.status(400).json(apiErrorJson(req, "invalid_payment_metadata"));
+      }
+      if ((meta as { orderMode?: string }).orderMode === "group") {
+        return res.status(400).json({
+          ...apiErrorJson(req, "msi_group_not_available"),
+          code: "msi_group_unsupported",
+        });
+      }
+
+      const feePresentation: FeePresentation =
+        meta.feePresentation === "absorb_all" ||
+        meta.feePresentation === "pass_through"
+          ? meta.feePresentation
+          : resolveFeePresentation(
+              pay.fee_presentation as string | null,
+              pay.org_fee_presentation as string | null,
+            );
+      const listPriceCents = Number(
+        meta.breakdown?.listPriceCents ??
+          meta.categoryListPriceCents ??
+          pay.registration_amount_cents ??
+          0,
+      );
+      const baseServiceFeePercent = Number(
+        meta.baseServiceFeePercent ??
+          resolveServiceFeePercent(
+            pay.service_fee_percent as number | string | null,
+            pay.org_fee_percent as number | string | null,
+          ),
+      );
+
+      const baseBreakdown = computeCheckoutBreakdown({
+        listPriceCents,
+        serviceFeePercent: baseServiceFeePercent,
+        feePresentation,
+      });
+      const msiAvailable = resolveCheckoutMsiAvailable({
+        eventMsiEnabled:
+          meta.msiEnabled === true || eventRowMsiEnabled(pay),
+        provider: "stripe",
+        baseAthleteTotalCents: baseBreakdown.athleteTotalCents,
+      });
+      if (!msiAvailable) {
+        return res.status(400).json({
+          ...apiErrorJson(req, "msi_not_available"),
+          code: "msi_unavailable",
+        });
+      }
+
+      const nextBreakdown = computeCheckoutBreakdownForMsiPlan({
+        listPriceCents,
+        baseServiceFeePercent,
+        feePresentation,
+        planMonths,
+      });
+      const breakdownError = validateCheckoutBreakdown(nextBreakdown);
+      if (breakdownError) {
+        return res.status(400).json({ error: breakdownError });
+      }
+
+      const registrationAmountCents = nextBreakdown.stripeOrganizerTransferCents;
+      const serviceFeeCents = nextBreakdown.serviceFeeCents;
+      const totalCents = nextBreakdown.athleteTotalCents;
+      const isSimulation = Number(pay.is_simulation) === 1;
+
+      const nextMeta: CheckoutPaymentMetadata = {
+        ...meta,
+        feePresentation,
+        breakdown: breakdownToSnapshot(nextBreakdown),
+        baseServiceFeePercent,
+        msiEnabled: true,
+        msiPlanMonths: planMonths,
+      };
+
+      await pool.query<ResultSetHeader>(
+        `UPDATE payments SET
+           metadata_json = ?,
+           amount_cents = ?,
+           registration_amount_cents = ?,
+           service_fee_cents = ?
+         WHERE public_uuid = ? AND athlete_id = ? AND registration_id IS NULL`,
+        [
+          JSON.stringify(nextMeta),
+          totalCents,
+          registrationAmountCents,
+          serviceFeeCents,
+          paymentPublicUuid,
+          athleteId,
+        ],
+      );
+
+      const piId = pay.stripe_payment_intent_id
+        ? String(pay.stripe_payment_intent_id)
+        : "";
+      const stripe = stripeClientForSimulation(isSimulation);
+      if (piId && stripe) {
+        try {
+          const updateParams: Stripe.PaymentIntentUpdateParams = {
+            amount: totalCents,
+            payment_method_options: stripeInstallmentUpdateParams(planMonths),
+            metadata: {
+              msi_plan_months: planMonths == null ? "" : String(planMonths),
+            },
+          };
+          if (!isSimulation) {
+            updateParams.application_fee_amount = serviceFeeCents;
+          }
+          await stripe.paymentIntents.update(piId, updateParams);
+        } catch (err) {
+          console.error("[checkout] MSI plan PaymentIntent update failed:", err);
+          return res.status(502).json({
+            ...apiErrorJson(req, "installment_update_failed"),
+            code: "msi_plan_update_failed",
+          });
+        }
+      }
+
+      const resumed = await buildCheckoutResponseForPayment(
+        paymentPublicUuid,
+        athleteId,
+      );
+      if (!resumed) {
+        return res.status(503).json({
+          error: "Could not reload checkout after MSI plan update",
+          code: "payment_setup_failed",
+        });
+      }
+      return res.json(resumed);
+    }),
+  );
+
+  app.post("/api/events/:slug/register/mp/pay", requireAthlete, (_req, res) => {
+    return res.status(410).json({
+      error: "Mercado Pago is no longer available",
+      code: "mp_removed",
+    });
+  });
+
+  app.post(
+    "/api/events/:slug/register/resume",
+    requireAthlete,
+    async (req: AuthedRequest, res) => {
+      const slug = String(req.params.slug);
+      const athleteId = req.auth!.id;
+      const paymentPublicUuid = String(
+        req.body?.paymentPublicUuid ?? "",
+      ).trim();
+      const idempotencyKey = String(req.body?.idempotencyKey ?? "").trim();
+
+      if (!paymentPublicUuid && !idempotencyKey) {
+        return res
+          .status(400)
+          .json({ error: "paymentPublicUuid or idempotencyKey required" });
+      }
+
+      const simToken = String(
+        req.body?.simulationToken ?? req.headers["x-simulation-token"] ?? "",
+      ).trim();
+      const loadedResume = await loadEventRowForCheckout(
+        slug,
+        simToken || null,
+      );
+      if (!loadedResume) {
+        return res.status(404).json(apiErrorJson(req, "event_not_found"));
+      }
+      const eventId = loadedResume.row.id as number;
+
+      const [payRows] = await pool.query<RowDataPacket[]>(
+        paymentPublicUuid
+          ? `SELECT p.*, e.title AS event_title, e.slug AS event_slug
+             FROM payments p
+             JOIN events e ON e.id = p.event_id
+             WHERE p.public_uuid = ? AND p.athlete_id = ? AND p.event_id = ? LIMIT 1`
+          : `SELECT p.*, e.title AS event_title, e.slug AS event_slug
+             FROM payments p
+             JOIN events e ON e.id = p.event_id
+             WHERE p.idempotency_key = ? AND p.athlete_id = ? AND p.event_id = ?
+               AND p.registration_id IS NULL
+             ORDER BY p.created_at DESC LIMIT 1`,
+        paymentPublicUuid
+          ? [paymentPublicUuid, athleteId, eventId]
+          : [idempotencyKey, athleteId, eventId],
+      );
+      if (payRows.length === 0) {
+        return res.status(404).json(apiErrorJson(req, "checkout_not_found"));
+      }
+      const pay = payRows[0];
+      const payUuid = pay.public_uuid as string;
+
+      if (pay.registration_id) {
+        const [existing] = await pool.query<RowDataPacket[]>(
+          `SELECT r.public_uuid, r.registration_number, r.qr_code_token, r.status, r.total_cents,
+                  ec.name AS category_name, e.title AS event_title, e.slug AS event_slug
+           FROM registrations r
+           JOIN event_categories ec ON ec.id = r.event_category_id
+           JOIN events e ON e.id = r.event_id
+           WHERE r.id = ? AND r.deleted_at IS NULL`,
+          [pay.registration_id],
+        );
+        return res.json({
+          status: "complete",
+          registration: existing[0] ?? null,
+          confirmationEmail: await athleteLoginEmail(athleteId),
+        });
+      }
+
+      if (pay.status === "succeeded") {
+        const [orderRows] = await pool.query<RowDataPacket[]>(
+          `SELECT id, public_uuid FROM registration_orders
+           WHERE payment_id = ? AND status = 'confirmed' LIMIT 1`,
+          [pay.id],
+        );
+        if (orderRows.length > 0) {
+          const orderRow = orderRows[0];
+          const [regs] = await pool.query<RowDataPacket[]>(
+            `SELECT r.public_uuid, r.registration_number, r.qr_code_token, r.status, r.total_cents,
+                    ec.name AS category_name, e.title AS event_title, e.slug AS event_slug,
+                    CONCAT(a.first_name, ' ', a.last_name) AS participant_label,
+                    a.email AS participant_email, r.guest_claim_token
+             FROM registrations r
+             JOIN event_categories ec ON ec.id = r.event_category_id
+             JOIN events e ON e.id = r.event_id
+             JOIN athletes a ON a.id = r.athlete_id
+             WHERE r.order_id = ? AND r.deleted_at IS NULL`,
+            [orderRow.id],
+          );
+          return res.json({
+            status: "complete",
+            order: formatGroupOrderResponse(
+              String(orderRow.public_uuid),
+              regs,
+              pay.event_title as string,
+              pay.event_slug as string,
+            ),
+            registration: regs[0] ?? null,
+            confirmationEmail: await athleteLoginEmail(athleteId),
+          });
+        }
+      }
+
+      if (pay.provider === "mock" && Number(pay.amount_cents) === 0) {
+        // Do not auto-finalize $0 — athlete must explicitly confirm in the wizard.
+        const resumedFree = await buildCheckoutResponseForPayment(payUuid, athleteId);
+        if (!resumedFree) {
+          return res.status(410).json({
+            status: "expired",
+            ...apiErrorJson(req, "checkout_expired"),
+          });
+        }
+        return res.json({ status: "checkout", checkout: resumedFree });
+      }
+
+      const confirmIsSim = Number(pay.is_simulation) === 1;
+      const confirmStripe = stripeClientForSimulation(confirmIsSim);
+      if (confirmStripe && pay.stripe_payment_intent_id) {
+        const pi = await confirmStripe.paymentIntents.retrieve(
+          pay.stripe_payment_intent_id as string,
+        );
+        if (pi.status === "succeeded") {
+          const result = await finalizeRegistrationAfterPayment(payUuid, pi);
+          if (result.success && (result.registration || result.order)) {
+            if (confirmIsSim && pay.event_id) {
+              await pool
+                .query(
+                  `UPDATE registrations SET is_simulation = 1 WHERE event_id = ? AND (payment_id = ? OR order_id IN (SELECT id FROM registration_orders WHERE payment_id = ?))`,
+                  [pay.event_id, pay.id, pay.id],
+                )
+                .catch(async () => {
+                  await pool.query(
+                    `UPDATE registrations SET is_simulation = 1 WHERE event_id = ? AND payment_id = ?`,
+                    [pay.event_id, pay.id],
+                  );
+                });
+              await pool
+                .query(
+                  `UPDATE registration_orders SET is_simulation = 1 WHERE payment_id = ?`,
+                  [pay.id],
+                )
+                .catch(() => undefined);
+              await bumpSimulationActivity(pool, Number(pay.event_id));
+            }
+            return res.json({
+              status: "complete",
+              registration: result.registration ?? null,
+              order: result.order,
+              confirmationEmail: await athleteLoginEmail(athleteId),
+            });
+          }
+          return res.status(402).json({
+            status: "failed",
+            error: result.error || "Payment captured but registration failed",
+          });
+        }
+      }
+
+      const resumed = await buildCheckoutResponseForPayment(payUuid, athleteId);
+      if (!resumed) {
+        return res.status(410).json({
+          status: "expired",
+          ...apiErrorJson(req, "checkout_expired"),
+        });
+      }
+
+      return res.json({ status: "checkout", checkout: resumed });
+    },
+  );
+
+  app.post(
+    "/api/events/:slug/register/confirm",
+    requireAthlete,
+    async (req: AuthedRequest, res) => {
+      const paymentPublicUuid = String(
+        req.body?.paymentPublicUuid ?? req.body?.registrationPublicUuid ?? "",
+      ).trim();
+      const paymentIntentId = req.body?.paymentIntentId
+        ? String(req.body.paymentIntentId)
+        : undefined;
+      const paymentMethodId = req.body?.paymentMethodId
+        ? String(req.body.paymentMethodId)
+        : undefined;
+
+      if (!paymentPublicUuid) {
+        return res.status(400).json(apiErrorJson(req, "payment_public_uuid_required"));
+      }
+
+      const [payProbe] = await pool.query<RowDataPacket[]>(
+        `SELECT provider, amount_cents, is_simulation FROM payments
+         WHERE public_uuid = ? AND athlete_id = ? LIMIT 1`,
+        [paymentPublicUuid, req.auth!.id],
+      );
+      const isZeroMock =
+        payProbe.length > 0 &&
+        payProbe[0].provider === "mock" &&
+        Number(payProbe[0].amount_cents) === 0;
+      const probeIsSim = Number(payProbe[0]?.is_simulation) === 1;
+
+      if (!isZeroMock && !isStripeReadyForSimulation(probeIsSim)) {
+        return res.status(503).json(apiErrorJson(req, "payment_unavailable"));
+      }
+
+      const result = await confirmRegistrationPayment(
+        paymentPublicUuid,
+        req.auth!.id,
+        paymentIntentId,
+        paymentMethodId,
+      );
+
+      if (!result.success || (!result.registration && !result.order)) {
+        const errCode =
+          result.code && result.code in API_ERROR_I18N_KEYS
+            ? (result.code as ApiErrorCode)
+            : null;
+        return res.status(402).json({
+          success: false,
+          error: errCode
+            ? apiErrorMessage(resolveRequestLocale(req), errCode)
+            : result.error ||
+              apiErrorMessage(resolveRequestLocale(req), "generic"),
+          ...(errCode ? { code: errCode } : {}),
+          ...(result.requiresAction
+            ? { requiresAction: true, clientSecret: result.clientSecret }
+            : {}),
+        });
+      }
+
+      const confirmationEmail = await athleteLoginEmail(req.auth!.id);
+      const payload: Record<string, unknown> = {
+        success: true,
+        confirmationEmail,
+      };
+      if (result.order) {
+        payload.order = result.order;
+      }
+      if (result.registration) {
+        const r = result.registration;
+        payload.registration = {
+          public_uuid: r.public_uuid,
+          registration_number: r.registration_number,
+          qr_code_token: r.qr_code_token,
+          status: r.status,
+          total_cents: r.total_cents,
+          category_name: r.category_name,
+          event_title: r.event_title,
+          event_slug: r.event_slug,
+        };
+      }
+      res.json(payload);
+    },
+  );
+}
+
+// ============================================================================
+// ROUTES — ATHLETE PORTAL
+// ============================================================================
+
+const ATHLETE_GENDER_VALUES = new Set([
+  "male",
+  "female",
+  "other",
+  "prefer_not_to_say",
+]);
+const ATHLETE_SHIRT_SIZE_VALUES = new Set(["XS", "S", "M", "L", "XL", "XXL"]);
+
+function parseAthleteProfileUpdate(body: Record<string, unknown>):
+  | { error: string; code: ApiErrorCode }
+  | {
+      data: {
+        first_name: string;
+        last_name: string;
+        phone: string | null;
+        date_of_birth: string | null;
+        gender: string | null;
+        shirt_size: string | null;
+        country: string;
+        city: string | null;
+        emergency_contact_name: string | null;
+        emergency_contact_phone: string | null;
+      };
+    } {
+  const first_name = String(body.first_name ?? "").trim();
+  const last_name = String(body.last_name ?? "").trim();
+  if (!first_name || first_name.length > 100) {
+    return { error: "first_name required (max 100 characters)", code: "first_name_required" as const };
+  }
+  if (!last_name || last_name.length > 100) {
+    return { error: "last_name required (max 100 characters)", code: "last_name_required" as const };
+  }
+
+  const phoneRaw = body.phone;
+  const phone =
+    phoneRaw === null || phoneRaw === undefined || phoneRaw === ""
+      ? null
+      : String(phoneRaw).trim();
+  if (phone && phone.length > 20) {
+    return { error: "phone max 20 characters", code: "phone_too_long" as const };
+  }
+
+  const dobRaw = body.date_of_birth;
+  const date_of_birth =
+    dobRaw === null || dobRaw === undefined || dobRaw === ""
+      ? null
+      : String(dobRaw).trim();
+  if (date_of_birth && !/^\d{4}-\d{2}-\d{2}$/.test(date_of_birth)) {
+    return { error: "date_of_birth must be YYYY-MM-DD", code: "date_of_birth_invalid" as const };
+  }
+
+  const genderRaw = body.gender;
+  const gender =
+    genderRaw === null || genderRaw === undefined || genderRaw === ""
+      ? null
+      : String(genderRaw);
+  if (gender && !ATHLETE_GENDER_VALUES.has(gender)) {
+    return { error: "invalid gender", code: "invalid_gender" as const };
+  }
+
+  const shirtRaw = body.shirt_size;
+  const shirt_size =
+    shirtRaw === null || shirtRaw === undefined || shirtRaw === ""
+      ? null
+      : String(shirtRaw);
+  if (shirt_size && !ATHLETE_SHIRT_SIZE_VALUES.has(shirt_size)) {
+    return { error: "invalid shirt_size", code: "invalid_shirt_size" as const };
+  }
+
+  const country = String(body.country ?? "MX")
+    .trim()
+    .toUpperCase()
+    .slice(0, 2);
+  if (!country) {
+    return { error: "country required", code: "country_required" as const };
+  }
+
+  const cityRaw = body.city;
+  const city =
+    cityRaw === null || cityRaw === undefined || cityRaw === ""
+      ? null
+      : String(cityRaw).trim();
+  if (city && city.length > 100) {
+    return { error: "city max 100 characters", code: "city_too_long" as const };
+  }
+
+  const ecNameRaw = body.emergency_contact_name;
+  const emergency_contact_name =
+    ecNameRaw === null || ecNameRaw === undefined || ecNameRaw === ""
+      ? null
+      : String(ecNameRaw).trim();
+  if (emergency_contact_name && emergency_contact_name.length > 200) {
+    return { error: "emergency_contact_name max 200 characters", code: "emergency_contact_name_too_long" as const };
+  }
+
+  const ecPhoneRaw = body.emergency_contact_phone;
+  const emergency_contact_phone =
+    ecPhoneRaw === null || ecPhoneRaw === undefined || ecPhoneRaw === ""
+      ? null
+      : String(ecPhoneRaw).trim();
+  if (emergency_contact_phone && emergency_contact_phone.length > 20) {
+    return { error: "emergency_contact_phone max 20 characters", code: "emergency_contact_phone_too_long" as const };
+  }
+
+  return {
+    data: {
+      first_name,
+      last_name,
+      phone,
+      date_of_birth,
+      gender,
+      shirt_size,
+      country,
+      city,
+      emergency_contact_name,
+      emergency_contact_phone,
+    },
+  };
+}
+
+function parseAvatarDataUrl(
+  image: unknown,
+): { error: string; code: ApiErrorCode } | { dataUrl: string } {
+  const raw = String(image ?? "").trim();
+  if (!raw.startsWith("data:image/")) {
+    return {
+      error: "image must be a data URL (jpeg, png, or webp)",
+      code: "invalid_avatar_data_url",
+    };
+  }
+
+  const match = raw.match(
+    /^data:image\/(jpeg|png|webp);base64,([A-Za-z0-9+/=]+)$/,
+  );
+  if (!match) {
+    return {
+      error: "invalid image format (jpeg, png, webp only)",
+      code: "invalid_avatar_format",
+    };
+  }
+
+  const buffer = Buffer.from(match[2], "base64");
+  if (buffer.length > 180 * 1024) {
+    return { error: "image too large (max 180KB)", code: "avatar_too_large" };
+  }
+  if (raw.length > 500_000) {
+    return {
+      error: "image payload too large",
+      code: "avatar_payload_too_large",
+    };
+  }
+
+  return { dataUrl: raw };
+}
+
+function parseStaffProfileUpdate(
+  body: Record<string, unknown>,
+): { error: string } | { updates: string[]; params: (string | null)[] } {
+  const updates: string[] = [];
+  const params: (string | null)[] = [];
+
+  if (body.first_name !== undefined) {
+    const first_name = String(body.first_name).trim();
+    if (!first_name) return { error: "first_name required" };
+    updates.push("first_name = ?");
+    params.push(first_name.slice(0, 100));
+  }
+  if (body.last_name !== undefined) {
+    const last_name = String(body.last_name).trim();
+    if (!last_name) return { error: "last_name required" };
+    updates.push("last_name = ?");
+    params.push(last_name.slice(0, 100));
+  }
+  if (body.phone !== undefined) {
+    const phoneRaw = body.phone == null ? "" : String(body.phone).trim();
+    updates.push("phone = ?");
+    params.push(phoneRaw ? phoneRaw.slice(0, 20) : null);
+  }
+  if (body.preferred_language !== undefined) {
+    updates.push("preferred_language = ?");
+    params.push(normalizeLocale(String(body.preferred_language)));
+  }
+  if (body.preferred_theme !== undefined) {
+    updates.push("preferred_theme = ?");
+    params.push(normalizeTheme(String(body.preferred_theme)));
+  }
+
+  if (updates.length === 0) {
+    return { error: "No fields to update" };
+  }
+  return { updates, params };
+}
+
+function registerAthleteRoutes(app: express.Express) {
+  app.get(
+    "/api/athlete/me",
+    requireAthlete,
+    async (req: AuthedRequest, res) => {
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT id, public_uuid, email, phone, first_name, last_name, date_of_birth, gender,
+              shirt_size, country, city, emergency_contact_name, emergency_contact_phone,
+              avatar_url, preferred_language, preferred_theme, created_at
+       FROM athletes WHERE id = ? AND deleted_at IS NULL LIMIT 1`,
+        [req.auth!.id],
+      );
+      if (rows.length === 0) {
+        return res.status(404).json(apiErrorJson(req, "athlete_not_found"));
+      }
+      res.json({ athlete: serializeAthleteRow(rows[0]) });
+    },
+  );
+
+  app.patch(
+    "/api/athlete/me",
+    requireAthlete,
+    async (req: AuthedRequest, res) => {
+      const parsed = parseAthleteProfileUpdate(
+        (req.body ?? {}) as Record<string, unknown>,
+      );
+      if ("error" in parsed) {
+        return res.status(400).json(apiErrorJson(req, parsed.code));
+      }
+
+      const { data } = parsed;
+
+      if (data.phone) {
+        const [phoneRows] = await pool.query<RowDataPacket[]>(
+          `SELECT id FROM athletes
+           WHERE phone = ? AND id <> ? AND deleted_at IS NULL LIMIT 1`,
+          [data.phone, req.auth!.id],
+        );
+        if (phoneRows.length > 0) {
+          return res.status(409).json(apiErrorJson(req, "phone_in_use"));
+        }
+      }
+
+      await pool.query<ResultSetHeader>(
+        `UPDATE athletes SET
+           first_name = ?, last_name = ?, phone = ?, date_of_birth = ?,
+           gender = ?, shirt_size = ?, country = ?, city = ?,
+           emergency_contact_name = ?, emergency_contact_phone = ?
+         WHERE id = ? AND deleted_at IS NULL`,
+        [
+          data.first_name,
+          data.last_name,
+          data.phone,
+          data.date_of_birth,
+          data.gender,
+          data.shirt_size,
+          data.country,
+          data.city,
+          data.emergency_contact_name,
+          data.emergency_contact_phone,
+          req.auth!.id,
+        ],
+      );
+
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT id, public_uuid, email, phone, first_name, last_name, date_of_birth, gender,
+                shirt_size, country, city, emergency_contact_name, emergency_contact_phone,
+                avatar_url, preferred_language, preferred_theme, created_at
+         FROM athletes WHERE id = ? AND deleted_at IS NULL LIMIT 1`,
+        [req.auth!.id],
+      );
+      if (rows.length === 0) {
+        return res.status(404).json(apiErrorJson(req, "athlete_not_found"));
+      }
+      res.json({ ok: true, athlete: serializeAthleteRow(rows[0]) });
+    },
+  );
+
+  app.patch(
+    "/api/athlete/preferences",
+    requireAthlete,
+    async (req: AuthedRequest, res) => {
+      const locale =
+        req.body?.preferred_language !== undefined
+          ? normalizeLocale(String(req.body.preferred_language))
+          : null;
+      const theme =
+        req.body?.preferred_theme !== undefined
+          ? normalizeTheme(String(req.body.preferred_theme))
+          : null;
+      if (!locale && !theme) {
+        return res.status(400).json({
+          ...apiErrorJson(req, "preferred_language_or_theme_required"),
+        });
+      }
+      const updates: string[] = [];
+      const params: string[] = [];
+      if (locale) {
+        updates.push("preferred_language = ?");
+        params.push(locale);
+      }
+      if (theme) {
+        updates.push("preferred_theme = ?");
+        params.push(theme);
+      }
+      params.push(String(req.auth!.id));
+      await pool.query<ResultSetHeader>(
+        `UPDATE athletes SET ${updates.join(", ")} WHERE id = ?`,
+        params,
+      );
+      res.json({
+        ok: true,
+        ...(locale ? { preferred_language: locale } : {}),
+        ...(theme ? { preferred_theme: theme } : {}),
+      });
+    },
+  );
+
+  app.get(
+    "/api/athlete/registrations",
+    requireAthlete,
+    async (req: AuthedRequest, res) => {
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT r.id, r.public_uuid, r.registration_number, r.qr_code_token, r.bib_number, r.status,
+                r.total_cents, r.created_at, r.waiver_signed_at, r.order_id, r.purchaser_athlete_id,
+                r.guest_claim_token, r.athlete_id,
+                e.title AS event_title, e.slug AS event_slug, e.start_date, e.allows_transfers,
+                e.requires_waiver,
+                ec.name AS category_name
+         FROM registrations r
+         JOIN events e ON e.id = r.event_id AND e.deleted_at IS NULL
+         JOIN event_categories ec ON ec.id = r.event_category_id
+         WHERE r.athlete_id = ? AND r.deleted_at IS NULL AND r.status = 'confirmed'
+           AND COALESCE(r.is_simulation, 0) = 0
+         ORDER BY r.created_at DESC`,
+        [req.auth!.id],
+      );
+
+      const registrations = await Promise.all(
+        rows.map(async (row) => {
+          let waiver_outdated = false;
+          if (Boolean(row.requires_waiver)) {
+            const status = await getRegistrationWaiverStatus(
+              pool,
+              row.id as number,
+            );
+            waiver_outdated = status.outdated;
+          }
+          const {
+            requires_waiver,
+            guest_claim_token,
+            purchaser_athlete_id,
+            athlete_id,
+            ...rest
+          } = row;
+          const claimPending = Boolean(guest_claim_token);
+          const isManaged =
+            purchaser_athlete_id != null &&
+            Number(purchaser_athlete_id) !== Number(athlete_id) &&
+            !claimPending;
+          return {
+            ...rest,
+            waiver_outdated,
+            is_order_purchaser:
+              Number(purchaser_athlete_id) === Number(req.auth!.id),
+            guest_claim_pending: claimPending,
+            is_managed_participant: isManaged,
+          };
+        }),
+      );
+
+      res.json({ registrations });
+    },
+  );
+
+  app.get(
+    "/api/athlete/order-wallets",
+    requireAthlete,
+    async (req: AuthedRequest, res) => {
+      const athleteId = req.auth!.id;
+      const [orderRows] = await pool.query<RowDataPacket[]>(
+        `SELECT ro.id AS order_id, ro.public_uuid AS order_public_uuid, ro.item_count,
+                e.title AS event_title, e.slug AS event_slug, e.start_date
+         FROM registration_orders ro
+         JOIN events e ON e.id = ro.event_id AND e.deleted_at IS NULL
+         WHERE ro.purchaser_athlete_id = ? AND ro.status = 'confirmed'
+           AND COALESCE(ro.is_simulation, 0) = 0
+           AND COALESCE(e.is_simulation, 0) = 0
+         ORDER BY ro.created_at DESC
+         LIMIT 50`,
+        [athleteId],
+      );
+
+      const wallets = [];
+      for (const order of orderRows) {
+        const [passes] = await pool.query<RowDataPacket[]>(
+          `SELECT r.id, r.public_uuid, r.registration_number, r.qr_code_token, r.bib_number, r.status,
+                  r.guest_claim_token, r.purchaser_athlete_id, r.athlete_id,
+                  ec.name AS category_name,
+                  CONCAT(a.first_name, ' ', a.last_name) AS participant_label,
+                  a.email AS participant_email
+           FROM registrations r
+           JOIN event_categories ec ON ec.id = r.event_category_id
+           JOIN athletes a ON a.id = r.athlete_id AND a.deleted_at IS NULL
+           WHERE r.order_id = ? AND r.deleted_at IS NULL AND r.status = 'confirmed'
+           ORDER BY r.id ASC`,
+          [order.order_id],
+        );
+        const mapped = passes
+          .map((p) => {
+            const claimPending = Boolean(p.guest_claim_token);
+            const managed =
+              p.purchaser_athlete_id != null &&
+              Number(p.purchaser_athlete_id) !== Number(p.athlete_id) &&
+              !claimPending;
+            const held = claimPending || managed;
+            if (!held) return null;
+            return {
+              id: p.id,
+              public_uuid: p.public_uuid,
+              registration_number: p.registration_number,
+              qr_code_token: p.qr_code_token,
+              bib_number: p.bib_number,
+              status: p.status,
+              category_name: p.category_name,
+              participant_label: p.participant_label,
+              participant_email: p.participant_email,
+              guest_claim_pending: claimPending,
+              is_managed_participant: managed,
+              wallet_held_by_purchaser: true,
+            };
+          })
+          .filter(Boolean);
+        if (mapped.length === 0) continue;
+        wallets.push({
+          order_id: order.order_id,
+          order_public_uuid: order.order_public_uuid,
+          event_title: order.event_title,
+          event_slug: order.event_slug,
+          start_date: order.start_date,
+          item_count: order.item_count,
+          passes: mapped,
+        });
+      }
+
+      res.json({ wallets });
+    },
+  );
+
+  app.post(
+    "/api/athlete/registrations/claim-guest",
+    requireAthlete,
+    async (req: AuthedRequest, res) => {
+      const claimToken = String(req.body?.claimToken ?? "").trim();
+      const result = await claimGuestRegistration(
+        pool,
+        req.auth!.id,
+        claimToken,
+      );
+      if (result.ok === false) {
+        return res.status(result.error.status).json(result.error.body);
+      }
+      res.json({ success: true, registration: result.registration });
+    },
+  );
+
+  app.get(
+    "/api/athlete/registrations/:publicUuid/waivers",
+    requireAthlete,
+    async (req: AuthedRequest, res) => {
+      const publicUuid = String(req.params.publicUuid).trim();
+      const [regRows] = await pool.query<RowDataPacket[]>(
+        `SELECT r.id, r.event_id, r.status, e.requires_waiver, e.slug AS event_slug
+         FROM registrations r
+         JOIN events e ON e.id = r.event_id AND e.deleted_at IS NULL
+         WHERE r.public_uuid = ? AND r.athlete_id = ? AND r.deleted_at IS NULL LIMIT 1`,
+        [publicUuid, req.auth!.id],
+      );
+      if (regRows.length === 0) {
+        return res.status(404).json(apiErrorJson(req, "registration_not_found"));
+      }
+      const reg = regRows[0];
+      if (reg.status !== "confirmed") {
+        return res.status(400).json(apiErrorJson(req, "registration_not_confirmed"));
+      }
+      if (!Boolean(reg.requires_waiver)) {
+        return res.json({
+          requiresResign: false,
+          waivers: [],
+          waiverStatus: { signed: true, outdated: false, outdatedWaivers: [] },
+        });
+      }
+
+      const waiverStatus = await getRegistrationWaiverStatus(
+        pool,
+        reg.id as number,
+      );
+      const waivers = await fetchApplicableWaiversForRegistration(
+        pool,
+        reg.id as number,
+      );
+
+      res.json({
+        requiresResign: waiverStatus.outdated,
+        waivers,
+        waiverStatus,
+      });
+    },
+  );
+
+  app.post(
+    "/api/athlete/registrations/:publicUuid/waivers/resign",
+    requireAthlete,
+    async (req: AuthedRequest, res) => {
+      const publicUuid = String(req.params.publicUuid).trim();
+      const signatures = parseWaiverSignatures(req.body);
+      if (!signatures) {
+        return res.status(400).json(apiErrorJson(req, "waiver_required"));
+      }
+
+      const [regRows] = await pool.query<RowDataPacket[]>(
+        `SELECT r.id, r.event_id, r.event_category_id, r.status, r.registration_number,
+                e.requires_waiver, e.start_date, e.title AS event_title,
+                a.date_of_birth, a.email AS athlete_email, a.first_name AS athlete_first_name,
+                a.last_name AS athlete_last_name, a.preferred_language,
+                ec.name AS category_name,
+                o.name AS organizer_name
+         FROM registrations r
+         JOIN events e ON e.id = r.event_id AND e.deleted_at IS NULL
+         JOIN athletes a ON a.id = r.athlete_id AND a.deleted_at IS NULL
+         JOIN event_categories ec ON ec.id = r.event_category_id
+         JOIN organizers o ON o.id = e.organizer_id
+         WHERE r.public_uuid = ? AND r.athlete_id = ? AND r.deleted_at IS NULL LIMIT 1`,
+        [publicUuid, req.auth!.id],
+      );
+      if (regRows.length === 0) {
+        return res.status(404).json(apiErrorJson(req, "registration_not_found"));
+      }
+      const reg = regRows[0];
+
+      const validation = await validateWaiverSignaturesForEvent(
+        pool,
+        reg.event_id as number,
+        signatures,
+        {
+          categoryId: Number(reg.event_category_id),
+          dateOfBirth: reg.date_of_birth ?? null,
+          eventStartDate: reg.start_date ?? null,
+        },
+      );
+      if ("error" in validation) {
+        return res.status(400).json({ error: validation.error });
+      }
+
+      const result = await resignRegistrationWaivers(
+        pool,
+        reg.id as number,
+        signatures,
+        {
+          clientIp: req.ip?.slice(0, 45),
+          userAgent: String(req.headers["user-agent"] ?? "").slice(0, 500),
+          deviceInfo: String(req.headers["user-agent"] ?? "").slice(0, 255),
+        },
+      );
+      if ("error" in result) {
+        return res.status(400).json({ error: result.error });
+      }
+
+      const locale = resolveLocale(reg.preferred_language as string | undefined);
+      const athleteFullName = [reg.athlete_first_name, reg.athlete_last_name]
+        .map((p) => String(p ?? "").trim())
+        .filter(Boolean)
+        .join(" ");
+      let stamped: Awaited<ReturnType<typeof stampRegistrationWaiverAcceptancePdfs>> =
+        [];
+      try {
+        stamped = await stampRegistrationWaiverAcceptancePdfs(pool, reg.id as number, {
+          locale: locale === "en" ? "en" : "es",
+          athleteFullName:
+            athleteFullName || String(reg.athlete_first_name || "Athlete"),
+          eventTitle: String(reg.event_title),
+          categoryName: String(reg.category_name),
+          registrationNumber: String(reg.registration_number),
+          organizerName: reg.organizer_name ? String(reg.organizer_name) : null,
+          clientIp: req.ip?.slice(0, 45) ?? null,
+        });
+      } catch (err) {
+        console.error("[waiver:resign-stamp]", { registrationId: reg.id, err });
+      }
+
+      const athleteEmail = String(reg.athlete_email ?? "").trim();
+      if (athleteEmail && stamped.length > 0) {
+        try {
+          const [titleRows] = await pool.query<RowDataPacket[]>(
+            `SELECT ew.title
+             FROM registration_waiver_signatures rws
+             JOIN event_waivers ew ON ew.id = rws.waiver_id
+             WHERE rws.registration_id = ?
+               AND (rws.signature_data IS NULL OR rws.signature_data NOT LIKE 'WAIVED_BY_STAFF%')
+             ORDER BY ew.sort_order ASC, ew.id ASC`,
+            [reg.id],
+          );
+          const mail = buildWaiverAcceptanceUpdatedEmail({
+            locale,
+            firstName: String(reg.athlete_first_name || "Atleta"),
+            eventTitle: String(reg.event_title),
+            categoryName: String(reg.category_name),
+            registrationNumber: String(reg.registration_number),
+            appUrl: APP_URL,
+            acceptedWaiverTitles: titleRows.map((w) => String(w.title)),
+            waiverAcceptanceAttached: true,
+            organizerName: reg.organizer_name ? String(reg.organizer_name) : null,
+          });
+          await sendEmail({
+            to: athleteEmail,
+            subject: mail.subject,
+            html: mail.html,
+            text: mail.text,
+            attachments: stamped.map((s) => ({
+              filename: s.filename,
+              content: s.bytes,
+              contentType: "application/pdf",
+            })),
+          });
+        } catch (err) {
+          console.error("[waiver:resign-email]", { registrationId: reg.id, err });
+        }
+      }
+
+      res.json({ ok: true, acceptancePdfsAttached: stamped.length });
+    },
+  );
+
+  app.get(
+    "/api/athlete/pending-checkout",
+    requireAthlete,
+    async (req: AuthedRequest, res) => {
+      const eventSlug = req.query.eventSlug
+        ? String(req.query.eventSlug)
+        : null;
+      const sql = eventSlug
+        ? `SELECT p.public_uuid, p.amount_cents, p.currency, p.status, p.created_at,
+                  p.metadata_json, e.title AS event_title, e.slug AS event_slug
+           FROM payments p
+           JOIN events e ON e.id = p.event_id
+           WHERE p.athlete_id = ? AND p.registration_id IS NULL
+             AND p.status IN ('pending', 'processing', 'succeeded')
+             AND e.slug = ?
+           ORDER BY p.created_at DESC LIMIT 1`
+        : `SELECT p.public_uuid, p.amount_cents, p.currency, p.status, p.created_at,
+                  p.metadata_json, e.title AS event_title, e.slug AS event_slug
+           FROM payments p
+           JOIN events e ON e.id = p.event_id
+           WHERE p.athlete_id = ? AND p.registration_id IS NULL
+             AND p.status IN ('pending', 'processing', 'succeeded')
+           ORDER BY p.created_at DESC LIMIT 5`;
+      const params = eventSlug ? [req.auth!.id, eventSlug] : [req.auth!.id];
+      const [rows] = await pool.query<RowDataPacket[]>(sql, params);
+      const pending = rows.map((row) => {
+        const meta = parseCheckoutPaymentMetadata(
+          typeof row.metadata_json === "string"
+            ? JSON.parse(row.metadata_json as string)
+            : row.metadata_json,
+        );
+        return {
+          public_uuid: row.public_uuid,
+          amount_cents: row.amount_cents,
+          currency: row.currency,
+          status: row.status,
+          created_at: row.created_at,
+          event_title: row.event_title,
+          event_slug: row.event_slug,
+          category_name: meta?.categoryName ?? null,
+          category_id: meta?.categoryId ?? null,
+        };
+      });
+      res.json({ pending });
+    },
+  );
+
+  app.get(
+    "/api/athlete/waitlist",
+    requireAthlete,
+    async (req: AuthedRequest, res) => {
+      await expireStaleWaitlistOffers(pool);
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT w.id, w.event_id, w.event_category_id, w.status, w.position,
+                w.offered_at, w.offer_expires_at, w.created_at,
+                e.title AS event_title, e.slug AS event_slug,
+                ec.name AS category_name,
+                (w.status = 'offered' AND (w.offer_expires_at IS NULL OR w.offer_expires_at > NOW())) AS can_claim
+         FROM waitlist_entries w
+         JOIN events e ON e.id = w.event_id AND e.deleted_at IS NULL
+         JOIN event_categories ec ON ec.id = w.event_category_id
+         WHERE w.athlete_id = ?
+           AND w.status IN ('waiting', 'offered')
+         ORDER BY w.created_at DESC`,
+        [req.auth!.id],
+      );
+      res.json({
+        entries: rows.map((r) => ({
+          ...r,
+          can_claim: Boolean(r.can_claim),
+        })),
+      });
+    },
+  );
+
+  app.post(
+    "/api/athlete/registrations/:publicUuid/transfer",
+    requireAthlete,
+    async (req: AuthedRequest, res) => {
+      const publicUuid = String(req.params.publicUuid).trim();
+      const recipientEmail = String(req.body?.recipientEmail ?? "")
+        .trim()
+        .toLowerCase();
+      const fromAthleteId = req.auth!.id;
+
+      if (!publicUuid) {
+        return res.status(400).json(apiErrorJson(req, "registration_id_required"));
+      }
+      if (!recipientEmail || !recipientEmail.includes("@")) {
+        return res.status(400).json(apiErrorJson(req, "valid_recipient_email_required"));
+      }
+
+      const [regRows] = await pool.query<RowDataPacket[]>(
+        `SELECT r.id, r.athlete_id, r.status, r.event_id,
+                e.allows_transfers, e.transfer_fee_cents, e.title AS event_title
+         FROM registrations r
+         JOIN events e ON e.id = r.event_id AND e.deleted_at IS NULL
+         WHERE r.public_uuid = ? AND r.deleted_at IS NULL LIMIT 1`,
+        [publicUuid],
+      );
+      if (regRows.length === 0) {
+        return res.status(404).json(apiErrorJson(req, "registration_not_found"));
+      }
+      const reg = regRows[0];
+
+      if (Number(reg.athlete_id) !== fromAthleteId) {
+        return res.status(403).json(apiErrorJson(req, "not_your_registration"));
+      }
+      if (reg.status !== "confirmed") {
+        return res
+          .status(400)
+          .json(apiErrorJson(req, "registration_not_confirmed"));
+      }
+      if (!Boolean(reg.allows_transfers)) {
+        return res
+          .status(400)
+          .json(apiErrorJson(req, "transfers_not_allowed"));
+      }
+
+      const [toRows] = await pool.query<RowDataPacket[]>(
+        `SELECT id, email FROM athletes
+         WHERE LOWER(email) = ? AND status = 'active' AND deleted_at IS NULL LIMIT 1`,
+        [recipientEmail],
+      );
+      if (toRows.length === 0) {
+        return res.status(404).json(apiErrorJson(req, "recipient_athlete_not_found"));
+      }
+      const toAthleteId = Number(toRows[0].id);
+      if (toAthleteId === fromAthleteId) {
+        return res.status(400).json(apiErrorJson(req, "cannot_transfer_to_self"));
+      }
+
+      const [dupReg] = await pool.query<RowDataPacket[]>(
+        `SELECT id FROM registrations
+         WHERE event_id = ? AND athlete_id = ? AND status = 'confirmed'
+           AND deleted_at IS NULL LIMIT 1`,
+        [reg.event_id, toAthleteId],
+      );
+      if (dupReg.length > 0) {
+        return res
+          .status(409)
+          .json(apiErrorJson(req, "recipient_already_registered"));
+      }
+
+      const transferFeeCents = Number(reg.transfer_fee_cents ?? 0);
+      const conn = await pool.getConnection();
+      try {
+        await conn.beginTransaction();
+
+        const [transferResult] = await conn.query<ResultSetHeader>(
+          `INSERT INTO registration_transfers (
+             registration_id, from_athlete_id, to_athlete_id, transfer_fee_cents, status, completed_at
+           ) VALUES (?,?,?,?,?,NOW())`,
+          [reg.id, fromAthleteId, toAthleteId, transferFeeCents, "completed"],
+        );
+
+        await conn.query<ResultSetHeader>(
+          `UPDATE registrations SET athlete_id = ?, source = 'transfer' WHERE id = ?`,
+          [toAthleteId, reg.id],
+        );
+
+        await conn.commit();
+
+        res.json({
+          ok: true,
+          transfer: {
+            id: transferResult.insertId,
+            registration_id: reg.id,
+            status: "completed",
+            completed_at: new Date().toISOString(),
+          },
+        });
+      } catch (err) {
+        await conn.rollback();
+        throw err;
+      } finally {
+        conn.release();
+      }
+    },
+  );
+
+  app.get(
+    "/api/athlete/results",
+    requireAthlete,
+    async (req: AuthedRequest, res) => {
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT er.id, er.overall_rank, er.category_rank, er.gender_rank,
+                er.finish_time_ms, er.pace_per_km_ms, er.status, er.published_at,
+                e.title AS event_title, e.slug AS event_slug, e.start_date,
+                ec.name AS category_name,
+                r.registration_number, r.bib_number
+         FROM event_results er
+         JOIN registrations r ON r.id = er.registration_id AND r.deleted_at IS NULL
+         JOIN events e ON e.id = er.event_id AND e.deleted_at IS NULL
+         JOIN event_categories ec ON ec.id = er.event_category_id
+         WHERE r.athlete_id = ? AND er.published_at IS NOT NULL
+         ORDER BY er.published_at DESC, e.start_date DESC`,
+        [req.auth!.id],
+      );
+
+      const results = [];
+      for (const row of rows) {
+        const [splits] = await pool.query<RowDataPacket[]>(
+          `SELECT id, split_name, split_order, distance_km, elapsed_ms, pace_per_km_ms
+           FROM result_splits WHERE result_id = ? ORDER BY split_order ASC, id ASC`,
+          [row.id],
+        );
+        results.push({ ...row, splits });
+      }
+      res.json({ results });
+    },
+  );
+
+  app.get(
+    "/api/athlete/results/:resultId/visualization",
+    requireAthlete,
+    async (req: AuthedRequest, res) => {
+      const resultId = Number(req.params.resultId);
+      if (!Number.isFinite(resultId)) {
+        return res.status(400).json(apiErrorJson(req, "invalid_result_id"));
+      }
+
+      const [resultRows] = await pool.query<RowDataPacket[]>(
+        `SELECT er.id, er.finish_time_ms, er.event_id, e.slug AS event_slug
+         FROM event_results er
+         JOIN registrations r ON r.id = er.registration_id AND r.deleted_at IS NULL
+         JOIN events e ON e.id = er.event_id AND e.deleted_at IS NULL
+         WHERE er.id = ? AND r.athlete_id = ? AND er.published_at IS NOT NULL LIMIT 1`,
+        [resultId, req.auth!.id],
+      );
+      if (resultRows.length === 0) {
+        return res.status(404).json(apiErrorJson(req, "result_not_found"));
+      }
+      const result = resultRows[0];
+
+      const [splitRows] = await pool.query<RowDataPacket[]>(
+        `SELECT id, split_name, split_order, distance_km, elapsed_ms, pace_per_km_ms
+         FROM result_splits WHERE result_id = ? ORDER BY split_order ASC, id ASC`,
+        [resultId],
+      );
+
+      const [courseRows] = await pool.query<RowDataPacket[]>(
+        `SELECT route_geojson, points_json, distance_km, elevation_gain_m, elevation_profile_json
+         FROM event_courses WHERE event_id = ? LIMIT 1`,
+        [result.event_id],
+      );
+      const courseRow = courseRows[0];
+      let course = null;
+      if (courseRow) {
+        course = normalizeEventCourse({
+          routeGeojson:
+            typeof courseRow.route_geojson === "string"
+              ? JSON.parse(courseRow.route_geojson as string)
+              : courseRow.route_geojson,
+          points:
+            typeof courseRow.points_json === "string"
+              ? JSON.parse(courseRow.points_json as string)
+              : courseRow.points_json,
+          distanceKm: courseRow.distance_km,
+          elevationGainM: courseRow.elevation_gain_m,
+          elevationProfile: parseElevationProfile(
+            courseRow.elevation_profile_json,
+          ),
+        });
+      }
+
+      const totalKm = Number(
+        course?.distanceKm ?? splitRows[splitRows.length - 1]?.distance_km ?? 0,
+      );
+      const paceSegments = buildServerPaceSegments(splitRows, totalKm);
+
+      res.json({
+        resultId,
+        finishTimeMs: result.finish_time_ms,
+        splits: splitRows,
+        course,
+        paceSegments,
+      });
+    },
+  );
+
+  app.post(
+    "/api/athlete/avatar",
+    requireAthlete,
+    async (req: AuthedRequest, res) => {
+      const parsed = parseAvatarDataUrl(req.body?.image);
+      if ("error" in parsed) {
+        return res.status(400).json(apiErrorJson(req, parsed.code));
+      }
+
+      await pool.query<ResultSetHeader>(
+        "UPDATE athletes SET avatar_url = ? WHERE id = ? AND deleted_at IS NULL",
+        [parsed.dataUrl, req.auth!.id],
+      );
+
+      res.json({ ok: true, avatar_url: parsed.dataUrl });
+    },
+  );
+
+  app.delete(
+    "/api/athlete/avatar",
+    requireAthlete,
+    async (req: AuthedRequest, res) => {
+      await pool.query<ResultSetHeader>(
+        "UPDATE athletes SET avatar_url = NULL WHERE id = ? AND deleted_at IS NULL",
+        [req.auth!.id],
+      );
+      res.json({ ok: true, avatar_url: null });
+    },
+  );
+
+  app.get(
+    "/api/athlete/payment-methods",
+    requireAthlete,
+    async (req: AuthedRequest, res) => {
+      if (!isStripeConfigured() || !getStripeClient()) {
+        return res.status(503).json(apiErrorJson(req, "payment_unavailable"));
+      }
+
+      const customerId = await ensureStripeCustomer(req.auth!.id);
+      if (!customerId) {
+        return res
+          .status(500)
+          .json({ error: "Could not create Stripe customer" });
+      }
+
+      const { paymentMethods, defaultPaymentMethodId } =
+        await listAthleteStripePaymentMethods(customerId);
+      res.json({ paymentMethods, defaultPaymentMethodId });
+    },
+  );
+
+  app.post(
+    "/api/athlete/payment-methods/setup-intent",
+    requireAthlete,
+    async (req: AuthedRequest, res) => {
+      if (!isStripeConfigured() || !getStripeClient()) {
+        return res.status(503).json(apiErrorJson(req, "payment_unavailable"));
+      }
+
+      const customerId = await ensureStripeCustomer(req.auth!.id);
+      if (!customerId) {
+        return res
+          .status(500)
+          .json({ error: "Could not create Stripe customer" });
+      }
+
+      const setupIntent = await getStripeClient()!.setupIntents.create({
+        customer: customerId,
+        payment_method_types: ["card"],
+        usage: "off_session",
+      });
+
+      res.json({
+        clientSecret: setupIntent.client_secret,
+      });
+    },
+  );
+
+  app.post(
+    "/api/athlete/payment-methods/complete-setup",
+    requireAthlete,
+    async (req: AuthedRequest, res) => {
+      const setupIntentId = String(req.body?.setupIntentId ?? "").trim();
+      const setAsDefault = req.body?.setAsDefault !== false;
+
+      if (!setupIntentId) {
+        return res.status(400).json({ error: "setupIntentId required" });
+      }
+      if (!isStripeConfigured() || !getStripeClient()) {
+        return res.status(503).json(apiErrorJson(req, "stripe_not_configured"));
+      }
+
+      const customerId = await ensureStripeCustomer(req.auth!.id);
+      if (!customerId) {
+        return res
+          .status(500)
+          .json({ error: "Could not resolve Stripe customer" });
+      }
+
+      const setupIntent =
+        await getStripeClient()!.setupIntents.retrieve(setupIntentId);
+      if (setupIntent.status !== "succeeded") {
+        return res.status(400).json(apiErrorJson(req, "setup_not_completed"));
+      }
+      if (setupIntent.customer !== customerId) {
+        return res.status(403).json({ error: "Invalid setup intent" });
+      }
+
+      const paymentMethodId =
+        typeof setupIntent.payment_method === "string"
+          ? setupIntent.payment_method
+          : setupIntent.payment_method?.id;
+
+      if (!paymentMethodId) {
+        return res
+          .status(400)
+          .json({ error: "No payment method on setup intent" });
+      }
+
+      const { paymentMethods, defaultPaymentMethodId } =
+        await listAthleteStripePaymentMethods(customerId);
+      const shouldSetDefault =
+        setAsDefault || paymentMethods.length <= 1 || !defaultPaymentMethodId;
+
+      if (shouldSetDefault) {
+        await setAthleteDefaultPaymentMethod(
+          req.auth!.id,
+          customerId,
+          paymentMethodId,
+        );
+      }
+
+      const updated = await listAthleteStripePaymentMethods(customerId);
+      res.json(updated);
+    },
+  );
+
+  app.patch(
+    "/api/athlete/payment-methods/default",
+    requireAthlete,
+    async (req: AuthedRequest, res) => {
+      const paymentMethodId = String(req.body?.paymentMethodId ?? "").trim();
+      if (!paymentMethodId) {
+        return res.status(400).json({ error: "paymentMethodId required" });
+      }
+      if (!isStripeConfigured() || !getStripeClient()) {
+        return res.status(503).json(apiErrorJson(req, "stripe_not_configured"));
+      }
+
+      const customerId = await ensureStripeCustomer(req.auth!.id);
+      if (!customerId) {
+        return res
+          .status(500)
+          .json({ error: "Could not resolve Stripe customer" });
+      }
+
+      try {
+        await setAthleteDefaultPaymentMethod(
+          req.auth!.id,
+          customerId,
+          paymentMethodId,
+        );
+      } catch (err) {
+        return res.status(400).json({
+          error: err instanceof Error ? err.message : "Invalid payment method",
+        });
+      }
+
+      const updated = await listAthleteStripePaymentMethods(customerId);
+      res.json(updated);
+    },
+  );
+
+  app.delete(
+    "/api/athlete/payment-methods/:paymentMethodId",
+    requireAthlete,
+    async (req: AuthedRequest, res) => {
+      const paymentMethodId = String(req.params.paymentMethodId ?? "").trim();
+      if (!paymentMethodId) {
+        return res.status(400).json({ error: "paymentMethodId required" });
+      }
+      if (!isStripeConfigured() || !getStripeClient()) {
+        return res.status(503).json(apiErrorJson(req, "stripe_not_configured"));
+      }
+
+      const customerId = await ensureStripeCustomer(req.auth!.id);
+      if (!customerId) {
+        return res
+          .status(500)
+          .json({ error: "Could not resolve Stripe customer" });
+      }
+
+      try {
+        await detachAthletePaymentMethod(customerId, paymentMethodId);
+      } catch (err) {
+        return res.status(400).json({
+          error: err instanceof Error ? err.message : "Could not remove card",
+        });
+      }
+
+      const updated = await listAthleteStripePaymentMethods(customerId);
+      res.json(updated);
+    },
+  );
+}
+
+// ============================================================================
+// ROUTES — ORGANIZER PORTAL
+// ============================================================================
+
+function registerOrganizerRoutes(app: express.Express) {
+  app.get(
+    "/api/organizer/events",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json(apiErrorJson(req, "organizer_context_missing"));
+      }
+      const result = await listOrganizerMemberEventsPaginated(
+        pool,
+        req.auth!.id,
+        organizerId,
+        {
+          q: String(req.query.q ?? "").trim() || undefined,
+          status: String(req.query.status ?? "").trim() || undefined,
+          simulation: parseSimulationListFilter(req.query.simulation),
+          page: req.query.page,
+          limit: req.query.limit,
+          sortBy: req.query.sortBy,
+          sortDir: req.query.sortDir,
+        },
+      );
+      const events = await enrichStaffEventsWithPaymentAvailability(
+        pool,
+        result.events,
+        getStripeClient(),
+      );
+      res.json({ events, pagination: result.pagination });
+    },
+  );
+
+  app.get(
+    "/api/organizer/registrations",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json(apiErrorJson(req, "organizer_context_missing"));
+      }
+
+      const eventIdRaw = req.query.eventId;
+      const eventId =
+        eventIdRaw != null && String(eventIdRaw).trim() !== ""
+          ? Number(eventIdRaw)
+          : undefined;
+      if (eventId != null && !Number.isFinite(eventId)) {
+        return res.status(400).json({ error: "Invalid eventId" });
+      }
+
+      const q = String(req.query.q ?? "").trim();
+      const result = await listStaffRegistrations(pool, {
+        organizerId,
+        eventId,
+        q: q || undefined,
+        page: req.query.page,
+        limit: req.query.limit,
+        sortBy: req.query.sortBy,
+        sortDir: req.query.sortDir,
+      });
+      res.json(result);
+    },
+  );
+
+  app.patch(
+    "/api/organizer/preferences",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const locale =
+        req.body?.preferred_language !== undefined
+          ? normalizeLocale(String(req.body.preferred_language))
+          : null;
+      const theme =
+        req.body?.preferred_theme !== undefined
+          ? normalizeTheme(String(req.body.preferred_theme))
+          : null;
+      if (!locale && !theme) {
+        return res.status(400).json({
+          ...apiErrorJson(req, "preferred_language_or_theme_required"),
+        });
+      }
+      const updates: string[] = [];
+      const params: string[] = [];
+      if (locale) {
+        updates.push("preferred_language = ?");
+        params.push(locale);
+      }
+      if (theme) {
+        updates.push("preferred_theme = ?");
+        params.push(theme);
+      }
+      params.push(String(req.auth!.id));
+      await pool.query<ResultSetHeader>(
+        `UPDATE organizer_members SET ${updates.join(", ")} WHERE id = ?`,
+        params,
+      );
+      res.json({
+        ok: true,
+        ...(locale ? { preferred_language: locale } : {}),
+        ...(theme ? { preferred_theme: theme } : {}),
+      });
+    },
+  );
+
+  app.get(
+    "/api/organizer/events/:eventId/sponsors",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json(apiErrorJson(req, "organizer_context_missing"));
+      }
+      const eventId = Number(req.params.eventId);
+      if (!Number.isFinite(eventId)) {
+        return res.status(400).json(apiErrorJson(req, "invalid_event_id"));
+      }
+
+      if (
+        !(await assertMemberCanAccessEvent(
+          pool,
+          req.auth!.id,
+          organizerId,
+          eventId,
+        ))
+      ) {
+        return res.status(404).json(apiErrorJson(req, "event_not_found"));
+      }
+
+      const [sponsors] = await pool.query<RowDataPacket[]>(
+        `SELECT id, name, logo_url, website_url, tier, sort_order
+         FROM event_sponsors
+         WHERE event_id = ? AND is_active = 1
+         ORDER BY sort_order ASC`,
+        [eventId],
+      );
+      res.json({ sponsors });
+    },
+  );
+
+  app.put(
+    "/api/organizer/events/:eventId/sponsors",
+    requireOrganizer,
+    async (req: AuthedRequest, res) => {
+      const organizerId = req.auth!.organizerId;
+      if (!organizerId) {
+        return res.status(403).json(apiErrorJson(req, "organizer_context_missing"));
+      }
+      const eventId = Number(req.params.eventId);
+      if (!Number.isFinite(eventId)) {
+        return res.status(400).json(apiErrorJson(req, "invalid_event_id"));
+      }
+
+      if (
+        !(await assertMemberCanAccessEvent(
+          pool,
+          req.auth!.id,
+          organizerId,
+          eventId,
+        ))
+      ) {
+        return res.status(404).json(apiErrorJson(req, "event_not_found"));
+      }
+      const memberRole = await getOrganizerMemberRole(
+        pool,
+        req.auth!.id,
+        organizerId,
+      );
+      if (!memberRole || !canOrganizerEditEvents(memberRole)) {
+        return res
+          .status(403)
+          .json(apiErrorJson(req, "insufficient_permissions"));
+      }
+
+      const raw = req.body?.sponsors;
+      if (!Array.isArray(raw)) {
+        return res.status(400).json({ error: "sponsors array required" });
+      }
+
+      const validTiers = new Set([
+        "title",
+        "gold",
+        "silver",
+        "bronze",
+        "partner",
+      ]);
+      const sponsors = raw
+        .map((s: Record<string, unknown>, index: number) => {
+          const name = String(s.name ?? "").trim();
+          if (!name) return null;
+          const tier = String(s.tier ?? "partner");
+          return {
+            name: name.slice(0, 200),
+            logo_url: s.logo_url ? String(s.logo_url).slice(0, 500) : null,
+            website_url: s.website_url
+              ? String(s.website_url).slice(0, 500)
+              : null,
+            tier: validTiers.has(tier) ? tier : "partner",
+            sort_order: Number.isFinite(Number(s.sort_order))
+              ? Number(s.sort_order)
+              : index + 1,
+          };
+        })
+        .filter(Boolean) as Array<{
+        name: string;
+        logo_url: string | null;
+        website_url: string | null;
+        tier: string;
+        sort_order: number;
+      }>;
+
+      const conn = await pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        await conn.query("DELETE FROM event_sponsors WHERE event_id = ?", [
+          eventId,
+        ]);
+        for (const s of sponsors) {
+          await conn.query<ResultSetHeader>(
+            `INSERT INTO event_sponsors (event_id, name, logo_url, website_url, tier, sort_order, is_active)
+             VALUES (?, ?, ?, ?, ?, ?, 1)`,
+            [eventId, s.name, s.logo_url, s.website_url, s.tier, s.sort_order],
+          );
+        }
+        await conn.commit();
+
+        const [rows] = await pool.query<RowDataPacket[]>(
+          `SELECT id, name, logo_url, website_url, tier, sort_order
+           FROM event_sponsors WHERE event_id = ? AND is_active = 1 ORDER BY sort_order ASC`,
+          [eventId],
+        );
+        res.json({ sponsors: rows });
+      } catch (err) {
+        await conn.rollback();
+        throw err;
+      } finally {
+        conn.release();
+      }
+    },
+  );
+}
+
+// ============================================================================
+// ROUTES — ADMIN
+// ============================================================================
+
+function registerAdminRoutes(app: express.Express) {
+  app.get("/api/admin/dashboard", requireAdmin, async (_req, res) => {
+    const [[stats]] = await pool.query<RowDataPacket[]>(
+      `SELECT
+         (SELECT COUNT(*) FROM athletes WHERE status = 'active' AND deleted_at IS NULL AND COALESCE(is_simulation, 0) = 0) AS athletes,
+         (SELECT COUNT(*) FROM organizers WHERE status = 'active') AS organizers,
+         (SELECT COUNT(*) FROM events WHERE status = 'published' AND deleted_at IS NULL AND COALESCE(is_simulation, 0) = 0) AS published_events,
+         (SELECT COUNT(*) FROM events WHERE status = 'pending_approval' AND deleted_at IS NULL AND COALESCE(is_simulation, 0) = 0) AS pending_approval_events,
+         (SELECT COUNT(*) FROM registrations WHERE status = 'confirmed' AND deleted_at IS NULL AND COALESCE(is_simulation, 0) = 0) AS confirmed_registrations,
+         (SELECT COALESCE(SUM(amount_cents), 0) FROM payments WHERE status = 'succeeded' AND COALESCE(is_simulation, 0) = 0) AS total_revenue_cents`,
+    );
+    res.json({ stats: stats ?? {} });
+  });
+
+  app.post(
+    "/api/admin/registrations/:registrationId/resend-confirmation",
+    requireAdmin,
+    async (req, res) => {
+      const registrationId = Number(req.params.registrationId);
+      if (!Number.isFinite(registrationId) || registrationId <= 0) {
+        return res.status(400).json({ error: "Invalid registration id" });
+      }
+      const result = await deliverRegistrationConfirmedEmail(registrationId, {
+        force: true,
+      });
+      if (!result.sent) {
+        return res.status(result.skipped ? 409 : 502).json({
+          error: result.error ?? "Could not send confirmation email",
+          skipped: result.skipped ?? false,
+        });
+      }
+      res.json({ ok: true, sent: true });
+    },
+  );
+
+  app.get("/api/admin/athletes", requireAdmin, async (req, res) => {
+    const q = String(req.query.q ?? "").trim();
+    const result = await listAdminAthletes(pool, {
+      q: q || undefined,
+      page: req.query.page,
+      limit: req.query.limit,
+      sortBy: req.query.sortBy,
+      sortDir: req.query.sortDir,
+    });
+    res.json(result);
+  });
+
+  app.get("/api/admin/events", requireAdmin, async (req, res) => {
+    const q = String(req.query.q ?? "").trim();
+    const status = String(req.query.status ?? "").trim();
+    const organizerIdRaw = req.query.organizerId;
+    const organizerId =
+      organizerIdRaw != null && String(organizerIdRaw).trim() !== ""
+        ? Number(organizerIdRaw)
+        : undefined;
+    if (organizerId != null && !Number.isFinite(organizerId)) {
+      return res.status(400).json({ error: "Invalid organizerId" });
+    }
+
+    const result = await listStaffEvents(pool, {
+      q: q || undefined,
+      status: status || undefined,
+      organizerId,
+      simulation: parseSimulationListFilter(req.query.simulation),
+      page: req.query.page,
+      limit: req.query.limit,
+      sortBy: req.query.sortBy,
+      sortDir: req.query.sortDir,
+    });
+    const events = await enrichStaffEventsWithPaymentAvailability(
+      pool,
+      result.events,
+      getStripeClient(),
+    );
+    res.json({ events, pagination: result.pagination });
+  });
+
+  app.get("/api/admin/analytics", requireAdmin, async (_req, res) => {
+    const [[stats]] = await pool.query<RowDataPacket[]>(
+      `SELECT
+         (SELECT COUNT(*) FROM athletes WHERE status = 'active' AND deleted_at IS NULL AND COALESCE(is_simulation, 0) = 0) AS athletes,
+         (SELECT COUNT(*) FROM organizers WHERE status = 'active') AS organizers,
+         (SELECT COUNT(*) FROM events WHERE status = 'published' AND deleted_at IS NULL AND COALESCE(is_simulation, 0) = 0) AS published_events,
+         (SELECT COUNT(*) FROM registrations WHERE status = 'confirmed' AND deleted_at IS NULL AND COALESCE(is_simulation, 0) = 0) AS confirmed_registrations,
+         (SELECT COALESCE(SUM(amount_cents), 0) FROM payments WHERE status = 'succeeded' AND COALESCE(is_simulation, 0) = 0) AS total_revenue_cents`,
+    );
+
+    const [[last30]] = await pool.query<RowDataPacket[]>(
+      `SELECT
+         (SELECT COUNT(*) FROM registrations
+          WHERE status = 'confirmed' AND deleted_at IS NULL AND COALESCE(is_simulation, 0) = 0
+            AND created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)) AS registrations,
+         (SELECT COALESCE(SUM(amount_cents), 0) FROM payments
+          WHERE status = 'succeeded' AND COALESCE(is_simulation, 0) = 0
+            AND created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)) AS revenue_cents`,
+    );
+
+    const [topEvents] = await pool.query<RowDataPacket[]>(
+      `SELECT e.id, e.title, e.slug,
+              ${EVENT_REGISTRATION_COUNT_SQL} AS registration_count,
+              COALESCE(SUM(CASE WHEN p.status = 'succeeded' THEN p.amount_cents ELSE 0 END), 0) AS revenue_cents
+       FROM events e
+       LEFT JOIN payments p ON p.event_id = e.id AND COALESCE(p.is_simulation, 0) = 0
+       WHERE e.deleted_at IS NULL AND COALESCE(e.is_simulation, 0) = 0
+       GROUP BY e.id, e.title, e.slug
+       ORDER BY revenue_cents DESC, registration_count DESC
+       LIMIT 5`,
+    );
+
+    res.json({
+      stats: stats ?? {},
+      last_30_days: {
+        registrations: Number(last30?.registrations ?? 0),
+        revenue_cents: Number(last30?.revenue_cents ?? 0),
+      },
+      top_events: topEvents,
+    });
+  });
+
+  app.get("/api/admin/site-profile", requireAdmin, async (_req, res) => {
+    const profile = await fetchSitePublicProfile(pool);
+    res.json({ profile });
+  });
+
+  app.patch("/api/admin/site-profile", requireAdmin, async (req, res) => {
+    const profile = normalizeSitePublicProfile(req.body);
+    if (!profile) {
+      return res.status(400).json({ error: "Invalid site profile payload" });
+    }
+    try {
+      await saveSitePublicProfile(pool, profile);
+      res.json({ ok: true, profile });
+    } catch (err: unknown) {
+      const message =
+        err instanceof Error ? err.message : "Could not save site profile";
+      if (message.includes("platform_settings table missing")) {
+        return res.status(503).json({ error: message });
+      }
+      throw err;
+    }
+  });
+
+  app.get("/api/admin/email-settings", requireAdmin, async (_req, res) => {
+    const resendEventUpdatesTopic =
+      await fetchResendEventUpdatesTopicSetting(pool);
+    res.json({ resendEventUpdatesTopic });
+  });
+
+  app.patch("/api/admin/email-settings", requireAdmin, async (req, res) => {
+    const setting = normalizeResendEventUpdatesTopicSetting(
+      req.body?.resendEventUpdatesTopic,
+    );
+    if (!setting) {
+      return res.status(400).json({ error: "Invalid email settings payload" });
+    }
+    try {
+      await saveResendEventUpdatesTopicSetting(pool, setting);
+      res.json({ ok: true, resendEventUpdatesTopic: setting });
+    } catch (err: unknown) {
+      const message =
+        err instanceof Error ? err.message : "Could not save email settings";
+      if (message.includes("platform_settings table missing")) {
+        return res.status(503).json({ error: message });
+      }
+      throw err;
+    }
+  });
+
+  app.patch(
+    "/api/admin/preferences",
+    requireAdmin,
+    async (req: AuthedRequest, res) => {
+      const locale =
+        req.body?.preferred_language !== undefined
+          ? normalizeLocale(String(req.body.preferred_language))
+          : null;
+      const theme =
+        req.body?.preferred_theme !== undefined
+          ? normalizeTheme(String(req.body.preferred_theme))
+          : null;
+      if (!locale && !theme) {
+        return res.status(400).json({
+          ...apiErrorJson(req, "preferred_language_or_theme_required"),
+        });
+      }
+      const updates: string[] = [];
+      const params: string[] = [];
+      if (locale) {
+        updates.push("preferred_language = ?");
+        params.push(locale);
+      }
+      if (theme) {
+        updates.push("preferred_theme = ?");
+        params.push(theme);
+      }
+      params.push(String(req.auth!.id));
+      await pool.query<ResultSetHeader>(
+        `UPDATE admins SET ${updates.join(", ")} WHERE id = ?`,
+        params,
+      );
+      res.json({
+        ok: true,
+        ...(locale ? { preferred_language: locale } : {}),
+        ...(theme ? { preferred_theme: theme } : {}),
+      });
+    },
+  );
+
+  app.get(
+    "/api/admin/events/:eventId/sponsors",
+    requireAdmin,
+    async (req, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!Number.isFinite(eventId)) {
+        return res.status(400).json(apiErrorJson(req, "invalid_event_id"));
+      }
+      const [eventRows] = await pool.query<RowDataPacket[]>(
+        "SELECT id FROM events WHERE id = ? AND deleted_at IS NULL LIMIT 1",
+        [eventId],
+      );
+      if (eventRows.length === 0) {
+        return res.status(404).json(apiErrorJson(req, "event_not_found"));
+      }
+      const [sponsors] = await pool.query<RowDataPacket[]>(
+        `SELECT id, name, logo_url, website_url, tier, sort_order
+       FROM event_sponsors
+       WHERE event_id = ? AND is_active = 1
+       ORDER BY sort_order ASC`,
+        [eventId],
+      );
+      res.json({ sponsors });
+    },
+  );
+
+  app.put(
+    "/api/admin/events/:eventId/sponsors",
+    requireAdmin,
+    async (req, res) => {
+      const eventId = Number(req.params.eventId);
+      if (!Number.isFinite(eventId)) {
+        return res.status(400).json(apiErrorJson(req, "invalid_event_id"));
+      }
+      const [eventRows] = await pool.query<RowDataPacket[]>(
+        "SELECT id FROM events WHERE id = ? AND deleted_at IS NULL LIMIT 1",
+        [eventId],
+      );
+      if (eventRows.length === 0) {
+        return res.status(404).json(apiErrorJson(req, "event_not_found"));
+      }
+      const raw = req.body?.sponsors;
+      if (!Array.isArray(raw)) {
+        return res.status(400).json({ error: "sponsors array required" });
+      }
+      const validTiers = new Set([
+        "title",
+        "gold",
+        "silver",
+        "bronze",
+        "partner",
+      ]);
+      const sponsors = raw
+        .map((s: Record<string, unknown>, index: number) => {
+          const name = String(s.name ?? "").trim();
+          if (!name) return null;
+          const tier = String(s.tier ?? "partner");
+          return {
+            name: name.slice(0, 200),
+            logo_url: s.logo_url ? String(s.logo_url).slice(0, 500) : null,
+            website_url: s.website_url
+              ? String(s.website_url).slice(0, 500)
+              : null,
+            tier: validTiers.has(tier) ? tier : "partner",
+            sort_order: Number.isFinite(Number(s.sort_order))
+              ? Number(s.sort_order)
+              : index + 1,
+          };
+        })
+        .filter(Boolean) as Array<{
+        name: string;
+        logo_url: string | null;
+        website_url: string | null;
+        tier: string;
+        sort_order: number;
+      }>;
+      const conn = await pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        await conn.query("DELETE FROM event_sponsors WHERE event_id = ?", [
+          eventId,
+        ]);
+        for (const s of sponsors) {
+          await conn.query<ResultSetHeader>(
+            `INSERT INTO event_sponsors (event_id, name, logo_url, website_url, tier, sort_order, is_active)
+           VALUES (?, ?, ?, ?, ?, ?, 1)`,
+            [eventId, s.name, s.logo_url, s.website_url, s.tier, s.sort_order],
+          );
+        }
+        await conn.commit();
+        const [rows] = await pool.query<RowDataPacket[]>(
+          `SELECT id, name, logo_url, website_url, tier, sort_order
+         FROM event_sponsors WHERE event_id = ? AND is_active = 1 ORDER BY sort_order ASC`,
+          [eventId],
+        );
+        res.json({ sponsors: rows });
+      } catch (err) {
+        await conn.rollback();
+        throw err;
+      } finally {
+        conn.release();
+      }
+    },
+  );
+}
+
+// ============================================================================
+// ROUTES — WEBHOOKS (Stripe direct payments; Connect account.updated)
+// ============================================================================
+
+async function handleStripeWebhook(req: Request, res: Response) {
+  const stripe = getStripeClient();
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET?.trim() || "";
+  if (!stripe || !webhookSecret) {
+    return res.status(503).json({ error: "Webhook not configured" });
+  }
+
+  const signature = req.headers["stripe-signature"];
+  if (!signature || typeof signature !== "string") {
+    return res.status(400).json({ error: "Missing Stripe signature" });
+  }
+
+  let event: Stripe.Event;
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body as Buffer,
+      signature,
+      webhookSecret,
+    );
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Invalid signature";
+    console.error("[stripe:webhook] signature error:", message);
+    return res.status(400).json({ error: "Invalid Stripe signature" });
+  }
+
+  try {
+    const claim = await claimStripeWebhookEvent(pool, event);
+    if (claim.action === "skip") {
+      return res.json({
+        received: true,
+        duplicate: true,
+        reason: claim.reason,
+      });
+    }
+
+    if (event.type === "payment_intent.succeeded") {
+      const pi = event.data.object as Stripe.PaymentIntent;
+      const paymentUuid = pi.metadata?.payment_public_uuid;
+      if (paymentUuid) {
+        await finalizeRegistrationAfterPayment(paymentUuid, pi);
+      }
+    } else if (event.type === "payment_intent.payment_failed") {
+      const pi = event.data.object as Stripe.PaymentIntent;
+      const paymentUuid = pi.metadata?.payment_public_uuid;
+      if (paymentUuid) {
+        await pool.query<ResultSetHeader>(
+          `UPDATE payments SET status = 'failed',
+             failure_code = ?, failure_message = ?
+           WHERE public_uuid = ? AND status IN ('pending', 'processing')`,
+          [
+            pi.last_payment_error?.code ?? "payment_failed",
+            (pi.last_payment_error?.message ?? "Payment failed").slice(0, 500),
+            paymentUuid,
+          ],
+        );
+      }
+    } else if (event.type === "account.updated") {
+      const account = event.data.object as Stripe.Account;
+      await handleStripeAccountUpdatedWebhook(pool, account);
+    } else if (event.type === "account.application.deauthorized") {
+      const accountId = (event.data.object as { id?: string }).id;
+      if (accountId) {
+        await handleStripeConnectDeauthorized(pool, accountId);
+      }
+    } else {
+      await pool.query<ResultSetHeader>(
+        `UPDATE stripe_webhook_events SET status = 'ignored', processed_at = NOW()
+         WHERE stripe_event_id = ?`,
+        [event.id],
+      );
+      return res.json({ received: true, ignored: true });
+    }
+
+    await markStripeWebhookEventProcessed(pool, event.id);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("[stripe:webhook] handler error:", err);
+    try {
+      await markStripeWebhookEventFailed(pool, event.id, message);
+    } catch (markErr) {
+      console.error("[stripe:webhook] failed to mark event failed:", markErr);
+    }
+    return res.status(500).json({ error: "Webhook handler failed" });
+  }
+
+  res.json({ received: true });
+}
+
+// ============================================================================
+// EXPORTS — Vercel serverless + dev server
+// ============================================================================
+
+let app: ReturnType<typeof buildApp>;
+try {
+  app = buildApp();
+} catch (initErr: any) {
+  console.error(
+    "[API init] Fatal error during startup:",
+    initErr?.message ?? initErr,
+  );
+  app = express() as any;
+  (app as any).use((_req: Request, res: Response) => {
+    res.status(503).json({
+      error:
+        "Service unavailable — server failed to initialise. Check environment variables.",
+    });
+  });
+}
+
+export default function handler(req: VercelRequest, res: VercelResponse) {
+  return new Promise<void>((resolve, reject) => {
+    res.on("finish", resolve);
+    res.on("close", resolve);
+    res.on("error", reject);
+    try {
+      app(req as any, res as any);
+    } catch (err) {
+      reject(err);
+    }
+  }).catch((err) => {
+    console.error("[Vercel handler]", err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: "A server error has occurred" });
+    }
+  });
+}
+
+export function createServer() {
+  return buildApp();
+}
+
+export { createSession };

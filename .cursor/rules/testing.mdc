@@ -1,0 +1,38 @@
+---
+description: Testing culture — API integration, deploy gates, Vitest layout
+alwaysApply: true
+---
+
+# Testing & Deploy Culture (NO EXCEPTIONS)
+
+## Tests are part of the change
+
+- Bugfixes and non-trivial behavior changes **ship with a regression test** in the same turn
+- Cover edge cases: null/empty, auth 401/403, admin vs organizer paths, unpaid/paused payouts, mobile layout regressions
+- Do **not** end a deep-review turn with “follow up with tests later”
+
+## Layout (Vitest — two projects)
+
+| Layer | Glob | Env |
+|-------|------|-----|
+| API unit / integration | `api/**/*.test.ts`, `api/**/*.integration.test.ts` | node |
+| Unit helpers | `tests/unit/**/*.spec.ts`, `app/**/*.spec.ts` | node |
+| Remaining smoke | `tests/smoke/**/*.spec.ts` | node |
+| UI components | `**/*.spec.tsx`, `tests/integration/**` | jsdom |
+
+- Mock HTTP suites: `setTestPool()` via `tests/helpers/*Harness.ts`
+- Real TiDB integration: `api/testDbCleanup.ts`, unique `@test.local` emails, cleanup in `afterAll`
+- `VITEST=true` + `ATLEITA_TEST_MODE=1` in `vitest.config.ts`
+
+## Deploy gate
+
+- Production: `npm run deploy:prod` (not raw `vercel --prod` alone)
+- Pre-deploy: `check:api-inline` → `typecheck` → `test` → Vercel → `app_version`
+- Skip checks only when user explicitly passes `--skip-checks`
+
+## Commands
+
+- `npm test` — full suite
+- `npm run test:api` — API tests only
+- `npm run check:api-inline` — Vercel bundle gate
+- `npm run test:cleanup-fixtures` — purge leftover `@test.local` rows from TiDB

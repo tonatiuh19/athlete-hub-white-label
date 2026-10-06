@@ -1,0 +1,24 @@
+---
+description: Critical Atleita rules from AGENTS.md — always apply
+alwaysApply: true
+---
+
+# Critical Rules (NO EXCEPTIONS)
+
+- **npm only** — never pnpm or yarn
+- **Schema first**: always check `database/schema.sql` before any SQL; never assume column names
+- **Never edit `database/schema.sql` directly** — migration in `database/migrations/` first, apply, then update `schema.sql`
+- **API entry**: routes and runtime logic in `api/index.ts` (Vercel). Allowed runtime imports: `../server/**`, `../shared/**`, `./testHooks` only (`vercel.json` `includeFiles`). No other sibling `api/*.ts` runtime imports — run `npm run check:api-inline`
+- **Redux only for data**: never axios/fetch in components; `createAsyncThunk` in slices; components dispatch + select only
+- **Fix root causes** — never patch around type errors or bugs
+- **No breaking changes** without calling them out
+- **API + swagger**: any `api/index.ts` route/behavior change → update `api/swagger.yaml`
+- **Design system**: relevant UI changes → update `DESIGN_SYSTEM.md`
+- **i18n**: new user-visible strings → `app/i18n/locales/en.json` **and** `es.json`, use `t('key')` — never hardcode UI copy
+- **Tests + deploy**: see `testing.mdc`; production via `npm run deploy:prod`
+- **Review chat history** before changing code — do not reintroduce fixed issues
+- Prefer reusable components/utilities when it avoids debt
+- **Mobile first**: every UI change must work on phones; **no page horizontal scroll** — see `mobile.mdc` (mandatory for marketing, athlete, organizer, and staff/admin)
+- **Staff auth**: admin JWT must not hit organizer-only APIs (401 cascade); gate fetches by role
+- Frontend: clean UX; UI logs via `app/utils/logger.ts` only
+- **Passwordless**: never reintroduce password login/reset UI; email OTP only
